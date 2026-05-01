@@ -264,6 +264,22 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return PREVIEW
 
 
+async def handle_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text("Generating weekly report...")
+    try:
+        report = await generate_weekly_report()
+        if report:
+            await update.effective_message.reply_text(
+                f"*Weekly highlights*\n\n{report}",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.effective_message.reply_text("No entries this week.")
+    except Exception:
+        logger.exception("Error generating weekly report")
+        await update.effective_message.reply_text("Error generating weekly report.")
+
+
 async def send_weekly_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Generating weekly report...")
     try:
@@ -310,6 +326,7 @@ def main() -> None:
     command_handlers = [
         CommandHandler("start", handle_start),
         CommandHandler("help", handle_help),
+        CommandHandler("weekly", handle_weekly),
     ]
 
     conv_handler = ConversationHandler(
