@@ -67,17 +67,19 @@ def _tags_line(tags: list[str]) -> str:
     return " ".join(f"`{t}`" for t in all_tags)
 
 
-def _preview_keyboard() -> InlineKeyboardMarkup:
+def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
+    highlight_btn = (
+        InlineKeyboardButton("⭐ Highlighted", callback_data="toggle_highlight")
+        if highlighted else
+        InlineKeyboardButton("Mark as Highlight ⭐", callback_data="toggle_highlight")
+    )
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✎ Title", callback_data="edit_title"),
             InlineKeyboardButton("✎ Text", callback_data="edit_text"),
             InlineKeyboardButton("✎ Tags", callback_data="edit_tags"),
         ],
-        [
-            InlineKeyboardButton("✓ Save", callback_data="save"),
-            InlineKeyboardButton("⭐ Highlight", callback_data="save_highlight"),
-        ],
+        [InlineKeyboardButton("✓ Save", callback_data="save"), highlight_btn],
     ])
 
 
@@ -109,7 +111,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         title_msg = await message.reply_text(f"*{title}*", parse_mode="Markdown")
         text_msg = await message.reply_text(text)
         tags_msg = await message.reply_text(_tags_line(tags), parse_mode="Markdown")
-        buttons_msg = await message.reply_text("Actions:", reply_markup=_preview_keyboard())
+        buttons_msg = await message.reply_text("Actions:", reply_markup=_preview_keyboard(highlighted=False))
 
         context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
         context.user_data["title_msg_id"] = title_msg.message_id
@@ -127,22 +129,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return PREVIEW
 
 
-async def _do_save(update: Update, context: ContextTypes.DEFAULT_TYPE, highlight: bool) -> int:
+async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
     pending = context.user_data.get("pending", {})
-    title = pending.get("title", "")
-    text = pending.get("text", "")
-    tags = pending.get("tags", [])
-
-    if highlight:
-        title = f"⭐ {title}"
-
     try:
-        updated = await save_entry(title, text, tags)
+        updated = await save_entry(pending.get("title", ""), pending.get("text", ""), pending.get("tags", []))
         status = "Added to today's page" if updated else "Saved to Notion"
-        await query.edit_message_text(f"✓ {status}" + (" ⭐" if highlight else ""))
+        await query.edit_message_text(f"✓ {status}")
     except Exception as e:
         logger.exception("Error saving to Notion")
         await query.edit_message_text(f"Error: {e}")
@@ -151,12 +146,31 @@ async def _do_save(update: Update, context: ContextTypes.DEFAULT_TYPE, highlight
     return ConversationHandler.END
 
 
-async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _do_save(update, context, highlight=False)
+async def toggle_highlight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
 
+    pending = context.user_data["pending"]
+    highlighted = pending["title"].startswith("⭐ ")
+    if highlighted:
+        pending["title"] = pending["title"][len("⭐ "):]
+    else:
+        pending["title"] = f"⭐ {pending['title']}"
 
-async def save_highlight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _do_save(update, context, highlight=True)
+    highlighted = not highlighted
+    chat_id = update.effective_chat.id
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=context.user_data["title_msg_id"],
+        text=f"*{pending['title']}*",
+        parse_mode="Markdown",
+    )
+    await context.bot.edit_message_reply_markup(
+        chat_id=chat_id,
+        message_id=context.user_data["buttons_msg_id"],
+        reply_markup=_preview_keyboard(highlighted=highlighted),
+    )
+    return PREVIEW
 
 
 async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -191,7 +205,7 @@ async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(),
+        reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
     await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
     await context.bot.delete_message(chat_id, user_msg.message_id)
@@ -211,7 +225,7 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(),
+        reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
     await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
     await context.bot.delete_message(chat_id, user_msg.message_id)
@@ -242,7 +256,7 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(),
+        reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
     await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
     await context.bot.delete_message(chat_id, user_msg.message_id)
@@ -283,7 +297,7 @@ def main() -> None:
         states={
             PREVIEW: [
                 CallbackQueryHandler(save_callback, pattern="^save$"),
-                CallbackQueryHandler(save_highlight_callback, pattern="^save_highlight$"),
+                CallbackQueryHandler(toggle_highlight_callback, pattern="^toggle_highlight$"),
                 CallbackQueryHandler(edit_title_callback, pattern="^edit_title$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(edit_tags_callback, pattern="^edit_tags$"),
