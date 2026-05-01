@@ -1,6 +1,6 @@
 # Noter
 
-A Telegram bot that turns voice messages into structured diary entries in Notion.
+A Telegram bot that turns voice messages into structured diary entries in Notion. Designed to work with the **Notion Journal** — see the [official setup guide](https://www.notion.com/help/guides/journal) to create one.
 
 ## How it works
 
@@ -38,7 +38,7 @@ When appending to an existing page, tags from all entries are merged without dup
 
 ## Notion database setup
 
-Your database must have the following properties:
+The bot works with the Notion Journal database described in the [official guide](https://www.notion.com/help/guides/journal). Make sure your database has the following properties:
 
 | Property | Type        | Notes                                      |
 |----------|-------------|--------------------------------------------|
