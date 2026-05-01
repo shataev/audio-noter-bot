@@ -74,7 +74,10 @@ def _preview_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("✎ Text", callback_data="edit_text"),
             InlineKeyboardButton("✎ Tags", callback_data="edit_tags"),
         ],
-        [InlineKeyboardButton("✓ Save", callback_data="save")],
+        [
+            InlineKeyboardButton("✓ Save", callback_data="save"),
+            InlineKeyboardButton("⭐ Highlight", callback_data="save_highlight"),
+        ],
     ])
 
 
@@ -124,7 +127,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return PREVIEW
 
 
-async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _do_save(update: Update, context: ContextTypes.DEFAULT_TYPE, highlight: bool) -> int:
     query = update.callback_query
     await query.answer()
 
@@ -133,16 +136,27 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     text = pending.get("text", "")
     tags = pending.get("tags", [])
 
+    if highlight:
+        title = f"⭐ {title}"
+
     try:
         updated = await save_entry(title, text, tags)
         status = "Added to today's page" if updated else "Saved to Notion"
-        await query.edit_message_text(f"✓ {status}")
+        await query.edit_message_text(f"✓ {status}" + (" ⭐" if highlight else ""))
     except Exception as e:
         logger.exception("Error saving to Notion")
         await query.edit_message_text(f"Error: {e}")
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _do_save(update, context, highlight=False)
+
+
+async def save_highlight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _do_save(update, context, highlight=True)
 
 
 async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -269,6 +283,7 @@ def main() -> None:
         states={
             PREVIEW: [
                 CallbackQueryHandler(save_callback, pattern="^save$"),
+                CallbackQueryHandler(save_highlight_callback, pattern="^save_highlight$"),
                 CallbackQueryHandler(edit_title_callback, pattern="^edit_title$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(edit_tags_callback, pattern="^edit_tags$"),
