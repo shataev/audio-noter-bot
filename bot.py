@@ -4,8 +4,15 @@ import tempfile
 import zoneinfo
 from datetime import time
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 from config import settings
 from services.formatter import format_entry
@@ -19,46 +26,124 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PREVIEW, EDIT_TITLE, EDIT_TEXT = range(3)
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+def _preview_text(title: str, text: str, tags: list[str]) -> str:
+    all_tags = ["Daily"] + [t for t in tags if t != "Daily"]
+    tags_line = " ".join(f"`{t}`" for t in all_tags)
+    return f"*{title}*\n\n{text}\n\n{tags_line}"
+
+
+def _preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✓ Сохранить", callback_data="save"),
+        InlineKeyboardButton("✎ Заголовок", callback_data="edit_title"),
+        InlineKeyboardButton("✎ Текст", callback_data="edit_text"),
+    ]])
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     await message.reply_text("Listening...")
 
-    # Download voice message
     voice_file = await context.bot.get_file(message.voice.file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         tmp_path = tmp.name
     await voice_file.download_to_drive(tmp_path)
 
     try:
-        # Transcribe
         await message.reply_text("Transcribing...")
         transcription = await transcribe(tmp_path)
         logger.info("Transcription: %s", transcription)
 
-        # Format with GPT
         await message.reply_text("Formatting...")
         title, text, tags = await format_entry(transcription)
 
-        # Save to Notion
-        updated = await save_entry(title, text, tags)
+        context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
 
-        status = "Added to today's page" if updated else "Created today's page"
-        all_tags = ["Daily"] + [t for t in tags if t != "Daily"]
-        tags_line = " ".join(f"`{t}`" for t in all_tags)
-        await message.reply_text(
-            f"✓ {status}\n\n"
-            f"*{title}*\n\n"
-            f"{text}\n\n"
-            f"{tags_line}",
+        preview_msg = await message.reply_text(
+            _preview_text(title, text, tags),
             parse_mode="Markdown",
+            reply_markup=_preview_keyboard(),
         )
+        context.user_data["preview_msg_id"] = preview_msg.message_id
 
     except Exception as e:
         logger.exception("Error processing voice message")
         await message.reply_text(f"Error: {e}")
+        return ConversationHandler.END
     finally:
         os.unlink(tmp_path)
+
+    return PREVIEW
+
+
+async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    pending = context.user_data.get("pending", {})
+    title = pending.get("title", "")
+    text = pending.get("text", "")
+    tags = pending.get("tags", [])
+
+    try:
+        updated = await save_entry(title, text, tags)
+        status = "Добавлено в сегодняшнюю страницу" if updated else "Создана новая страница"
+        await query.edit_message_text(
+            f"✓ {status}\n\n" + _preview_text(title, text, tags),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Error saving to Notion")
+        await query.edit_message_text(f"Error: {e}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    current = context.user_data["pending"]["title"]
+    await query.message.reply_text(
+        f"Текущий заголовок (скопируй и отредактируй):\n\n{current}\n\nОтправь новый вариант:"
+    )
+    return EDIT_TITLE
+
+
+async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    current = context.user_data["pending"]["text"]
+    await query.message.reply_text(
+        f"Текущий текст (скопируй и отредактируй):\n\n{current}\n\nОтправь новый вариант:"
+    )
+    return EDIT_TEXT
+
+
+async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["pending"]["title"] = update.effective_message.text.strip()
+    await _refresh_preview(update, context)
+    return PREVIEW
+
+
+async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["pending"]["text"] = update.effective_message.text.strip()
+    await _refresh_preview(update, context)
+    return PREVIEW
+
+
+async def _refresh_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.user_data["pending"]
+    await context.bot.edit_message_text(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data["preview_msg_id"],
+        text=_preview_text(pending["title"], pending["text"], pending["tags"]),
+        parse_mode="Markdown",
+        reply_markup=_preview_keyboard(),
+    )
 
 
 async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -83,11 +168,24 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = ApplicationBuilder().token(settings.telegram_token).build()
 
-    # Voice message handler
-    allowed = filters.VOICE & filters.User(user_id=settings.allowed_user_id)
-    app.add_handler(MessageHandler(allowed, handle_voice))
+    user_filter = filters.User(user_id=settings.allowed_user_id)
 
-    # Daily summary at 21:00 in user's timezone
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.VOICE & user_filter, handle_voice)],
+        states={
+            PREVIEW: [
+                CallbackQueryHandler(save_callback, pattern="^save$"),
+                CallbackQueryHandler(edit_title_callback, pattern="^edit_title$"),
+                CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
+            ],
+            EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_title)],
+            EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_text)],
+        },
+        fallbacks=[],
+    )
+
+    app.add_handler(conv_handler)
+
     tz = zoneinfo.ZoneInfo(settings.timezone)
     app.job_queue.run_daily(
         send_daily_summary,
