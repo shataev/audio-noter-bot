@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import zoneinfo
 import httpx
 from config import settings
@@ -135,6 +135,29 @@ async def update_page(page: dict, entry_title: str, entry_text: str, entry_tags:
             },
         )
         resp.raise_for_status()
+
+
+async def get_week_pages() -> list[dict]:
+    """Returns all diary pages created in the last 7 days, oldest first."""
+    tz = zoneinfo.ZoneInfo(settings.timezone)
+    today = datetime.now(tz).date()
+    week_ago = today - timedelta(days=6)
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(
+            f"{API}/databases/{settings.notion_database_id}/query",
+            headers=HEADERS,
+            json={
+                "filter": {
+                    "and": [
+                        {"property": "Created", "date": {"on_or_after": week_ago.isoformat()}},
+                        {"property": "Created", "date": {"on_or_before": today.isoformat()}},
+                    ]
+                },
+                "sorts": [{"property": "Created", "direction": "ascending"}],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", [])
 
 
 async def save_entry(entry_title: str, entry_text: str, entry_tags: list[str]) -> bool:

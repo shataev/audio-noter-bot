@@ -18,7 +18,7 @@ from telegram.ext import (
 from config import settings
 from services.formatter import format_entry
 from services.notion import save_entry
-from services.summary import generate_daily_summary
+from services.summary import generate_daily_summary, generate_weekly_report
 from services.whisper import transcribe
 
 logging.basicConfig(
@@ -264,6 +264,41 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return PREVIEW
 
 
+async def handle_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text("Generating weekly report...")
+    try:
+        report = await generate_weekly_report()
+        if report:
+            await update.effective_message.reply_text(
+                f"*Weekly highlights*\n\n{report}",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.effective_message.reply_text("No entries this week.")
+    except Exception:
+        logger.exception("Error generating weekly report")
+        await update.effective_message.reply_text("Error generating weekly report.")
+
+
+async def send_weekly_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Generating weekly report...")
+    try:
+        report = await generate_weekly_report()
+        if report:
+            await context.bot.send_message(
+                chat_id=settings.allowed_user_id,
+                text=f"*Weekly highlights*\n\n{report}",
+                parse_mode="Markdown",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=settings.allowed_user_id,
+                text="No entries this week — next week is a fresh start!",
+            )
+    except Exception:
+        logger.exception("Error generating weekly report")
+
+
 async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Generating daily summary...")
     try:
@@ -291,6 +326,7 @@ def main() -> None:
     command_handlers = [
         CommandHandler("start", handle_start),
         CommandHandler("help", handle_help),
+        CommandHandler("weekly", handle_weekly),
     ]
 
     conv_handler = ConversationHandler(
@@ -318,7 +354,12 @@ def main() -> None:
     tz = zoneinfo.ZoneInfo(settings.timezone)
     app.job_queue.run_daily(
         send_daily_summary,
-        time=time(21, 00, tzinfo=tz),
+        time=time(21, 0, tzinfo=tz),
+    )
+    app.job_queue.run_daily(
+        send_weekly_report,
+        time=time(21, 0, tzinfo=tz),
+        days=(6,),  # Sunday only
     )
 
     logger.info("Bot started")
