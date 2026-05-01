@@ -105,7 +105,8 @@ async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text("Пришли новый заголовок:")
+    prompt = await query.message.reply_text("Пришли новый заголовок:")
+    context.user_data["edit_prompt_msg_id"] = prompt.message_id
     return EDIT_TITLE
 
 
@@ -113,42 +114,49 @@ async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text("Пришли новый текст:")
+    prompt = await query.message.reply_text("Пришли новый текст:")
+    context.user_data["edit_prompt_msg_id"] = prompt.message_id
     return EDIT_TEXT
 
 
 async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["pending"]["title"] = update.effective_message.text.strip()
+    user_msg = update.effective_message
+    context.user_data["pending"]["title"] = user_msg.text.strip()
 
+    chat_id = update.effective_chat.id
     await context.bot.edit_message_text(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         message_id=context.user_data["title_msg_id"],
         text=f"*{context.user_data['pending']['title']}*",
         parse_mode="Markdown",
     )
     await context.bot.edit_message_reply_markup(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(),
     )
-    await update.effective_message.reply_text("Заголовок обновлён.")
+    await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
+    await context.bot.delete_message(chat_id, user_msg.message_id)
     return PREVIEW
 
 
 async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["pending"]["text"] = update.effective_message.text.strip()
+    user_msg = update.effective_message
+    context.user_data["pending"]["text"] = user_msg.text.strip()
 
+    chat_id = update.effective_chat.id
     await context.bot.edit_message_text(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         message_id=context.user_data["text_msg_id"],
         text=context.user_data["pending"]["text"],
     )
     await context.bot.edit_message_reply_markup(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(),
     )
-    await update.effective_message.reply_text("Текст обновлён.")
+    await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
+    await context.bot.delete_message(chat_id, user_msg.message_id)
     return PREVIEW
 
 
