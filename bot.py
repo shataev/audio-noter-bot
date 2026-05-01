@@ -37,11 +37,11 @@ def _tags_line(tags: list[str]) -> str:
 def _preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✎ Заголовок", callback_data="edit_title"),
-            InlineKeyboardButton("✎ Текст", callback_data="edit_text"),
-            InlineKeyboardButton("✎ Теги", callback_data="edit_tags"),
+            InlineKeyboardButton("✎ Title", callback_data="edit_title"),
+            InlineKeyboardButton("✎ Text", callback_data="edit_text"),
+            InlineKeyboardButton("✎ Tags", callback_data="edit_tags"),
         ],
-        [InlineKeyboardButton("✓ Сохранить", callback_data="save")],
+        [InlineKeyboardButton("✓ Save", callback_data="save")],
     ])
 
 
@@ -65,7 +65,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         title_msg = await message.reply_text(f"*{title}*", parse_mode="Markdown")
         text_msg = await message.reply_text(text)
         tags_msg = await message.reply_text(_tags_line(tags), parse_mode="Markdown")
-        buttons_msg = await message.reply_text("Действия:", reply_markup=_preview_keyboard())
+        buttons_msg = await message.reply_text("Actions:", reply_markup=_preview_keyboard())
 
         context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
         context.user_data["title_msg_id"] = title_msg.message_id
@@ -94,11 +94,11 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     try:
         updated = await save_entry(title, text, tags)
-        status = "Запись добавлена в сегодняшнюю страницу" if updated else "Запись сохранена в Notion"
+        status = "Added to today's page" if updated else "Saved to Notion"
         await query.edit_message_text(f"✓ {status}")
     except Exception as e:
         logger.exception("Error saving to Notion")
-        await query.edit_message_text(f"Ошибка: {e}")
+        await query.edit_message_text(f"Error: {e}")
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -108,7 +108,7 @@ async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    prompt = await query.message.reply_text("Пришли новый заголовок:")
+    prompt = await query.message.reply_text("Send a new title:")
     context.user_data["edit_prompt_msg_id"] = prompt.message_id
     return EDIT_TITLE
 
@@ -117,7 +117,7 @@ async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    prompt = await query.message.reply_text("Пришли новый текст:")
+    prompt = await query.message.reply_text("Send a new text:")
     context.user_data["edit_prompt_msg_id"] = prompt.message_id
     return EDIT_TEXT
 
@@ -167,7 +167,7 @@ async def edit_tags_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    prompt = await query.message.reply_text("Пришли теги через запятую:")
+    prompt = await query.message.reply_text("Send tags separated by commas:")
     context.user_data["edit_prompt_msg_id"] = prompt.message_id
     return EDIT_TAGS
 
@@ -207,7 +207,7 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await context.bot.send_message(
                 chat_id=settings.allowed_user_id,
-                text="Хей, как прошел твой день? Уверен, тебе есть чем гордиться!",
+                text="Hey, how was your day? I'm sure you have something to be proud of!",
             )
     except Exception:
         logger.exception("Error generating daily summary")
