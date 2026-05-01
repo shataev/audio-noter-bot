@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PREVIEW, EDIT_TITLE, EDIT_TEXT = range(3)
+PREVIEW, EDIT_TITLE, EDIT_TEXT, EDIT_TAGS = range(4)
 
 
 def _tags_line(tags: list[str]) -> str:
@@ -35,11 +35,14 @@ def _tags_line(tags: list[str]) -> str:
 
 
 def _preview_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✓ Сохранить", callback_data="save"),
-        InlineKeyboardButton("✎ Заголовок", callback_data="edit_title"),
-        InlineKeyboardButton("✎ Текст", callback_data="edit_text"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✎ Заголовок", callback_data="edit_title"),
+            InlineKeyboardButton("✎ Текст", callback_data="edit_text"),
+            InlineKeyboardButton("✎ Теги", callback_data="edit_tags"),
+        ],
+        [InlineKeyboardButton("✓ Сохранить", callback_data="save")],
+    ])
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -160,6 +163,37 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return PREVIEW
 
 
+async def edit_tags_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    prompt = await query.message.reply_text("Пришли теги через запятую:")
+    context.user_data["edit_prompt_msg_id"] = prompt.message_id
+    return EDIT_TAGS
+
+
+async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_msg = update.effective_message
+    new_tags = [t.strip() for t in user_msg.text.split(",") if t.strip()]
+    context.user_data["pending"]["tags"] = new_tags
+
+    chat_id = update.effective_chat.id
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=context.user_data["tags_msg_id"],
+        text=_tags_line(new_tags),
+        parse_mode="Markdown",
+    )
+    await context.bot.edit_message_reply_markup(
+        chat_id=chat_id,
+        message_id=context.user_data["buttons_msg_id"],
+        reply_markup=_preview_keyboard(),
+    )
+    await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
+    await context.bot.delete_message(chat_id, user_msg.message_id)
+    return PREVIEW
+
+
 async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Generating daily summary...")
     try:
@@ -191,9 +225,11 @@ def main() -> None:
                 CallbackQueryHandler(save_callback, pattern="^save$"),
                 CallbackQueryHandler(edit_title_callback, pattern="^edit_title$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
+                CallbackQueryHandler(edit_tags_callback, pattern="^edit_tags$"),
             ],
             EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_title)],
             EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_text)],
+            EDIT_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_tags)],
         },
         fallbacks=[],
     )
