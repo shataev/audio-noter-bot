@@ -29,10 +29,9 @@ logger = logging.getLogger(__name__)
 PREVIEW, EDIT_TITLE, EDIT_TEXT = range(3)
 
 
-def _preview_text(title: str, text: str, tags: list[str]) -> str:
+def _tags_line(tags: list[str]) -> str:
     all_tags = ["Daily"] + [t for t in tags if t != "Daily"]
-    tags_line = " ".join(f"`{t}`" for t in all_tags)
-    return f"*{title}*\n\n{text}\n\n{tags_line}"
+    return " ".join(f"`{t}`" for t in all_tags)
 
 
 def _preview_keyboard() -> InlineKeyboardMarkup:
@@ -60,14 +59,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await message.reply_text("Formatting...")
         title, text, tags = await format_entry(transcription)
 
-        context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
+        title_msg = await message.reply_text(f"*{title}*", parse_mode="Markdown")
+        text_msg = await message.reply_text(text)
+        tags_msg = await message.reply_text(_tags_line(tags), parse_mode="Markdown")
+        buttons_msg = await message.reply_text("Действия:", reply_markup=_preview_keyboard())
 
-        preview_msg = await message.reply_text(
-            _preview_text(title, text, tags),
-            parse_mode="Markdown",
-            reply_markup=_preview_keyboard(),
-        )
-        context.user_data["preview_msg_id"] = preview_msg.message_id
+        context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
+        context.user_data["title_msg_id"] = title_msg.message_id
+        context.user_data["text_msg_id"] = text_msg.message_id
+        context.user_data["tags_msg_id"] = tags_msg.message_id
+        context.user_data["buttons_msg_id"] = buttons_msg.message_id
 
     except Exception as e:
         logger.exception("Error processing voice message")
@@ -90,14 +91,11 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     try:
         updated = await save_entry(title, text, tags)
-        status = "Добавлено в сегодняшнюю страницу" if updated else "Создана новая страница"
-        await query.edit_message_text(
-            f"✓ {status}\n\n" + _preview_text(title, text, tags),
-            parse_mode="Markdown",
-        )
+        status = "Запись добавлена в сегодняшнюю страницу" if updated else "Запись сохранена в Notion"
+        await query.edit_message_text(f"✓ {status}")
     except Exception as e:
         logger.exception("Error saving to Notion")
-        await query.edit_message_text(f"Error: {e}")
+        await query.edit_message_text(f"Ошибка: {e}")
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -106,6 +104,7 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
     current = context.user_data["pending"]["title"]
     await query.message.reply_text(
         f"Текущий заголовок (скопируй и отредактируй):\n\n{current}\n\nОтправь новый вариант:"
@@ -116,6 +115,7 @@ async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
     current = context.user_data["pending"]["text"]
     await query.message.reply_text(
         f"Текущий текст (скопируй и отредактируй):\n\n{current}\n\nОтправь новый вариант:"
@@ -124,26 +124,38 @@ async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["pending"]["title"] = update.effective_message.text.strip()
-    await _refresh_preview(update, context)
+    new_title = update.effective_message.text.strip()
+    context.user_data["pending"]["title"] = new_title
+
+    await context.bot.edit_message_text(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data["title_msg_id"],
+        text=f"*{new_title}*",
+        parse_mode="Markdown",
+    )
+    await context.bot.edit_message_reply_markup(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data["buttons_msg_id"],
+        reply_markup=_preview_keyboard(),
+    )
     return PREVIEW
 
 
 async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["pending"]["text"] = update.effective_message.text.strip()
-    await _refresh_preview(update, context)
-    return PREVIEW
+    new_text = update.effective_message.text.strip()
+    context.user_data["pending"]["text"] = new_text
 
-
-async def _refresh_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pending = context.user_data["pending"]
     await context.bot.edit_message_text(
         chat_id=update.effective_chat.id,
-        message_id=context.user_data["preview_msg_id"],
-        text=_preview_text(pending["title"], pending["text"], pending["tags"]),
-        parse_mode="Markdown",
+        message_id=context.user_data["text_msg_id"],
+        text=new_text,
+    )
+    await context.bot.edit_message_reply_markup(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(),
     )
+    return PREVIEW
 
 
 async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
