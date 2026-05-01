@@ -2,7 +2,7 @@ import json
 import httpx
 import openai
 from config import settings
-from services.notion import API, HEADERS, get_today_page
+from services.notion import API, HEADERS, get_today_page, get_week_pages
 
 openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -32,6 +32,46 @@ async def _fetch_page_text(page_id: str) -> str:
             lines.append(text)
 
     return "\n\n".join(lines)
+
+
+WEEKLY_PROMPT = """You are helping the user reflect on their week.
+Below are all diary entries from the past 7 days.
+Entries marked with ⭐ were highlighted by the user as personally significant.
+
+Write a weekly highlight report in Russian:
+1. A warm narrative paragraph (3-5 sentences) capturing the spirit of the week.
+2. A list of 5-7 highlights — include all ⭐-marked entries first, then add any others you find significant. Format each as a short bullet point.
+
+Do not use headers. Write naturally and warmly, as if summarizing a meaningful week to a friend."""
+
+
+async def generate_weekly_report() -> str | None:
+    """Generates a GPT weekly highlight report. Returns None if no pages found."""
+    pages = await get_week_pages()
+    if not pages:
+        return None
+
+    sections = []
+    for page in pages:
+        title_prop = page["properties"].get("title") or page["properties"].get("Name")
+        page_title = "".join(p["plain_text"] for p in title_prop.get("title", []))
+        page_text = await _fetch_page_text(page["id"])
+        if page_text.strip():
+            sections.append(f"### {page_title}\n{page_text}")
+
+    if not sections:
+        return None
+
+    full_text = "\n\n".join(sections)
+    response = await openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=1024,
+        messages=[
+            {"role": "system", "content": WEEKLY_PROMPT},
+            {"role": "user", "content": full_text},
+        ],
+    )
+    return response.choices[0].message.content
 
 
 async def generate_daily_summary() -> str | None:
