@@ -79,7 +79,8 @@ def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✎ Text", callback_data="edit_text"),
             InlineKeyboardButton("✎ Tags", callback_data="edit_tags"),
         ],
-        [InlineKeyboardButton("✓ Save", callback_data="save"), highlight_btn],
+        [highlight_btn],
+        [InlineKeyboardButton("✓ Save", callback_data="save")],
     ])
 
 
