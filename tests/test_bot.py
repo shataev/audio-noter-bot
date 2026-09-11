@@ -781,3 +781,23 @@ async def test_only_the_last_few_saved_previews_are_remembered(tmp_path, monkeyp
 
     assert len(context.user_data[bot.SAVED_BUTTONS_KEY]) == bot.SAVED_BUTTONS_REMEMBERED
     assert len(no_network) == bot.SAVED_BUTTONS_REMEMBERED + 3
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_an_edit_does_not_chase_a_deleted_prompt(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+
+    await bot.edit_title_callback(
+        callback_update(fake_bot, "edit_title", context.user_data["buttons_msg_id"]), context
+    )
+    prompt_id = context.user_data["edit_prompt_msg_id"]
+    await bot.receive_new_title(text_update(fake_bot, "Новый заголовок"), context)
+
+    assert prompt_id in fake_bot.deleted
+    assert "edit_prompt_msg_id" not in context.user_data
+
+    fake_bot.deleted.clear()
+    await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert prompt_id not in fake_bot.deleted

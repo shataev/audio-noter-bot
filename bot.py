@@ -115,7 +115,10 @@ NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to tr
 
 DRAFT_REPLACED = "✕ Draft discarded — a newer recording replaced it."
 DRAFT_CANCELLED = "✕ Draft discarded."
-DRAFT_TIMED_OUT = "✕ Draft discarded — the preview went unanswered for 30 minutes."
+DRAFT_TIMED_OUT = (
+    "✕ Draft discarded — the preview went unanswered for "
+    f"{int(PREVIEW_TIMEOUT.total_seconds() // 60)} minutes."
+)
 NOTHING_TO_CANCEL = "There is no draft open right now."
 DRAFT_GONE = "That draft is no longer available. Send a new voice message and I'll start over."
 SOMETHING_BROKE = "Something went wrong on my side. It is in the log — please try that again."
@@ -461,8 +464,11 @@ async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
-    await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
-    await context.bot.delete_message(chat_id, user_msg.message_id)
+    # Popped, so /cancel does not later try to delete a prompt that is already gone.
+    await _delete_messages(context.bot, chat_id, [
+        context.user_data.pop("edit_prompt_msg_id", None),
+        user_msg.message_id,
+    ])
     return PREVIEW
 
 
@@ -484,8 +490,11 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
-    await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
-    await context.bot.delete_message(chat_id, user_msg.message_id)
+    # Popped, so /cancel does not later try to delete a prompt that is already gone.
+    await _delete_messages(context.bot, chat_id, [
+        context.user_data.pop("edit_prompt_msg_id", None),
+        user_msg.message_id,
+    ])
     return PREVIEW
 
 
@@ -521,8 +530,11 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
-    await context.bot.delete_message(chat_id, context.user_data["edit_prompt_msg_id"])
-    await context.bot.delete_message(chat_id, user_msg.message_id)
+    # Popped, so /cancel does not later try to delete a prompt that is already gone.
+    await _delete_messages(context.bot, chat_id, [
+        context.user_data.pop("edit_prompt_msg_id", None),
+        user_msg.message_id,
+    ])
     return PREVIEW
 
 
