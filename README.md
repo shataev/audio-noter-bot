@@ -137,13 +137,44 @@ same file. Any of the three can also be passed for a single command, e.g.
 `make deploy HOST=noter`. With none of them set, `make deploy` stops with an
 explanation before it opens a connection.
 
+The ssh user needs to be able to write to `APP_DIR` and to control the unit —
+either root, or a user with a sudo rule for `systemctl` and `journalctl`.
+
 ### Deploying
 
 ```bash
 make deploy
 ```
 
-This pushes changes to GitHub, pulls them on the VPS, and restarts the bot.
+Locally it refuses to do anything until the working tree is clean and `make
+check` passes, so uncommitted work cannot be half-deployed and code that does
+not compile cannot leave the machine. Then it pushes.
+
+On the server it pulls, installs `requirements.txt`, restarts the unit, waits,
+and then proves the bot is actually up rather than assuming it:
+
+- the unit is still `active`;
+- it has not restarted since the deploy — `Restart=always` otherwise hides a
+  crash loop behind an `active` unit;
+- the journal since the restart contains `Bot started`, the line the bot logs
+  once it has registered its handlers and begun polling.
+
+If any of those fails it prints the last 40 journal lines and the revision that
+was running before, and exits non-zero. Checking `systemctl status` immediately
+after a restart proves nothing on its own: a bot that is about to die on a
+missing import is reported `active` for the second or two it takes to get there.
+
+### Rolling back
+
+Every deploy prints the revision it replaced, and a failed deploy repeats it:
+
+```bash
+make rollback REV=<git-revision>
+```
+
+That resets the server's checkout to that revision, reinstalls dependencies,
+restarts, and runs the same liveness check. The next `make deploy`
+fast-forwards back onto the branch as usual.
 
 ### First-time VPS setup
 
@@ -188,6 +219,23 @@ systemctl status noter        # check status
 journalctl -u noter -f        # live logs
 systemctl restart noter       # restart manually
 ```
+
+## Continuous integration
+
+Every push, and every pull request against `main`, runs
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml): it byte-compiles the
+project, runs `ruff check` and `ruff format --check`, and runs `pytest`.
+
+The same checks run locally, and `make deploy` will not deploy without them:
+
+```bash
+pip install -r requirements-dev.txt
+make check
+```
+
+Ruff is currently scoped away from `bot.py`, `config.py` and `services/` — see
+the note in `pyproject.toml`. Byte-compiling and `tests/test_imports.py` still
+cover those files.
 
 ## Project structure
 
