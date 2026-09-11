@@ -64,7 +64,7 @@ async def generate_weekly_report() -> str | None:
 
     full_text = "\n\n".join(sections)
     response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=settings.summary_model,
         max_tokens=1024,
         messages=[
             {"role": "system", "content": WEEKLY_PROMPT},
@@ -85,7 +85,7 @@ async def generate_daily_summary() -> str | None:
         return None
 
     response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=settings.summary_model,
         max_tokens=512,
         messages=[
             {"role": "system", "content": SUMMARY_PROMPT},
