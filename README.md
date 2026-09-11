@@ -111,7 +111,33 @@ make stop-dev
 
 ## Deployment
 
-Deploy to VPS with one command:
+### Configuring the target
+
+This repository is public, so it does not contain the address of the server it
+deploys to. `make` reads that from `deploy.mk`, which is gitignored and stays on
+your machine:
+
+```bash
+cp deploy.mk.example deploy.mk
+$EDITOR deploy.mk        # set HOST
+```
+
+`HOST` is an ssh destination. Prefer an alias defined in `~/.ssh/config` over a
+literal `user@host`, so the address, the login and the key live in one place:
+
+```
+Host noter
+    HostName 203.0.113.10
+    User deploy
+    IdentityFile ~/.ssh/id_ed25519_noter
+```
+
+`APP_DIR` (default `/opt/noter`) and `UNIT` (default `noter`) can be set in the
+same file. Any of the three can also be passed for a single command, e.g.
+`make deploy HOST=noter`. With none of them set, `make deploy` stops with an
+explanation before it opens a connection.
+
+### Deploying
 
 ```bash
 make deploy

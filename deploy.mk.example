@@ -1,0 +1,24 @@
+# Copy this to deploy.mk and fill it in. deploy.mk is gitignored: this
+# repository is public, and the address of the server it deploys to is not
+# something to publish.
+#
+#     cp deploy.mk.example deploy.mk
+#
+# HOST is an ssh destination. An ssh_config alias is better than user@host:
+# the address, the login and the key then live in ~/.ssh/config, and the
+# Makefile never has to know any of them. In ~/.ssh/config:
+#
+#     Host noter
+#         HostName 203.0.113.10
+#         User deploy
+#         IdentityFile ~/.ssh/id_ed25519_noter
+#
+# The ssh user needs to be able to write to APP_DIR and to restart the unit,
+# either as root or through sudo.
+HOST = noter
+
+# Where the checkout lives on the server. Defaults to /opt/noter.
+# APP_DIR = /opt/noter
+
+# Name of the systemd unit. Defaults to noter.
+# UNIT = noter
