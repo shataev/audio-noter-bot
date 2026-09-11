@@ -205,46 +205,179 @@ fast-forwards back onto the branch as usual.
 
 ### First-time VPS setup
 
+The bot runs as its own unprivileged user. It holds four live API credentials
+and everything it transcribes is a diary, so it is given no more of the machine
+than it needs. Run these as root on the server.
+
+**1. Create the service user.** System account, no home directory, no shell —
+nothing ever logs in as it.
+
+```bash
+useradd --system --no-create-home --shell /usr/sbin/nologin noter
+```
+
+**2. Check out the code.** It stays owned by root. The service only ever reads
+it, and a bot that cannot rewrite the code it is running is one less thing to
+worry about.
+
 ```bash
 git clone https://github.com/shataev/audio-noter-bot.git /opt/noter
 cd /opt/noter
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-nano .env  # fill in all values
+.venv/bin/pip install -r requirements.txt
 ```
 
-Create `/etc/systemd/system/noter.service`:
+**3. Put the credentials in `/etc/noter/noter.env`** — not in a `.env` sitting
+next to the code. Same `KEY=value` lines as `.env.example`, with no `export`
+and no shell expansion.
+
+```bash
+install -d -m 755 /etc/noter
+cp .env.example /etc/noter/noter.env
+$EDITOR /etc/noter/noter.env      # fill in all values
+chown root:root /etc/noter/noter.env
+chmod 600 /etc/noter/noter.env
+```
+
+systemd reads this file as root and hands the values to the service, so the
+`noter` user never needs read access to it at all.
+
+**4. Install the unit** from [`deploy/noter.service`](deploy/noter.service):
+
+```bash
+cp /opt/noter/deploy/noter.service /etc/systemd/system/noter.service
+systemctl daemon-reload
+systemctl enable --now noter
+```
+
+**5. Check it started.**
+
+```bash
+systemctl status noter
+journalctl -u noter -n 20 --no-pager    # should contain "Bot started"
+```
+
+### The unit
 
 ```ini
 [Unit]
 Description=Noter Telegram Bot
-After=network.target
+Documentation=https://github.com/shataev/audio-noter-bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=root
+Type=simple
+User=noter
+Group=noter
 WorkingDirectory=/opt/noter
 ExecStart=/opt/noter/.venv/bin/python bot.py
 Restart=always
 RestartSec=5
+EnvironmentFile=/etc/noter/noter.env
+StateDirectory=noter
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+What each line is for:
+
+| Directive | Why |
+|---|---|
+| `User=noter`, `Group=noter` | The bot shells out to nothing and serves one person. Running it as root meant a bug in any of the three API clients was a bug with root's authority. |
+| `EnvironmentFile=/etc/noter/noter.env` | Keeps the four live tokens out of the working directory, in one root-owned mode-600 file, instead of a `.env` that any process running as the service user could read. |
+| `StateDirectory=noter` | Creates `/var/lib/noter` owned by the service user. The only writable path the bot has, and where any runtime state file belongs. |
+| `NoNewPrivileges=yes` | Nothing the bot runs ever needs to gain privileges, so setuid escalation is switched off for the whole process tree. |
+| `PrivateTmp=yes` | Voice messages are written to a temporary file before transcription. A private `/tmp` keeps those recordings out of the shared one and clears them on stop. |
+| `PrivateDevices=yes` | It touches no hardware; hides physical devices and blocks creating device nodes. |
+| `ProtectSystem=strict` | The whole filesystem read-only except the state directory — `/opt/noter` included, so the service cannot modify its own code. |
+| `ProtectHome=yes` | `/home`, `/root` and `/run/user` are hidden. Nothing the bot needs lives there. |
+| `ProtectProc=invisible` | Other users' processes disappear from `/proc`. |
+| `ProtectKernelTunables=yes` | It never writes to `/proc/sys` or `/sys`. |
+| `ProtectKernelModules=yes` | It never loads a kernel module. |
+| `ProtectControlGroups=yes` | It never edits cgroups. |
+| `ProtectClock=yes` | It reads the clock for timezone handling and scheduled jobs; it never sets it. |
+| `RestrictSUIDSGID=yes` | It never creates setuid or setgid files. |
+| `RestrictNamespaces=yes` | It never creates namespaces of its own. |
+| `LockPersonality=yes` | It never changes its execution domain. |
+| `RestrictAddressFamilies=…` | HTTPS to Telegram, OpenAI and Notion, plus the local sockets glibc and journald need — nothing else. |
+| `SystemCallFilter=@system-service` | systemd's baseline set for ordinary services. If the bot ever fails to start with an unexplained `EPERM`, this is the first line to remove. |
+
+`MemoryDenyWriteExecute` is deliberately absent: it breaks JIT compilation and
+some native extensions, and Python is exactly the runtime that trips over it.
+
+`systemd-analyze security noter` scores the result, and
+`systemd-analyze verify /etc/systemd/system/noter.service` checks it parses.
+
+### Migrating an existing root install
+
+The transcriptions in the journal are personal data and `.env` holds four live
+tokens, so file ownership is the point of this, not a formality. In order, as
+root:
+
 ```bash
+# 1. Create the service user.
+useradd --system --no-create-home --shell /usr/sbin/nologin noter
+
+# 2. Move the credentials out of the working directory.
+install -d -m 755 /etc/noter
+mv /opt/noter/.env /etc/noter/noter.env
+chown root:root /etc/noter/noter.env
+chmod 600 /etc/noter/noter.env
+
+# 3. Make sure nothing is left behind: config.py calls load_dotenv(), which
+#    reads .env from the working directory if one is there.
+ls -la /opt/noter/.env    # must be "No such file or directory"
+
+# 4. Fix ownership of the code. Root owns it; the service only reads it.
+chown -R root:root /opt/noter
+chmod -R go-w /opt/noter
+
+# 5. Install the new unit and reload.
+cp /opt/noter/deploy/noter.service /etc/systemd/system/noter.service
 systemctl daemon-reload
-systemctl enable noter
-systemctl start noter
+
+# 6. Restart, and confirm it came back.
+systemctl restart noter
+sleep 10
+systemctl is-active noter
+journalctl -u noter -n 20 --no-pager    # should contain "Bot started"
 ```
 
-Useful commands:
+If it does not come back, `journalctl -u noter -n 50` says why; the usual cause
+is a value that did not survive the move into `noter.env`. Putting `User=root`
+back and reloading returns you to where you started.
+
+Anything the bot wrote under `/opt/noter` while it ran as root — there is
+nothing today, but check — needs `chown noter:noter` and moving to
+`/var/lib/noter`, because `ProtectSystem=strict` makes `/opt/noter` read-only
+to the service.
+
+### Useful commands
 
 ```bash
 systemctl status noter        # check status
 journalctl -u noter -f        # live logs
 systemctl restart noter       # restart manually
+systemd-analyze security noter
 ```
 
 ## Continuous integration
