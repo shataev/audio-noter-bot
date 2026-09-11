@@ -22,8 +22,12 @@ RestartSec=5
 EnvironmentFile=/etc/noter/noter.env
 
 # /var/lib/noter, created and owned by the service user. The only path the bot
-# can write to, and where any runtime state file belongs.
+# can write to, and where any runtime state file belongs. 0700 rather than the
+# default 0755: a saved draft is a diary entry, and noter is the only account
+# that ever reads one. Without this, systemd's default UMask=0022 would leave
+# both the directory and the file world-readable.
 StateDirectory=noter
+StateDirectoryMode=0700
 
 # --- Sandboxing ---------------------------------------------------------
 # The bot downloads voice messages, calls three HTTPS APIs and writes a log

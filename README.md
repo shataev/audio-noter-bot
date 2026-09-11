@@ -426,6 +426,7 @@ LockPersonality=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
@@ -437,7 +438,8 @@ What each line is for:
 |---|---|
 | `User=noter`, `Group=noter` | The bot shells out to nothing and serves one person. Running it as root meant a bug in any of the three API clients was a bug with root's authority. |
 | `EnvironmentFile=/etc/noter/noter.env` | Keeps the four live tokens out of the working directory, in one root-owned mode-600 file, instead of a `.env` that any process running as the service user could read. |
-| `StateDirectory=noter` | Creates `/var/lib/noter` owned by the service user. The only writable path the bot has, and where any runtime state file belongs. |
+| `StateDirectory=noter` | Creates `/var/lib/noter` owned by the service user, exported as `$STATE_DIRECTORY`. The only writable path the bot has, and where any runtime state file belongs. |
+| `StateDirectoryMode=0700` | The default is 0755, which with systemd's default `UMask=0022` would leave saved drafts world-readable on the server. A draft is a diary entry; `noter` is the only account that reads one. |
 | `NoNewPrivileges=yes` | Nothing the bot runs ever needs to gain privileges, so setuid escalation is switched off for the whole process tree. |
 | `PrivateTmp=yes` | Voice messages are written to a temporary file before transcription. A private `/tmp` keeps those recordings out of the shared one and clears them on stop. |
 | `PrivateDevices=yes` | It touches no hardware; hides physical devices and blocks creating device nodes. |
