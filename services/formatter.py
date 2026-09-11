@@ -16,7 +16,7 @@ SYSTEM_PROMPT = """Ты помогаешь вести личный дневни�
 
 async def format_entry(transcription: str) -> tuple[str, str, list[str]]:
     response = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=settings.formatter_model,
         max_tokens=1024,
         response_format={"type": "json_object"},
         messages=[

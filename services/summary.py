@@ -1,8 +1,6 @@
-import json
-import httpx
 import openai
 from config import settings
-from services.notion import API, HEADERS, get_today_page, get_week_pages
+from services.notion import get_page_blocks, get_today_page, get_week_pages
 
 openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -15,13 +13,7 @@ Do not use bullet points — write as a short paragraph."""
 
 async def _fetch_page_text(page_id: str) -> str:
     """Fetches all text blocks from a Notion page and returns them as plain text."""
-    async with httpx.AsyncClient() as http:
-        resp = await http.get(
-            f"{API}/blocks/{page_id}/children",
-            headers=HEADERS,
-        )
-        resp.raise_for_status()
-        blocks = resp.json().get("results", [])
+    blocks = await get_page_blocks(page_id)
 
     lines = []
     for block in blocks:
@@ -64,7 +56,7 @@ async def generate_weekly_report() -> str | None:
 
     full_text = "\n\n".join(sections)
     response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=settings.summary_model,
         max_tokens=1024,
         messages=[
             {"role": "system", "content": WEEKLY_PROMPT},
@@ -85,7 +77,7 @@ async def generate_daily_summary() -> str | None:
         return None
 
     response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=settings.summary_model,
         max_tokens=512,
         messages=[
             {"role": "system", "content": SUMMARY_PROMPT},

@@ -1,0 +1,17 @@
+# Copy this to deploy.mk and set HOST. deploy.mk is gitignored.
+#
+#     cp deploy.mk.example deploy.mk
+#
+# HOST is the name of an entry in your ~/.ssh/config — not a hostname and not
+# an address. The address, the login and the key belong there, which is why
+# this repository, which is public, never has to know any of them:
+#
+#     Host noter-vps
+#         HostName <your server>
+#         User noter-deploy
+#         IdentityFile ~/.ssh/id_ed25519_noter_deploy
+#         IdentitiesOnly yes
+#
+# That key is a forced-command key on the server: it can ask for a deploy or a
+# rollback and cannot reach a shell. See "Deployment" in the README.
+HOST = noter-vps

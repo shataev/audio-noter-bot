@@ -1,0 +1,35 @@
+# Tool configuration only. The bot is run from a checkout, not installed as a
+# package, so there is no [project] table and no build backend here.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# bot.py, config.py and services/ are being rewritten on two other branches
+# right now. Linting or reformatting them from here would collide with that
+# work, so they are excluded for the moment. Drop these exclusions once both
+# branches have landed — `ruff check` reports 21 violations in them today,
+# all of them import order, line length and two unused imports.
+#
+# tests/ is deliberately NOT excluded: new code should meet the rules from the
+# day it is written, which is the whole point of adding them now. Anything
+# under tests/ has to satisfy line-length 100, select = E,F,I,UP,B, and
+# `ruff format`. `make check` reports all three before a deploy, and CI before
+# a merge.
+extend-exclude = ["bot.py", "config.py", "services"]
+
+[tool.ruff.lint]
+# Deliberately modest for a project this size: pyflakes (F) and the pycodestyle
+# errors (E) catch real mistakes, I keeps imports ordered, UP and B are the two
+# rule families that have caught actual bugs rather than style opinions.
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The project is a plain checkout, not an installed package: put the repository
+# root on sys.path so the tests can import bot, config and services.
+pythonpath = ["."]
+# Set explicitly rather than left to the pytest-asyncio default, so that
+# @pytest.mark.asyncio is required and behaves the same on every machine and
+# in CI regardless of which pytest-asyncio version is installed.
+asyncio_mode = "strict"
