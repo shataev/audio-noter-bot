@@ -65,6 +65,9 @@ The bot works with the Notion Journal database described in the [official guide]
 
 ## Installation
 
+Needs Python 3.10 or newer — that is the floor the pinned dependencies set, and
+the code annotates with `dict | None`.
+
 ```bash
 git clone https://github.com/shataev/audio-noter-bot.git
 cd audio-noter-bot
@@ -171,8 +174,44 @@ same file. Any of the three can also be passed for a single command, e.g.
 `make deploy HOST=noter`. With none of them set, `make deploy` stops with an
 explanation before it opens a connection.
 
-The ssh user needs to be able to write to `APP_DIR` and to control the unit —
-either root, or a user with a sudo rule for `systemctl` and `journalctl`.
+### The deploy user
+
+`make deploy` connects as one account and does three things as it: `git pull`,
+`pip install`, and `systemctl` / `journalctl` through `sudo`. So that account
+must
+
+- **own `APP_DIR` and its `.venv`.** The pull and the install deliberately do
+  not go through `sudo` — the less that runs as root on the server, the better.
+- **be able to restart the unit and read its journal without a password.** A
+  deploy has no terminal, so a `sudo` password prompt is a hang, not a question.
+
+Deploying as root satisfies both with nothing to set up. To deploy as an
+ordinary user instead — `deploy` in the examples — give it the code and a
+narrow rule:
+
+```bash
+chown -R deploy:deploy /opt/noter
+visudo -f /etc/sudoers.d/noter-deploy
+```
+
+```
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart noter, \
+                            /usr/bin/systemctl is-active --quiet noter, \
+                            /usr/bin/systemctl show -p NRestarts --value noter, \
+                            /usr/bin/journalctl -u noter *
+```
+
+Check it before you rely on it — the paths have to match `command -v systemctl`
+and `command -v journalctl` on your server:
+
+```bash
+sudo -n systemctl is-active --quiet noter; echo $?
+```
+
+If that asks for a password, the deploy fails at the restart.
+
+Whichever account you use, the one that must **not** own the code is `noter`,
+the user the bot runs as. It only ever reads it.
 
 ### Deploying
 
@@ -191,7 +230,10 @@ and then proves the bot is actually up rather than assuming it:
 - it has not restarted since the deploy — `Restart=always` otherwise hides a
   crash loop behind an `active` unit;
 - the journal since the restart contains `Bot started`, the line the bot logs
-  once it has registered its handlers and begun polling.
+  once it has registered its handlers and begun polling. Note that it is logged
+  immediately *before* polling starts, so a failure inside polling itself — a
+  revoked token, a second poller — still satisfies it; the `active` check ten
+  seconds later is what catches those.
 
 If any of those fails it prints the last 40 journal lines and the revision that
 was running before, and exits non-zero. Checking `systemctl status` immediately
@@ -223,9 +265,11 @@ nothing ever logs in as it.
 useradd --system --no-create-home --shell /usr/sbin/nologin noter
 ```
 
-**2. Check out the code.** It stays owned by root. The service only ever reads
-it, and a bot that cannot rewrite the code it is running is one less thing to
-worry about.
+**2. Check out the code.** It ends up owned by whoever you deploy as — root
+here; see [The deploy user](#the-deploy-user) to use an ordinary account
+instead. What matters is that `noter` does not own it: the service only ever
+reads the code, and a bot that cannot rewrite what it is running is one less
+thing to worry about.
 
 ```bash
 git clone https://github.com/shataev/audio-noter-bot.git /opt/noter
@@ -354,8 +398,11 @@ chmod 600 /etc/noter/noter.env
 #    reads .env from the working directory if one is there.
 ls -la /opt/noter/.env    # must be "No such file or directory"
 
-# 4. Fix ownership of the code. Root owns it; the service only reads it.
-chown -R root:root /opt/noter
+# 4. Fix ownership of the code. The deploy user owns it, the service user only
+#    reads it. DEPLOY_USER is whoever you ssh in as — root unless you set up a
+#    separate account, see "The deploy user" above.
+DEPLOY_USER=root
+chown -R "$DEPLOY_USER:$DEPLOY_USER" /opt/noter
 chmod -R go-w /opt/noter
 
 # 5. Install the new unit and reload.

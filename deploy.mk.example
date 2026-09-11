@@ -13,8 +13,9 @@
 #         User deploy
 #         IdentityFile ~/.ssh/id_ed25519_noter
 #
-# The ssh user needs to be able to write to APP_DIR and to restart the unit,
-# either as root or through sudo.
+# Whoever you connect as must own APP_DIR and be able to restart the unit
+# without a password prompt. Deploying as root needs no setup; see "The deploy
+# user" in the README to use an ordinary account instead.
 HOST = noter
 
 # Where the checkout lives on the server. Defaults to /opt/noter.
