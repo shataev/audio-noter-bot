@@ -43,10 +43,11 @@ def api(monkeypatch):
     return recorder
 
 
-def _audio_file(tmp_path, megabytes: float):
+def _audio_file(tmp_path, megabytes: float, decimal: bool = False):
     path = tmp_path / "voice.ogg"
+    unit = 1_000_000 if decimal else 1024 * 1024
     with open(path, "wb") as handle:
-        handle.truncate(int(megabytes * 1024 * 1024))
+        handle.truncate(int(megabytes * unit))
     return str(path)
 
 
@@ -60,6 +61,22 @@ async def test_a_26mb_recording_is_rejected_before_anything_is_uploaded(api, tmp
     assert api.calls == [], "nothing was sent to the API"
     assert "26.0 MB" in str(raised.value)
     assert "25 MB" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_255mb_recording_is_rejected_too(api, tmp_path):
+    """OpenAI quotes 25 MB decimal, so the guard has to mean decimal.
+
+    Read as MiB the ceiling is 26,214,400 bytes, and everything in the band
+    between that and 25,000,000 sails past a guard whose own message says it
+    accepts at most 25 MB. The 26 MB test above passes under either reading.
+    """
+    path = _audio_file(tmp_path, 25.5, decimal=True)
+
+    with pytest.raises(whisper.AudioTooLargeError):
+        await whisper.transcribe(path)
+
+    assert api.calls == []
 
 
 @pytest.mark.asyncio

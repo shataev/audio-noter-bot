@@ -29,7 +29,10 @@ class _Settings:
 
     @property
     def max_audio_bytes(self) -> int:
-        return int(self.max_audio_mb * 1024 * 1024)
+        # Decimal MB, because that is what the OpenAI limit is quoted in. Reading
+        # it as MiB would let a 25.5 MB file past a guard whose whole purpose is
+        # to stop it reaching the API, and whose message says "at most 25 MB".
+        return int(self.max_audio_mb * 1_000_000)
 
 
 settings = _Settings()
