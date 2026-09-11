@@ -168,9 +168,64 @@ def test_day_title_survives_many_entries_and_keeps_its_prefix():
     assert notion.ELLIPSIS not in short_day
 
 
+PASTED_PARAGRAPH = "Это вставленный абзац из другого приложения. " * 60
+
+
+def _oldest_were_dropped(title: str, prefix: str) -> bool:
+    """True only for the drop guard.
+
+    Both guards mark themselves with an ellipsis — a capped name ends in one,
+    and dropped names are replaced by one — so "… appears somewhere" cannot tell
+    them apart. The drop marker is always the first item in the list.
+    """
+    return title.startswith(f"{prefix} | {notion.ELLIPSIS}, ")
+
+
+def test_an_ordinary_day_is_the_accumulated_list_and_nothing_else():
+    """The format is the owner's table of contents; neither guard may touch it."""
+    prefix = "9 мая"
+    entries = [f"Событие {n}" for n in range(1, 66)]
+
+    title = notion._compose_day_title(prefix, entries)
+
+    assert title == f"{prefix} | " + ", ".join(entries), "no reshaping, no shortening"
+    assert notion.ELLIPSIS not in title
+    # Well past the 65 entries a real day would hold, still untouched.
+    for count in (80, 100):
+        longer = notion._compose_day_title(prefix, [f"Событие {n}" for n in range(1, count + 1)])
+        assert len(longer) <= notion.MAX_TITLE_CHARS
+        assert notion.ELLIPSIS not in longer
+
+
+def test_capping_one_name_does_not_drop_any_others():
+    """The cheap guard fires alone; the drop guard is a genuine last resort."""
+    prefix = "9 мая"
+    entries = ["Событие 1", PASTED_PARAGRAPH, "Событие 3"]
+
+    title = notion._compose_day_title(prefix, entries)
+    names = notion._split_day_title(title)[1]
+
+    assert len(names) == 3, "every entry of the day is still named"
+    assert max(len(name) for name in names) == notion.MAX_ENTRY_TITLE_CHARS
+    assert not _oldest_were_dropped(title, prefix)
+
+
+def test_names_are_dropped_only_once_capping_is_not_enough():
+    prefix = "9 мая"
+
+    # Capping alone absorbs a handful of pasted paragraphs.
+    few = notion._compose_day_title(prefix, [PASTED_PARAGRAPH] * 5)
+    assert not _oldest_were_dropped(few, prefix)
+
+    # It takes an implausible day of them before the oldest have to go.
+    many = notion._compose_day_title(prefix, [PASTED_PARAGRAPH] * 40)
+    assert _oldest_were_dropped(many, prefix)
+    assert len(many) <= notion.MAX_TITLE_CHARS
+    assert many.startswith(f"{prefix} | "), "the date prefix survives the drop"
+
+
 def test_one_pathological_entry_title_cannot_blow_the_limit():
-    pasted = "Это вставленный абзац из другого приложения. " * 60
-    title = notion._compose_day_title("9 сентября", ["Обычная запись", pasted])
+    title = notion._compose_day_title("9 сентября", ["Обычная запись", PASTED_PARAGRAPH])
 
     assert len(title) <= notion.MAX_TITLE_CHARS
     assert title.startswith("9 сентября | Обычная запись, ")
