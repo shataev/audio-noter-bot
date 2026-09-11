@@ -189,3 +189,7 @@ Both Whisper and GPT-4o-mini are very cheap for personal use:
 | GPT-4o-mini | $0.15 / 1M tokens | ~$0.00005                     |
 
 100 entries/month ≈ **$0.60**
+
+## License
+
+Released under the [MIT License](LICENSE).
