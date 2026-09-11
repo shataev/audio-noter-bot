@@ -68,7 +68,7 @@ PREVIEW_TIMEOUT = timedelta(minutes=30)
 # every push. Without somewhere to put them a preview from a minute earlier comes back
 # with working buttons and nothing behind them. The file holds a draft, not a secret,
 # but it is local runtime state and is gitignored.
-STATE_FILE = "bot_state.pickle"
+STATE_FILE_NAME = "bot_state.pickle"
 CONVERSATION_NAME = "preview_flow"
 
 WELCOME_TEXT = """👋 Welcome to Noter!
@@ -645,11 +645,24 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.warning("Could not tell the user about the error", exc_info=True)
 
 
+def state_file_path() -> str:
+    """Where the draft pickle goes.
+
+    systemd exports STATE_DIRECTORY for a unit that declares StateDirectory=, and under
+    the deployment's ProtectSystem=strict that directory is the only one the bot may
+    write to -- the working directory is read-only. A relative path would not stop the
+    bot if it failed: a persistence error is reported with no update attached, so it is
+    logged and swallowed, and the draft silently never gets written. The current
+    directory is the fallback for running outside systemd.
+    """
+    return os.path.join(os.environ.get("STATE_DIRECTORY", "."), STATE_FILE_NAME)
+
+
 def build_application() -> Application:
     app = (
         ApplicationBuilder()
         .token(settings.telegram_token)
-        .persistence(PicklePersistence(filepath=STATE_FILE))
+        .persistence(PicklePersistence(filepath=state_file_path()))
         .build()
     )
 

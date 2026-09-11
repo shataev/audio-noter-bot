@@ -233,7 +233,7 @@ def _trigger_fields(job):
 
 def test_weekly_report_is_scheduled_for_sunday(tmp_path, monkeypatch):
     """`days=(6,)` means Saturday in python-telegram-bot >= 20; Sunday is 0."""
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     app = bot.build_application()
 
     jobs = {job.name: job for job in app.job_queue.jobs()}
@@ -246,7 +246,7 @@ def test_weekly_report_is_scheduled_for_sunday(tmp_path, monkeypatch):
 
 
 def test_daily_summary_runs_every_day(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     app = bot.build_application()
 
     jobs = {job.name: job for job in app.job_queue.jobs()}
@@ -414,7 +414,7 @@ def _conversation_handler(app):
 
 
 def test_a_second_voice_message_during_a_preview_is_not_dropped(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     conv = _conversation_handler(bot.build_application())
     update = _real_voice_update()
 
@@ -432,7 +432,7 @@ def test_a_second_voice_message_during_a_preview_is_not_dropped(tmp_path, monkey
 
 @pytest.mark.parametrize("state_name", ["PREVIEW", "EDIT_TITLE", "EDIT_TEXT", "EDIT_TAGS"])
 def test_a_voice_message_is_accepted_from_every_state(tmp_path, monkeypatch, state_name):
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     conv = _conversation_handler(bot.build_application())
     update = _real_voice_update()
 
@@ -443,7 +443,7 @@ def test_a_voice_message_is_accepted_from_every_state(tmp_path, monkeypatch, sta
 
 
 def test_cancel_is_reachable_from_every_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     conv = _conversation_handler(bot.build_application())
 
     assert any(
@@ -571,8 +571,8 @@ async def test_a_text_reply_without_a_draft_does_not_raise(fake_bot, context):
 
 
 def test_drafts_are_persisted_across_a_restart(tmp_path, monkeypatch):
-    state_file = tmp_path / "bot_state.pickle"
-    monkeypatch.setattr(bot, "STATE_FILE", str(state_file))
+    state_file = tmp_path / bot.STATE_FILE_NAME
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
 
     app = bot.build_application()
 
@@ -585,15 +585,37 @@ def test_drafts_are_persisted_across_a_restart(tmp_path, monkeypatch):
     assert conv.persistent is True
 
 
+def test_the_state_file_goes_where_the_service_may_write(tmp_path, monkeypatch):
+    """The deployed unit makes everything but StateDirectory read-only.
+
+    A relative path resolves against the working directory, which is read-only there.
+    The resulting PermissionError never reaches the user — python-telegram-bot reports
+    persistence failures with no update attached — so the draft would silently never be
+    written. systemd exports the writable directory as STATE_DIRECTORY; use it.
+    """
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+
+    assert bot.state_file_path() == str(tmp_path / bot.STATE_FILE_NAME)
+    assert os.path.isabs(bot.state_file_path())
+    assert str(bot.build_application().persistence.filepath) == str(tmp_path / bot.STATE_FILE_NAME)
+
+
+def test_the_state_file_falls_back_to_the_working_directory(monkeypatch):
+    """Outside systemd there is no STATE_DIRECTORY, and the old behaviour is right."""
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+
+    assert bot.state_file_path() == os.path.join(".", bot.STATE_FILE_NAME)
+
+
 def test_a_global_error_handler_is_registered(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"))
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     app = bot.build_application()
 
     assert bot.handle_error in app.error_handlers
 
 
 def test_a_stale_callback_handler_catches_what_the_conversation_does_not(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"))
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     app = bot.build_application()
 
     handlers = app.handlers[0]
