@@ -381,3 +381,131 @@ async def test_successful_run_also_removes_the_temp_file(tmp_path, monkeypatch, 
 
     assert state == bot.PREVIEW
     assert list(tmp_path.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# Defect 2 — an abandoned preview wedged the bot until restart
+# --------------------------------------------------------------------------- #
+
+from datetime import datetime, timezone
+
+from telegram import Chat, Message, Update, User, Voice
+
+
+def _real_voice_update(update_id=1, message_id=7):
+    """A genuine telegram.Update, so the ConversationHandler's own routing is exercised."""
+    user = User(id=1, first_name="Owner", is_bot=False)
+    chat = Chat(id=1, type=Chat.PRIVATE)
+    message = Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=user,
+        voice=Voice(file_id="voice-1", file_unique_id="unique-1", duration=3),
+    )
+    return Update(update_id=update_id, message=message)
+
+
+def _conversation_handler(app):
+    for handler in app.handlers[0]:
+        if isinstance(handler, bot.ConversationHandler):
+            return handler
+    raise AssertionError("no ConversationHandler registered")
+
+
+def test_a_second_voice_message_during_a_preview_is_not_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    conv = _conversation_handler(bot.build_application())
+    update = _real_voice_update()
+
+    # No conversation yet: the entry point matches, as it always did.
+    assert conv.check_update(update) is not None
+
+    # Now pretend a preview is already open and left untouched.
+    key = (update.effective_chat.id, update.effective_user.id)
+    conv._conversations[key] = bot.PREVIEW
+
+    assert conv.check_update(update) is not None, (
+        "a voice message sent during an open preview must be handled, not swallowed"
+    )
+
+
+@pytest.mark.parametrize("state_name", ["PREVIEW", "EDIT_TITLE", "EDIT_TEXT", "EDIT_TAGS"])
+def test_a_voice_message_is_accepted_from_every_state(tmp_path, monkeypatch, state_name):
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    conv = _conversation_handler(bot.build_application())
+    update = _real_voice_update()
+
+    key = (update.effective_chat.id, update.effective_user.id)
+    conv._conversations[key] = getattr(bot, state_name)
+
+    assert conv.check_update(update) is not None
+
+
+def test_cancel_is_reachable_from_every_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"), raising=False)
+    conv = _conversation_handler(bot.build_application())
+
+    assert any(
+        getattr(handler, "commands", None) == frozenset({"cancel"})
+        for handler in conv.fallbacks
+    ), "/cancel must be a fallback so it works in every state"
+    assert conv.conversation_timeout == bot.PREVIEW_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_a_new_recording_takes_the_buttons_off_the_old_preview(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
+
+    first_buttons_id = context.user_data["buttons_msg_id"]
+    assert fake_bot.find(first_buttons_id).reply_markup is not None
+
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Вторая", "тело", [])
+    state = await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"]["title"] == "Вторая"
+    assert context.user_data["buttons_msg_id"] != first_buttons_id
+
+    retired = fake_bot.find(first_buttons_id)
+    assert retired.reply_markup is None
+    assert retired.text == bot.DRAFT_REPLACED
+
+
+@pytest.mark.asyncio
+async def test_cancel_discards_the_draft_and_its_messages(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", ["sport"])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    content_ids = [context.user_data[key] for key in ("title_msg_id", "text_msg_id", "tags_msg_id")]
+
+    state = await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert sorted(fake_bot.deleted) == sorted(content_ids)
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_draft_says_so(fake_bot, context):
+    state = await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert state == bot.ConversationHandler.END
+    assert fake_bot.sent[-1].text == bot.NOTHING_TO_CANCEL
+
+
+@pytest.mark.asyncio
+async def test_timeout_takes_the_buttons_off_the_stale_preview(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+
+    state = await bot.handle_preview_timeout(text_update(fake_bot, "anything"), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_TIMED_OUT

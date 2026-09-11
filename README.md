@@ -18,6 +18,7 @@ A Telegram bot that turns voice messages into structured diary entries in Notion
 |-----------|------------------------------------|
 | `/start`  | Welcome message and quick overview |
 | `/help`   | Detailed usage instructions        |
+| `/cancel` | Throw away the draft being previewed |
 
 ## Editing before saving
 

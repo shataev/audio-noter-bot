@@ -3,7 +3,7 @@ import logging
 import os
 import tempfile
 import zoneinfo
-from datetime import time
+from datetime import time, timedelta
 
 from telegram import Bot, Message, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -39,6 +40,21 @@ SUNDAY = 0
 
 DAILY_SUMMARY_JOB = "daily_summary"
 WEEKLY_REPORT_JOB = "weekly_report"
+
+# Everything in user_data that belongs to one draft. Cleared together, so a draft can
+# never survive half-way and leave message ids pointing at a preview that is gone.
+DRAFT_KEYS = (
+    "pending",
+    "title_msg_id",
+    "text_msg_id",
+    "tags_msg_id",
+    "buttons_msg_id",
+    "edit_prompt_msg_id",
+)
+
+# Long enough that no realistic dictate-and-edit session gets cut off, short enough
+# that a preview abandoned in the morning is not still live when the 21:00 jobs run.
+PREVIEW_TIMEOUT = timedelta(minutes=30)
 
 WELCOME_TEXT = """👋 Welcome to Noter!
 
@@ -81,6 +97,11 @@ TRANSCRIBE_FAILED = "I couldn't transcribe that voice message. Send it again and
 FORMAT_FAILED = "I transcribed it but couldn't turn it into an entry. Send the voice message again."
 PREVIEW_FAILED = "I couldn't show the preview for that entry. Send the voice message again."
 NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to try again."
+
+DRAFT_REPLACED = "✕ Draft discarded — a newer recording replaced it."
+DRAFT_CANCELLED = "✕ Draft discarded."
+DRAFT_TIMED_OUT = "✕ Draft discarded — the preview went unanswered for 30 minutes."
+NOTHING_TO_CANCEL = "There is no draft open right now."
 
 TITLE_TEMPLATE = "<b>{title}</b>"
 TAG_TEMPLATE = "<code>{tag}</code>"
@@ -129,6 +150,37 @@ def _tags_line(tags: list[str]) -> str:
     return " ".join(render(TAG_TEMPLATE, tag=t) for t in all_tags)
 
 
+def _clear_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Forgets the current draft and returns what was stored, message ids included."""
+    return {key: context.user_data.pop(key, None) for key in DRAFT_KEYS}
+
+
+async def _retire_preview(bot: Bot, chat_id: int, draft: dict, notice: str) -> bool:
+    """Takes the buttons off a preview that is no longer backed by a draft.
+
+    Editing the text of the buttons message and passing no markup is what removes the
+    keyboard, so the dead buttons disappear rather than sitting there doing nothing.
+    """
+    buttons_msg_id = draft.get("buttons_msg_id")
+    if buttons_msg_id is None:
+        return False
+    try:
+        await edit_html(bot, chat_id, buttons_msg_id, notice, reply_markup=None)
+    except Exception:
+        logger.warning("Could not retire preview message %s", buttons_msg_id, exc_info=True)
+    return True
+
+
+async def _delete_messages(bot: Bot, chat_id: int, message_ids) -> None:
+    for message_id in message_ids:
+        if message_id is None:
+            continue
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            logger.warning("Could not delete message %s", message_id, exc_info=True)
+
+
 def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
     highlight_btn = (
         InlineKeyboardButton("⭐ Highlighted", callback_data="toggle_highlight")
@@ -170,6 +222,14 @@ def _discard_temp_file(path: str | None) -> None:
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
+
+    # A recording sent while a preview is still open replaces it. The old preview keeps
+    # its message ids in user_data, and those are about to be overwritten, so its
+    # buttons have to come off first or they would end up driving the new draft.
+    previous = _clear_draft(context)
+    if previous.get("pending") is not None:
+        await _retire_preview(context.bot, update.effective_chat.id, previous, DRAFT_REPLACED)
+
     await message.reply_text("Listening...")
 
     # The download lives inside the guarded region: get_file and download_to_drive can
@@ -360,6 +420,34 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return PREVIEW
 
 
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = _clear_draft(context)
+    if draft.get("pending") is None:
+        await update.effective_message.reply_text(NOTHING_TO_CANCEL)
+        return ConversationHandler.END
+
+    chat_id = update.effective_chat.id
+    await _delete_messages(context.bot, chat_id, [
+        draft["title_msg_id"],
+        draft["text_msg_id"],
+        draft["tags_msg_id"],
+        draft["edit_prompt_msg_id"],
+    ])
+    if not await _retire_preview(context.bot, chat_id, draft, DRAFT_CANCELLED):
+        await update.effective_message.reply_text(DRAFT_CANCELLED)
+    return ConversationHandler.END
+
+
+async def handle_preview_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = _clear_draft(context)
+    if draft.get("pending") is None:
+        return ConversationHandler.END
+
+    logger.info("Preview timed out, discarding draft")
+    await _retire_preview(context.bot, update.effective_chat.id, draft, DRAFT_TIMED_OUT)
+    return ConversationHandler.END
+
+
 async def handle_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Generating weekly report...")
     try:
@@ -424,6 +512,7 @@ def build_application() -> Application:
         CommandHandler("help", handle_help),
         CommandHandler("weekly", handle_weekly),
     ]
+    cancel_handler = CommandHandler("cancel", handle_cancel)
 
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.VOICE & user_filter, handle_voice)],
@@ -439,12 +528,19 @@ def build_application() -> Application:
             EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_title), *command_handlers],
             EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_text), *command_handlers],
             EDIT_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_tags), *command_handlers],
+            ConversationHandler.TIMEOUT: [TypeHandler(Update, handle_preview_timeout)],
         },
-        fallbacks=[],
+        fallbacks=[cancel_handler],
+        # With allow_reentry the entry points are checked in every state, not only when
+        # no conversation is running, so a new voice message is picked up from PREVIEW
+        # and from all three editing states. A VOICE handler added to PREVIEW alone
+        # would still swallow a recording sent while the bot waits for a new title.
+        allow_reentry=True,
+        conversation_timeout=PREVIEW_TIMEOUT,
     )
 
     app.add_handler(conv_handler)
-    for handler in command_handlers:
+    for handler in [*command_handlers, cancel_handler]:
         app.add_handler(handler)
 
     tz = zoneinfo.ZoneInfo(settings.timezone)
