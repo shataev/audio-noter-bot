@@ -6,6 +6,7 @@ from datetime import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -28,6 +29,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PREVIEW, EDIT_TITLE, EDIT_TEXT, EDIT_TAGS = range(4)
+
+# `JobQueue.run_daily` numbers weekdays 0-6 as Sunday-Saturday, not Monday-Sunday.
+# The mapping was flipped in python-telegram-bot 20.0, and the old reading of it is
+# why the weekly report used to arrive on Saturday. Never pass a bare number here.
+SUNDAY = 0
+
+DAILY_SUMMARY_JOB = "daily_summary"
+WEEKLY_REPORT_JOB = "weekly_report"
 
 WELCOME_TEXT = """👋 Welcome to Noter!
 
@@ -318,7 +327,7 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Error generating daily summary")
 
 
-def main() -> None:
+def build_application() -> Application:
     app = ApplicationBuilder().token(settings.telegram_token).build()
 
     user_filter = filters.User(user_id=settings.allowed_user_id)
@@ -355,13 +364,20 @@ def main() -> None:
     app.job_queue.run_daily(
         send_daily_summary,
         time=time(21, 0, tzinfo=tz),
+        name=DAILY_SUMMARY_JOB,
     )
     app.job_queue.run_daily(
         send_weekly_report,
         time=time(21, 0, tzinfo=tz),
-        days=(6,),  # Sunday only
+        days=(SUNDAY,),
+        name=WEEKLY_REPORT_JOB,
     )
 
+    return app
+
+
+def main() -> None:
+    app = build_application()
     logger.info("Bot started")
     app.run_polling()
 
