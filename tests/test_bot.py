@@ -14,13 +14,16 @@ os.environ.setdefault("NOTION_DATABASE_ID", "test-db")
 os.environ.setdefault("ALLOWED_USER_ID", "1")
 os.environ.setdefault("TIMEZONE", "Europe/Moscow")
 
-import pytest
+import asyncio
+from datetime import datetime, timezone
+from xml.etree import ElementTree
 
+import pytest
+from telegram import CallbackQuery, Chat, Message, Update, User, Voice
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 import bot
-
 
 # --------------------------------------------------------------------------- #
 # A stub Telegram, standing in for the Bot API.
@@ -34,8 +37,6 @@ import bot
 # one unterminated, which the API rejects with "Can't parse entities". It is only
 # used to show what the old code sent; nothing in the bot uses Markdown any more.
 # --------------------------------------------------------------------------- #
-
-from xml.etree import ElementTree
 
 
 def _check_parse(text, parse_mode):
@@ -95,7 +96,9 @@ class FakeBot:
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
         return self._record(text, parse_mode, reply_markup)
 
-    async def edit_message_text(self, chat_id, message_id, text, parse_mode=None, reply_markup=None, **kwargs):
+    async def edit_message_text(
+        self, chat_id, message_id, text, parse_mode=None, reply_markup=None, **kwargs
+    ):
         _check_parse(text, parse_mode)
         message = self.find(message_id)
         message.text = text
@@ -148,13 +151,18 @@ class FakeCallbackQuery:
 
     async def edit_message_text(self, text, parse_mode=None, reply_markup=None, **kwargs):
         return await self._bot.edit_message_text(
-            self._bot.chat_id, self.message.message_id, text,
-            parse_mode=parse_mode, reply_markup=reply_markup,
+            self._bot.chat_id,
+            self.message.message_id,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
 
     async def edit_message_reply_markup(self, reply_markup=None, **kwargs):
         return await self._bot.edit_message_reply_markup(
-            self._bot.chat_id, self.message.message_id, reply_markup=reply_markup,
+            self._bot.chat_id,
+            self.message.message_id,
+            reply_markup=reply_markup,
         )
 
 
@@ -204,10 +212,14 @@ def text_update(fake_bot, text, message_id=50):
 
 def callback_update(fake_bot, data, message_id):
     message = FakeMessage(fake_bot, message_id)
-    return FakeUpdate(fake_bot, message=message, callback_query=FakeCallbackQuery(fake_bot, data, message))
+    return FakeUpdate(
+        fake_bot, message=message, callback_query=FakeCallbackQuery(fake_bot, data, message)
+    )
 
 
-async def stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, title, text, tags, download_fails=False):
+async def stub_voice_pipeline(
+    monkeypatch, tmp_path, fake_bot, title, text, tags, download_fails=False
+):
     """Points the voice pipeline at stubs and at a temp dir the test can inspect."""
     monkeypatch.setattr(bot.tempfile, "tempdir", str(tmp_path))
     fake_bot.files["voice-1"] = FakeFile(fail=download_fails)
@@ -269,7 +281,9 @@ AWKWARD_REPORT = "Неделя была насыщенной.\n- 5*5 трени�
 
 
 @pytest.mark.asyncio
-async def test_preview_survives_formatting_characters_in_title(tmp_path, monkeypatch, fake_bot, context):
+async def test_preview_survives_formatting_characters_in_title(
+    tmp_path, monkeypatch, fake_bot, context
+):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, AWKWARD_TITLE, "тело записи", [])
 
     state = await bot.handle_voice(voice_update(fake_bot), context)
@@ -282,14 +296,22 @@ async def test_preview_survives_formatting_characters_in_title(tmp_path, monkeyp
 
 @pytest.mark.asyncio
 async def test_tags_typed_by_the_user_do_not_break_the_message(fake_bot, context):
-    context.user_data.update({
-        "pending": {"title": "Заголовок", "text": "тело", "tags": []},
-        "title_msg_id": (await fake_bot.send_message(1, "<b>Заголовок</b>", ParseMode.HTML)).message_id,
-        "text_msg_id": (await fake_bot.send_message(1, "тело")).message_id,
-        "tags_msg_id": (await fake_bot.send_message(1, bot._tags_line([]), ParseMode.HTML)).message_id,
-        "buttons_msg_id": (await fake_bot.send_message(1, "Actions:")).message_id,
-        "edit_prompt_msg_id": (await fake_bot.send_message(1, "Send tags separated by commas:")).message_id,
-    })
+    context.user_data.update(
+        {
+            "pending": {"title": "Заголовок", "text": "тело", "tags": []},
+            "title_msg_id": (
+                await fake_bot.send_message(1, "<b>Заголовок</b>", ParseMode.HTML)
+            ).message_id,
+            "text_msg_id": (await fake_bot.send_message(1, "тело")).message_id,
+            "tags_msg_id": (
+                await fake_bot.send_message(1, bot._tags_line([]), ParseMode.HTML)
+            ).message_id,
+            "buttons_msg_id": (await fake_bot.send_message(1, "Actions:")).message_id,
+            "edit_prompt_msg_id": (
+                await fake_bot.send_message(1, "Send tags separated by commas:")
+            ).message_id,
+        }
+    )
 
     state = await bot.receive_new_tags(text_update(fake_bot, ", ".join(AWKWARD_TAGS)), context)
 
@@ -317,7 +339,9 @@ async def test_weekly_report_with_an_unpaired_asterisk_is_delivered(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_daily_summary_job_with_an_unpaired_asterisk_is_delivered(monkeypatch, fake_bot, context):
+async def test_daily_summary_job_with_an_unpaired_asterisk_is_delivered(
+    monkeypatch, fake_bot, context
+):
     async def fake_summary():
         return "День прошёл 3*4 раза лучше & <ярче>"
 
@@ -336,6 +360,7 @@ def test_render_escapes_every_interpolated_value():
 # --------------------------------------------------------------------------- #
 # Defects 6 and 7 — exception text in the chat, and a leaked temp file
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.asyncio
 async def test_failing_download_leaves_no_temp_file(tmp_path, monkeypatch, fake_bot, context):
@@ -363,7 +388,9 @@ async def test_failing_download_reports_plainly(tmp_path, monkeypatch, fake_bot,
 
 
 @pytest.mark.asyncio
-async def test_failing_transcription_is_distinguishable_and_cleans_up(tmp_path, monkeypatch, fake_bot, context):
+async def test_failing_transcription_is_distinguishable_and_cleans_up(
+    tmp_path, monkeypatch, fake_bot, context
+):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
 
     async def boom(path):
@@ -393,10 +420,6 @@ async def test_successful_run_also_removes_the_temp_file(tmp_path, monkeypatch, 
 # --------------------------------------------------------------------------- #
 # Defect 2 — an abandoned preview wedged the bot until restart
 # --------------------------------------------------------------------------- #
-
-from datetime import datetime, timezone
-
-from telegram import CallbackQuery, Chat, Message, Update, User, Voice
 
 
 def _real_voice_update(update_id=1, message_id=7):
@@ -454,14 +477,15 @@ def test_cancel_is_reachable_from_every_state(tmp_path, monkeypatch):
     conv = _conversation_handler(bot.build_application())
 
     assert any(
-        getattr(handler, "commands", None) == frozenset({"cancel"})
-        for handler in conv.fallbacks
+        getattr(handler, "commands", None) == frozenset({"cancel"}) for handler in conv.fallbacks
     ), "/cancel must be a fallback so it works in every state"
     assert conv.conversation_timeout == bot.PREVIEW_TIMEOUT
 
 
 @pytest.mark.asyncio
-async def test_a_new_recording_takes_the_buttons_off_the_old_preview(tmp_path, monkeypatch, fake_bot, context):
+async def test_a_new_recording_takes_the_buttons_off_the_old_preview(
+    tmp_path, monkeypatch, fake_bot, context
+):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", [])
     await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
 
@@ -481,7 +505,9 @@ async def test_a_new_recording_takes_the_buttons_off_the_old_preview(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_a_failed_new_recording_leaves_the_old_draft_alone(tmp_path, monkeypatch, fake_bot, context):
+async def test_a_failed_new_recording_leaves_the_old_draft_alone(
+    tmp_path, monkeypatch, fake_bot, context
+):
     """Replacing a preview is only earned by a recording that makes it all the way.
 
     The second recording is too large for the Bot API, so the download raises. The
@@ -508,7 +534,9 @@ async def test_a_failed_new_recording_leaves_the_old_draft_alone(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_a_failed_first_recording_still_ends_the_conversation(tmp_path, monkeypatch, fake_bot, context):
+async def test_a_failed_first_recording_still_ends_the_conversation(
+    tmp_path, monkeypatch, fake_bot, context
+):
     """With no draft to protect there is nothing to stay open for."""
     await stub_voice_pipeline(
         monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [], download_fails=True
@@ -571,7 +599,9 @@ async def test_a_finished_edit_is_not_somewhere_a_failed_recording_returns_to(
 
 
 @pytest.mark.asyncio
-async def test_a_new_recording_clears_the_replaced_drafts_edit_prompt(tmp_path, monkeypatch, fake_bot, context):
+async def test_a_new_recording_clears_the_replaced_drafts_edit_prompt(
+    tmp_path, monkeypatch, fake_bot, context
+):
     """Dictating over an open "send a new title" must not leave the prompt behind."""
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", [])
     await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
@@ -612,7 +642,9 @@ async def test_cancel_without_a_draft_says_so(fake_bot, context):
 
 
 @pytest.mark.asyncio
-async def test_timeout_takes_the_buttons_off_the_stale_preview(tmp_path, monkeypatch, fake_bot, context):
+async def test_timeout_takes_the_buttons_off_the_stale_preview(
+    tmp_path, monkeypatch, fake_bot, context
+):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
     await bot.handle_voice(voice_update(fake_bot), context)
     buttons_id = context.user_data["buttons_msg_id"]
@@ -629,6 +661,7 @@ async def test_timeout_takes_the_buttons_off_the_stale_preview(tmp_path, monkeyp
 # Defect 3 — a restart left live buttons wired to nothing
 # --------------------------------------------------------------------------- #
 
+
 @pytest.fixture
 def no_network(monkeypatch):
     """Nothing in these tests may reach Notion or OpenAI; there are no credentials."""
@@ -643,7 +676,9 @@ def no_network(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("data", ["save", "toggle_highlight", "edit_title", "edit_text", "edit_tags"])
+@pytest.mark.parametrize(
+    "data", ["save", "toggle_highlight", "edit_title", "edit_text", "edit_tags"]
+)
 async def test_a_callback_for_a_missing_draft_does_not_raise(fake_bot, context, data, no_network):
     """This is the state the bot comes back in after a restart: buttons, no user_data."""
     buttons = await fake_bot.send_message(1, "Actions:", reply_markup=bot._preview_keyboard())
@@ -735,7 +770,8 @@ def test_a_stale_callback_handler_catches_what_the_conversation_does_not(tmp_pat
     handlers = app.handlers[0]
     conv_index = next(i for i, h in enumerate(handlers) if isinstance(h, bot.ConversationHandler))
     stale = [
-        h for h in handlers
+        h
+        for h in handlers
         if isinstance(h, bot.CallbackQueryHandler) and h.callback is bot._draft_missing
     ]
 
@@ -831,8 +867,6 @@ async def test_error_handler_tells_the_user_about_a_failed_press_exactly_once(fa
 # Defect 4 — a second Save press
 # --------------------------------------------------------------------------- #
 
-import asyncio
-
 
 async def _open_preview(monkeypatch, tmp_path, fake_bot, context, title="Заголовок"):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, title, "тело", ["sport"])
@@ -841,7 +875,9 @@ async def _open_preview(monkeypatch, tmp_path, fake_bot, context, title="Заг�
 
 
 @pytest.mark.asyncio
-async def test_two_save_presses_write_one_entry(tmp_path, monkeypatch, fake_bot, context, no_network):
+async def test_two_save_presses_write_one_entry(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
     buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
 
     first = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
@@ -857,7 +893,9 @@ async def test_two_save_presses_write_one_entry(tmp_path, monkeypatch, fake_bot,
 
 
 @pytest.mark.asyncio
-async def test_a_press_during_the_notion_round_trip_is_refused(tmp_path, monkeypatch, fake_bot, context):
+async def test_a_press_during_the_notion_round_trip_is_refused(
+    tmp_path, monkeypatch, fake_bot, context
+):
     """Two presses that genuinely overlap: the guard is read and set with no await."""
     buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
 
@@ -899,7 +937,9 @@ async def test_a_press_during_the_notion_round_trip_is_refused(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_the_keyboard_is_gone_before_the_save_starts(tmp_path, monkeypatch, fake_bot, context):
+async def test_the_keyboard_is_gone_before_the_save_starts(
+    tmp_path, monkeypatch, fake_bot, context
+):
     buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
     markup_during_save = []
 
@@ -945,7 +985,9 @@ async def test_a_failed_save_can_be_retried(tmp_path, monkeypatch, fake_bot, con
 
 
 @pytest.mark.asyncio
-async def test_only_the_last_few_saved_previews_are_remembered(tmp_path, monkeypatch, fake_bot, context, no_network):
+async def test_only_the_last_few_saved_previews_are_remembered(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
     for _ in range(bot.SAVED_BUTTONS_REMEMBERED + 3):
         buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
         await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
@@ -955,7 +997,9 @@ async def test_only_the_last_few_saved_previews_are_remembered(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_an_edit_does_not_chase_a_deleted_prompt(tmp_path, monkeypatch, fake_bot, context):
+async def test_cancel_after_an_edit_does_not_chase_a_deleted_prompt(
+    tmp_path, monkeypatch, fake_bot, context
+):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
     await bot.handle_voice(voice_update(fake_bot), context)
 
