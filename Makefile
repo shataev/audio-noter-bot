@@ -35,10 +35,12 @@ check: require-dev-tools
 	$(PY) -m pytest -q
 
 # Nothing reaches the network until the tree is clean and the checks pass.
+# The revision is passed through to the server, which refuses to call a deploy
+# successful unless that is the revision it ends up on.
 deploy: require-host require-clean check
 	git push
-	@echo "-- deploying to $(HOST):$(APP_DIR)"
-	@ssh $(HOST) bash -s -- '$(APP_DIR)' '$(UNIT)' < scripts/remote-deploy.sh
+	@echo "-- deploying $$(git rev-parse --short HEAD) to $(HOST):$(APP_DIR)"
+	@ssh $(HOST) bash -s -- '$(APP_DIR)' '$(UNIT)' "$$(git rev-parse HEAD)" < scripts/remote-deploy.sh
 
 # Put the server back on an earlier revision. `make deploy` prints the one it
 # replaced, and the remote script repeats it when a deploy fails.
@@ -86,15 +88,18 @@ require-host:
 	} >&2; \
 	exit 1
 
-# Deploying pushes the current commit and pulls it on the server, so anything
-# uncommitted is not deployed — and what runs there is not what you are
-# looking at.
+# Deploying pushes this branch and the server pulls its own; the files on your
+# disk are never copied anywhere. Uncommitted work is therefore not deployed,
+# and the server would be running something other than what you are reading.
 require-clean:
 	@if [ -z "$$(git status --porcelain)" ]; then exit 0; fi; \
 	{ \
-	  echo 'make: the working tree has uncommitted changes, so there is nothing'; \
-	  echo 'to deploy them from. Commit them first — the server deploys by'; \
-	  echo 'pulling the commit you pushed, not the files on your disk.'; \
+	  echo 'make: the working tree has uncommitted changes.'; \
+	  echo; \
+	  echo 'Deploying pushes commits and the server pulls them; nothing is copied'; \
+	  echo 'from your disk. Anything uncommitted would simply not be deployed, and'; \
+	  echo 'the server would run something other than what you are looking at.'; \
+	  echo 'Commit or discard these first:'; \
 	  echo; \
 	  git status --short; \
 	} >&2; \
