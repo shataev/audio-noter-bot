@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import re
 from datetime import datetime, timedelta
 import zoneinfo
 import httpx
@@ -28,6 +30,23 @@ _PRE_SEND_ERRORS = (
     httpx.PoolTimeout,
     httpx.ProxyError,
 )
+
+# Notion's documented request limits. A rich text object holds at most 2000
+# characters, a block at most 100 rich text objects, a children array at most
+# 100 blocks, and a request body at most 500KB.
+MAX_TEXT_CHARS = 2000
+MAX_RICH_TEXT_PER_BLOCK = 100
+MAX_CHILDREN_PER_REQUEST = 100
+MAX_PAYLOAD_BYTES = 450_000
+# A page title is rich text too, so 2000 characters is the hard ceiling for the
+# whole accumulated day title.
+MAX_TITLE_CHARS = MAX_TEXT_CHARS
+# Ceiling for one entry's name within that title. Far above the 3-5 words the
+# formatter is asked for; it exists only so that a single pathological name — a
+# model that ignored the instruction on garbled input, or a paragraph pasted
+# into the edit flow — cannot consume the whole budget on its own.
+MAX_ENTRY_TITLE_CHARS = 100
+ELLIPSIS = "\u2026"
 
 _client: httpx.AsyncClient | None = None
 
@@ -135,6 +154,166 @@ async def _request(
     raise NotionError(f"Notion {method} {path} exhausted its {attempts} attempts")
 
 
+_SENTENCE_END = re.compile(r"(?<=[.!?\u2026])\s+")
+_WHITESPACE = re.compile(r"\s+")
+_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+
+
+def _cut_point(text: str, limit: int) -> int:
+    """Finds where to cut `text` so that the left piece is at most `limit` long.
+
+    Prefers the last sentence boundary, falls back to the last whitespace, and
+    only cuts mid-word when the window contains neither. Boundary whitespace
+    stays on the left piece, so concatenating the pieces reproduces the input.
+    A boundary in the first half of the window is ignored: it would waste most
+    of a rich text object for the sake of a tidier seam.
+    """
+    window = text[:limit]
+    floor = limit // 2
+    for pattern in (_SENTENCE_END, _WHITESPACE):
+        cut = 0
+        for match in pattern.finditer(window):
+            if match.end() >= floor:
+                cut = match.end()
+        if cut:
+            return cut
+    return limit
+
+
+def _split_text(text: str, limit: int = MAX_TEXT_CHARS) -> list[str]:
+    """Splits text into pieces that each fit in one rich text object."""
+    pieces = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = _cut_point(remaining, limit)
+        pieces.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        pieces.append(remaining)
+    return pieces or [""]
+
+
+def _rich_text(text: str) -> list[dict]:
+    return [{"text": {"content": piece}} for piece in _split_text(text)]
+
+
+def _paragraph_block(pieces: list[str]) -> dict:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": [{"text": {"content": piece}} for piece in pieces]},
+    }
+
+
+def _text_blocks(text: str) -> list[dict]:
+    """Turns entry text into paragraph blocks that respect Notion's limits.
+
+    A paragraph too long for one rich text object is carried by several of them
+    inside the same block, which Notion renders as one continuous paragraph, so
+    the split leaves no visible seam. New blocks are only started at the blank
+    lines that were already there, or when a paragraph exceeds the 100 rich text
+    objects a single block can hold.
+    """
+    blocks = []
+    for paragraph in _PARAGRAPH_BREAK.split(text.strip()):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        pieces = _split_text(paragraph)
+        for start in range(0, len(pieces), MAX_RICH_TEXT_PER_BLOCK):
+            blocks.append(_paragraph_block(pieces[start:start + MAX_RICH_TEXT_PER_BLOCK]))
+    return blocks or [_paragraph_block([""])]
+
+
+def _entry_blocks(entry_title: str, entry_text: str, *, divider: bool) -> list[dict]:
+    """Builds the blocks for one diary entry: heading, then the text."""
+    blocks = []
+    if divider:
+        blocks.append({"object": "block", "type": "divider", "divider": {}})
+    blocks.append({
+        "object": "block",
+        "type": "heading_3",
+        "heading_3": {"rich_text": _rich_text(entry_title)},
+    })
+    blocks.extend(_text_blocks(entry_text))
+    return blocks
+
+
+def _batch_blocks(blocks: list[dict]) -> list[list[dict]]:
+    """Groups blocks into batches small enough to be one request each."""
+    batches: list[list[dict]] = []
+    batch: list[dict] = []
+    size = 0
+    for block in blocks:
+        block_size = len(json.dumps(block, ensure_ascii=False).encode("utf-8"))
+        too_many = len(batch) >= MAX_CHILDREN_PER_REQUEST
+        too_big = size + block_size > MAX_PAYLOAD_BYTES
+        if batch and (too_many or too_big):
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(block)
+        size += block_size
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= len(ELLIPSIS):
+        return text[:limit]
+    return text[: limit - len(ELLIPSIS)].rstrip() + ELLIPSIS
+
+
+def _split_day_title(title: str) -> tuple[str, list[str]]:
+    """Splits "9 May | Entry 1, Entry 2" into its date prefix and entry titles.
+
+    A title without the separator was not written by this bot; it is kept whole
+    as the prefix so that nothing already on the page is lost.
+    """
+    prefix, separator, rest = title.partition(" | ")
+    if not separator:
+        return title, []
+    entries = [part.strip() for part in rest.split(", ")]
+    return prefix, [entry for entry in entries if entry and entry != ELLIPSIS]
+
+
+def _compose_day_title(prefix: str, entries: list[str], limit: int = MAX_TITLE_CHARS) -> str:
+    """Renders "<date> | <entry, entry, ...>" within Notion's title limit.
+
+    The growing list is deliberate — it is the day's table of contents in the
+    database view — so the format is unchanged and the list is never shortened
+    for readability. Two guards keep it from being rejected outright: one name
+    is capped at MAX_ENTRY_TITLE_CHARS, and only if the assembled title would
+    still be too long are the oldest names dropped for an ellipsis. Ordinary use
+    reaches neither: roughly 30 characters per entry means about 65 entries in a
+    single day, and the title starts again at midnight.
+    """
+    names = [_truncate(entry.strip(), MAX_ENTRY_TITLE_CHARS) for entry in entries if entry.strip()]
+    if not names:
+        return _truncate(prefix, limit)
+
+    head = f"{prefix} | "
+    room = limit - len(head)
+    if room <= 0:
+        return _truncate(prefix, limit)
+
+    joined = ", ".join(names)
+    if len(joined) <= room:
+        return head + joined
+
+    # Last resort: keep the date prefix and the newest names, drop the oldest.
+    kept = [_truncate(names[-1], room)]
+    for index in range(len(names) - 2, -1, -1):
+        candidate = ", ".join([names[index], *kept])
+        if len(candidate) + len(ELLIPSIS) + 2 > room:
+            break
+        kept.insert(0, names[index])
+    kept.insert(0, ELLIPSIS)
+    return head + ", ".join(kept)
+
+
 MONTHS_RU = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля",
     5: "мая", 6: "июня", 7: "июля", 8: "августа",
@@ -190,69 +369,61 @@ async def get_today_page() -> dict | None:
     return results[0] if results else None
 
 
+async def _append_blocks(page_id: str, blocks: list[dict]) -> None:
+    """Appends blocks to a page, one request per batch that fits the limits."""
+    for batch in _batch_blocks(blocks):
+        await _request(
+            "PATCH",
+            f"/blocks/{page_id}/children",
+            json={"children": batch},
+            repeatable=False,
+        )
+
+
 async def create_page(entry_title: str, entry_text: str, entry_tags: list[str]) -> None:
-    title = f"{_today_label()} | {entry_title}"
-    await _request(
+    title = _compose_day_title(_today_label(), [entry_title])
+    batches = _batch_blocks(_entry_blocks(entry_title, entry_text, divider=False))
+    resp = await _request(
         "POST",
         "/pages",
         json={
             "parent": {"database_id": settings.notion_database_id},
             "properties": {
-                "title": {"title": [{"text": {"content": title}}]},
+                "title": {"title": _rich_text(title)},
                 "Created": {"date": {"start": _today_date()}},
                 "Tags": {"multi_select": _combine_tags(None, entry_tags)},
             },
-            "children": [
-                {
-                    "object": "block",
-                    "type": "heading_3",
-                    "heading_3": {"rich_text": [{"text": {"content": entry_title}}]},
-                },
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": entry_text}}]},
-                },
-            ],
+            "children": batches[0],
         },
         repeatable=False,
     )
+    if len(batches) > 1:
+        page_id = resp.json()["id"]
+        for batch in batches[1:]:
+            await _request(
+                "PATCH",
+                f"/blocks/{page_id}/children",
+                json={"children": batch},
+                repeatable=False,
+            )
 
 
 async def update_page(page: dict, entry_title: str, entry_text: str, entry_tags: list[str]) -> None:
     page_id = page["id"]
-    new_title = f"{_extract_title(page)}, {entry_title}"
+    prefix, entries = _split_day_title(_extract_title(page))
+    new_title = _compose_day_title(prefix, [*entries, entry_title])
     # Setting properties is an absolute write, so replaying it is harmless.
     await _request(
         "PATCH",
         f"/pages/{page_id}",
         json={
             "properties": {
-                "title": {"title": [{"text": {"content": new_title}}]},
+                "title": {"title": _rich_text(new_title)},
                 "Tags": {"multi_select": _combine_tags(page, entry_tags)},
             }
         },
     )
-    await _request(
-        "PATCH",
-        f"/blocks/{page_id}/children",
-        json={
-            "children": [
-                {"object": "block", "type": "divider", "divider": {}},
-                {
-                    "object": "block",
-                    "type": "heading_3",
-                    "heading_3": {"rich_text": [{"text": {"content": entry_title}}]},
-                },
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": entry_text}}]},
-                },
-            ]
-        },
-        repeatable=False,
-    )
+    await _append_blocks(page_id, _entry_blocks(entry_title, entry_text, divider=True))
 
 
 async def get_week_pages() -> list[dict]:
