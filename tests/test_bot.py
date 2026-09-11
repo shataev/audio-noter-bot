@@ -324,3 +324,60 @@ async def test_daily_summary_job_with_an_unpaired_asterisk_is_delivered(monkeypa
 
 def test_render_escapes_every_interpolated_value():
     assert bot.render("<b>{a}</b> {b}", a="<x>", b="a & b") == "<b>&lt;x&gt;</b> a &amp; b"
+
+
+# --------------------------------------------------------------------------- #
+# Defects 6 and 7 — exception text in the chat, and a leaked temp file
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_failing_download_leaves_no_temp_file(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [], download_fails=True
+    )
+
+    state = await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert state == bot.ConversationHandler.END
+    assert list(tmp_path.iterdir()) == []
+    assert "pending" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_failing_download_reports_plainly(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [], download_fails=True
+    )
+
+    await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert fake_bot.sent[-1].text == bot.DOWNLOAD_FAILED
+    assert "File is too big" not in fake_bot.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_failing_transcription_is_distinguishable_and_cleans_up(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+
+    async def boom(path):
+        raise RuntimeError("openai said no: sk-secret-ish detail")
+
+    monkeypatch.setattr(bot, "transcribe", boom)
+
+    state = await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert state == bot.ConversationHandler.END
+    assert list(tmp_path.iterdir()) == []
+    assert fake_bot.sent[-1].text == bot.TRANSCRIBE_FAILED
+    assert bot.TRANSCRIBE_FAILED != bot.DOWNLOAD_FAILED
+    assert "sk-secret-ish detail" not in fake_bot.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_successful_run_also_removes_the_temp_file(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", ["sport"])
+
+    state = await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert state == bot.PREVIEW
+    assert list(tmp_path.iterdir()) == []

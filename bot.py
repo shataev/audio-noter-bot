@@ -73,6 +73,15 @@ HELP_TEXT = """<b>How to use Noter</b>
 <b>Daily summary</b>
 Every day at 21:00 I send a summary of all entries recorded that day. If there are none, I'll send a friendly nudge instead."""
 
+# Shown to the user when something breaks. They say which step failed and what to do
+# next; the exception itself belongs in the log, where it is readable and where it
+# cannot end up quoting a third-party response body back into the chat.
+DOWNLOAD_FAILED = "I couldn't download that voice message. Send it again and I'll retry."
+TRANSCRIBE_FAILED = "I couldn't transcribe that voice message. Send it again and I'll retry."
+FORMAT_FAILED = "I transcribed it but couldn't turn it into an entry. Send the voice message again."
+PREVIEW_FAILED = "I couldn't show the preview for that entry. Send the voice message again."
+NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to try again."
+
 TITLE_TEMPLATE = "<b>{title}</b>"
 TAG_TEMPLATE = "<code>{tag}</code>"
 DAILY_SUMMARY_TEMPLATE = "<b>Daily summary</b>\n\n{summary}"
@@ -145,40 +154,74 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await reply_html(update.effective_message, HELP_TEXT)
 
 
+def _discard_temp_file(path: str | None) -> None:
+    """Removes a downloaded audio file, if there is one.
+
+    Never raises. This runs on the failure path too, and a temp file we cannot delete
+    must not replace the error we are already reporting.
+    """
+    if path is None:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        logger.warning("Could not remove temporary audio file %s", path, exc_info=True)
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     await message.reply_text("Listening...")
 
-    voice_file = await context.bot.get_file(message.voice.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp_path = tmp.name
-    await voice_file.download_to_drive(tmp_path)
+    # The download lives inside the guarded region: get_file and download_to_drive can
+    # both fail — a network blip, or a voice note too large for the Bot API — and the
+    # file has already been created by then.
+    tmp_path = None
+    try:
+        try:
+            voice_file = await context.bot.get_file(message.voice.file_id)
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                tmp_path = tmp.name
+            await voice_file.download_to_drive(tmp_path)
+        except Exception:
+            logger.exception("Error downloading voice message")
+            await message.reply_text(DOWNLOAD_FAILED)
+            return ConversationHandler.END
+
+        try:
+            await message.reply_text("Transcribing...")
+            transcription = await transcribe(tmp_path)
+        except Exception:
+            logger.exception("Error transcribing voice message")
+            await message.reply_text(TRANSCRIBE_FAILED)
+            return ConversationHandler.END
+    finally:
+        _discard_temp_file(tmp_path)
+
+    logger.info("Transcription: %s", transcription)
 
     try:
-        await message.reply_text("Transcribing...")
-        transcription = await transcribe(tmp_path)
-        logger.info("Transcription: %s", transcription)
-
         await message.reply_text("Formatting...")
         title, text, tags = await format_entry(transcription)
+    except Exception:
+        logger.exception("Error formatting transcription")
+        await message.reply_text(FORMAT_FAILED)
+        return ConversationHandler.END
 
+    try:
         title_msg = await reply_html(message, _title_body(title))
         text_msg = await message.reply_text(text)
         tags_msg = await reply_html(message, _tags_line(tags))
         buttons_msg = await message.reply_text("Actions:", reply_markup=_preview_keyboard(highlighted=False))
-
-        context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
-        context.user_data["title_msg_id"] = title_msg.message_id
-        context.user_data["text_msg_id"] = text_msg.message_id
-        context.user_data["tags_msg_id"] = tags_msg.message_id
-        context.user_data["buttons_msg_id"] = buttons_msg.message_id
-
-    except Exception as e:
-        logger.exception("Error processing voice message")
-        await message.reply_text(f"Error: {e}")
+    except Exception:
+        logger.exception("Error sending the preview")
+        await message.reply_text(PREVIEW_FAILED)
         return ConversationHandler.END
-    finally:
-        os.unlink(tmp_path)
+
+    context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
+    context.user_data["title_msg_id"] = title_msg.message_id
+    context.user_data["text_msg_id"] = text_msg.message_id
+    context.user_data["tags_msg_id"] = tags_msg.message_id
+    context.user_data["buttons_msg_id"] = buttons_msg.message_id
 
     return PREVIEW
 
@@ -192,9 +235,9 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         updated = await save_entry(pending.get("title", ""), pending.get("text", ""), pending.get("tags", []))
         status = "Added to today's page" if updated else "Saved to Notion"
         await query.edit_message_text(f"✓ {status}")
-    except Exception as e:
+    except Exception:
         logger.exception("Error saving to Notion")
-        await query.edit_message_text(f"Error: {e}")
+        await query.edit_message_text(NOTION_FAILED)
 
     context.user_data.clear()
     return ConversationHandler.END
