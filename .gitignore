@@ -2,3 +2,6 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Local runtime state: the draft the bot is previewing, so it survives a restart.
+*.pickle

@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PicklePersistence,
     TypeHandler,
     filters,
 )
@@ -55,6 +56,13 @@ DRAFT_KEYS = (
 # Long enough that no realistic dictate-and-edit session gets cut off, short enough
 # that a preview abandoned in the morning is not still live when the 21:00 jobs run.
 PREVIEW_TIMEOUT = timedelta(minutes=30)
+
+# Drafts live in user_data, which is in-memory, and `make deploy` restarts the bot on
+# every push. Without somewhere to put them a preview from a minute earlier comes back
+# with working buttons and nothing behind them. The file holds a draft, not a secret,
+# but it is local runtime state and is gitignored.
+STATE_FILE = "bot_state.pickle"
+CONVERSATION_NAME = "preview_flow"
 
 WELCOME_TEXT = """👋 Welcome to Noter!
 
@@ -102,6 +110,8 @@ DRAFT_REPLACED = "✕ Draft discarded — a newer recording replaced it."
 DRAFT_CANCELLED = "✕ Draft discarded."
 DRAFT_TIMED_OUT = "✕ Draft discarded — the preview went unanswered for 30 minutes."
 NOTHING_TO_CANCEL = "There is no draft open right now."
+DRAFT_GONE = "That draft is no longer available. Send a new voice message and I'll start over."
+SOMETHING_BROKE = "Something went wrong on my side. It is in the log — please try that again."
 
 TITLE_TEMPLATE = "<b>{title}</b>"
 TAG_TEMPLATE = "<code>{tag}</code>"
@@ -179,6 +189,26 @@ async def _delete_messages(bot: Bot, chat_id: int, message_ids) -> None:
             await bot.delete_message(chat_id, message_id)
         except Exception:
             logger.warning("Could not delete message %s", message_id, exc_info=True)
+
+
+async def _draft_missing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Deals with an action aimed at a draft that is no longer there.
+
+    A preview that outlived its draft is the one failure the user cannot see: the
+    button stays live and pressing it used to raise a KeyError into a log nobody reads.
+    Saying so and taking the buttons off makes the dead button go away.
+    """
+    query = update.callback_query
+    if query is None:
+        await update.effective_message.reply_text(DRAFT_GONE)
+        return ConversationHandler.END
+
+    await query.answer(DRAFT_GONE)
+    try:
+        await query.edit_message_text(DRAFT_GONE, reply_markup=None)
+    except Exception:
+        logger.warning("Could not take the buttons off a stale preview", exc_info=True)
+    return ConversationHandler.END
 
 
 def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
@@ -287,12 +317,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    pending = context.user_data.get("pending")
+    if pending is None:
+        return await _draft_missing(update, context)
+
     query = update.callback_query
     await query.answer()
 
-    pending = context.user_data.get("pending", {})
     try:
-        updated = await save_entry(pending.get("title", ""), pending.get("text", ""), pending.get("tags", []))
+        updated = await save_entry(pending["title"], pending["text"], pending["tags"])
         status = "Added to today's page" if updated else "Saved to Notion"
         await query.edit_message_text(f"✓ {status}")
     except Exception:
@@ -304,10 +337,13 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def toggle_highlight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    pending = context.user_data.get("pending")
+    if pending is None:
+        return await _draft_missing(update, context)
+
     query = update.callback_query
     await query.answer()
 
-    pending = context.user_data["pending"]
     highlighted = pending["title"].startswith("⭐ ")
     if highlighted:
         pending["title"] = pending["title"][len("⭐ "):]
@@ -331,6 +367,9 @@ async def toggle_highlight_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
@@ -340,6 +379,9 @@ async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
@@ -349,6 +391,9 @@ async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
     user_msg = update.effective_message
     context.user_data["pending"]["title"] = user_msg.text.strip()
 
@@ -370,6 +415,9 @@ async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
     user_msg = update.effective_message
     context.user_data["pending"]["text"] = user_msg.text.strip()
 
@@ -390,6 +438,9 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def edit_tags_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
@@ -399,6 +450,9 @@ async def edit_tags_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
     user_msg = update.effective_message
     new_tags = [t.strip() for t in user_msg.text.split(",") if t.strip()]
     context.user_data["pending"]["tags"] = new_tags
@@ -502,8 +556,38 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Error generating daily summary")
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Last line of defence: log the traceback, tell the user something happened.
+
+    Whatever went wrong stays in the log. The user gets one fixed sentence, so a
+    third-party response body can never reach the chat by this route.
+    """
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+
+    if not isinstance(update, Update):
+        return
+
+    if update.callback_query is not None:
+        try:
+            await update.callback_query.answer(SOMETHING_BROKE)
+        except Exception:
+            logger.warning("Could not answer the callback query after an error", exc_info=True)
+
+    message = update.effective_message
+    if message is not None:
+        try:
+            await message.reply_text(SOMETHING_BROKE)
+        except Exception:
+            logger.warning("Could not tell the user about the error", exc_info=True)
+
+
 def build_application() -> Application:
-    app = ApplicationBuilder().token(settings.telegram_token).build()
+    app = (
+        ApplicationBuilder()
+        .token(settings.telegram_token)
+        .persistence(PicklePersistence(filepath=STATE_FILE))
+        .build()
+    )
 
     user_filter = filters.User(user_id=settings.allowed_user_id)
 
@@ -537,11 +621,24 @@ def build_application() -> Application:
         # would still swallow a recording sent while the bot waits for a new title.
         allow_reentry=True,
         conversation_timeout=PREVIEW_TIMEOUT,
+        name=CONVERSATION_NAME,
+        persistent=True,
     )
 
     app.add_handler(conv_handler)
     for handler in [*command_handlers, cancel_handler]:
         app.add_handler(handler)
+
+    # Reached only when the conversation did not take the callback — a preview left in
+    # the chat by an older process, or one whose conversation has already ended. Only
+    # one handler per group runs, and the conversation is registered first, so this
+    # never steals a callback from a live draft.
+    app.add_handler(CallbackQueryHandler(
+        _draft_missing,
+        pattern="^(save|toggle_highlight|edit_title|edit_text|edit_tags)$",
+    ))
+
+    app.add_error_handler(handle_error)
 
     tz = zoneinfo.ZoneInfo(settings.timezone)
     app.job_queue.run_daily(

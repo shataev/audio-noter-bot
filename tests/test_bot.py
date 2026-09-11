@@ -509,3 +509,148 @@ async def test_timeout_takes_the_buttons_off_the_stale_preview(tmp_path, monkeyp
     assert "pending" not in context.user_data
     assert fake_bot.find(buttons_id).reply_markup is None
     assert fake_bot.find(buttons_id).text == bot.DRAFT_TIMED_OUT
+
+
+# --------------------------------------------------------------------------- #
+# Defect 3 — a restart left live buttons wired to nothing
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def no_network(monkeypatch):
+    """Nothing in these tests may reach Notion or OpenAI; there are no credentials."""
+    calls = []
+
+    async def fake_save_entry(title, text, tags):
+        calls.append((title, text, tags))
+        return False
+
+    monkeypatch.setattr(bot, "save_entry", fake_save_entry)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["save", "toggle_highlight", "edit_title", "edit_text", "edit_tags"])
+async def test_a_callback_for_a_missing_draft_does_not_raise(fake_bot, context, data, no_network):
+    """This is the state the bot comes back in after a restart: buttons, no user_data."""
+    buttons = await fake_bot.send_message(1, "Actions:", reply_markup=bot._preview_keyboard())
+    update = callback_update(fake_bot, data, buttons.message_id)
+
+    handler = {
+        "save": bot.save_callback,
+        "toggle_highlight": bot.toggle_highlight_callback,
+        "edit_title": bot.edit_title_callback,
+        "edit_text": bot.edit_text_callback,
+        "edit_tags": bot.edit_tags_callback,
+    }[data]
+
+    state = await handler(update, context)
+
+    assert state == bot.ConversationHandler.END
+    assert no_network == []
+    assert fake_bot.find(buttons.message_id).reply_markup is None
+    assert fake_bot.find(buttons.message_id).text == bot.DRAFT_GONE
+    assert fake_bot.answered == [bot.DRAFT_GONE]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_draft_does_not_write_an_empty_entry(fake_bot, context, no_network):
+    """The old code fell back to empty strings and appended a blank entry to Notion."""
+    buttons = await fake_bot.send_message(1, "Actions:", reply_markup=bot._preview_keyboard())
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons.message_id), context)
+
+    assert no_network == []
+
+
+@pytest.mark.asyncio
+async def test_a_text_reply_without_a_draft_does_not_raise(fake_bot, context):
+    state = await bot.receive_new_title(text_update(fake_bot, "новый заголовок"), context)
+
+    assert state == bot.ConversationHandler.END
+    assert fake_bot.sent[-1].text == bot.DRAFT_GONE
+
+
+def test_drafts_are_persisted_across_a_restart(tmp_path, monkeypatch):
+    state_file = tmp_path / "bot_state.pickle"
+    monkeypatch.setattr(bot, "STATE_FILE", str(state_file))
+
+    app = bot.build_application()
+
+    assert app.persistence is not None
+    assert str(app.persistence.filepath) == str(state_file)
+    assert app.persistence.store_data.user_data is True
+
+    conv = _conversation_handler(app)
+    assert conv.name == bot.CONVERSATION_NAME
+    assert conv.persistent is True
+
+
+def test_a_global_error_handler_is_registered(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"))
+    app = bot.build_application()
+
+    assert bot.handle_error in app.error_handlers
+
+
+def test_a_stale_callback_handler_catches_what_the_conversation_does_not(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.pickle"))
+    app = bot.build_application()
+
+    handlers = app.handlers[0]
+    conv_index = next(i for i, h in enumerate(handlers) if isinstance(h, bot.ConversationHandler))
+    stale = [
+        h for h in handlers
+        if isinstance(h, bot.CallbackQueryHandler) and h.callback is bot._draft_missing
+    ]
+
+    assert len(stale) == 1
+    # Only one handler per group runs, so the conversation has to be tried first.
+    assert handlers.index(stale[0]) > conv_index
+
+
+class ErrorContext:
+    """Stands in for the context the error handler is called with."""
+
+    def __init__(self, fake_bot, error):
+        self.bot = fake_bot
+        self.error = error
+
+
+LEAKY_ERROR = RuntimeError('Notion PATCH pages error 400: {"message": "secret-ish body"}')
+
+
+def _real_message_update(fake_bot, message_id=9):
+    user = User(id=1, first_name="Owner", is_bot=False)
+    chat = Chat(id=fake_bot.chat_id, type=Chat.PRIVATE)
+    message = Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=user,
+        text="/weekly",
+    )
+    message.set_bot(fake_bot)
+    update = Update(update_id=1, message=message)
+    update.set_bot(fake_bot)
+    return update
+
+
+@pytest.mark.asyncio
+async def test_error_handler_logs_the_traceback(fake_bot, caplog):
+    with caplog.at_level("ERROR"):
+        await bot.handle_error("not an update", ErrorContext(fake_bot, LEAKY_ERROR))
+
+    assert "RuntimeError" in caplog.text
+    assert "secret-ish body" in caplog.text
+    assert fake_bot.sent == []
+
+
+@pytest.mark.asyncio
+async def test_error_handler_tells_the_user_without_quoting_the_exception(fake_bot, caplog):
+    with caplog.at_level("ERROR"):
+        await bot.handle_error(_real_message_update(fake_bot), ErrorContext(fake_bot, LEAKY_ERROR))
+
+    assert fake_bot.sent[-1].text == bot.SOMETHING_BROKE
+    assert "secret-ish body" not in fake_bot.sent[-1].text
+    assert "400" not in fake_bot.sent[-1].text
+    assert "secret-ish body" in caplog.text
