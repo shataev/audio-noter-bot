@@ -73,6 +73,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+To work on the bot, install the development tools too — `ruff` and `pytest`,
+the same versions CI runs:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in the values:
