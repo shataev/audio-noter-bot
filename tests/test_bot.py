@@ -111,6 +111,10 @@ class FakeBot:
     async def delete_message(self, chat_id, message_id, **kwargs):
         self.deleted.append(message_id)
 
+    async def answer_callback_query(self, callback_query_id, text=None, **kwargs):
+        self.answered.append(text)
+        return True
+
     async def get_file(self, file_id):
         return self.files[file_id]
 
@@ -389,7 +393,7 @@ async def test_successful_run_also_removes_the_temp_file(tmp_path, monkeypatch, 
 
 from datetime import datetime, timezone
 
-from telegram import Chat, Message, Update, User, Voice
+from telegram import CallbackQuery, Chat, Message, Update, User, Voice
 
 
 def _real_voice_update(update_id=1, message_id=7):
@@ -782,6 +786,41 @@ async def test_error_handler_tells_the_user_without_quoting_the_exception(fake_b
     assert fake_bot.sent[-1].text == bot.SOMETHING_BROKE
     assert "secret-ish body" not in fake_bot.sent[-1].text
     assert "400" not in fake_bot.sent[-1].text
+    assert "secret-ish body" in caplog.text
+
+
+def _real_callback_update(fake_bot, message_id=9):
+    user = User(id=1, first_name="Owner", is_bot=False)
+    chat = Chat(id=fake_bot.chat_id, type=Chat.PRIVATE)
+    message = Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=user,
+        text="Actions:",
+    )
+    message.set_bot(fake_bot)
+    query = CallbackQuery(
+        id="cb-1", from_user=user, chat_instance="chat-instance", data="save", message=message
+    )
+    query.set_bot(fake_bot)
+    update = Update(update_id=2, callback_query=query)
+    update.set_bot(fake_bot)
+    return update
+
+
+@pytest.mark.asyncio
+async def test_error_handler_tells_the_user_about_a_failed_press_exactly_once(fake_bot, caplog):
+    """`effective_message` for a callback update is the message the button sits on.
+
+    Answering the query and then replying to that message is one failure reported
+    twice — a toast and a chat message for the same press.
+    """
+    with caplog.at_level("ERROR"):
+        await bot.handle_error(_real_callback_update(fake_bot), ErrorContext(fake_bot, LEAKY_ERROR))
+
+    assert fake_bot.answered == [bot.SOMETHING_BROKE]
+    assert fake_bot.sent == [], "the toast is the whole notification; do not also post in the chat"
     assert "secret-ish body" in caplog.text
 
 

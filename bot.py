@@ -657,10 +657,14 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if update.callback_query is not None:
+        # One failure, one notification. `effective_message` for a callback update is
+        # the message the button sits on, so falling through to the reply below would
+        # tell the user twice — once as a toast and once in the chat.
         try:
             await update.callback_query.answer(SOMETHING_BROKE)
         except Exception:
             logger.warning("Could not answer the callback query after an error", exc_info=True)
+        return
 
     message = update.effective_message
     if message is not None:
