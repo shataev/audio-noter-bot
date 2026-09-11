@@ -97,17 +97,44 @@ cp .env.example .env
 
 ## Development
 
-Run locally (stops the bot on VPS to avoid conflicts):
+Telegram allows one poller per bot token, so running this bot locally against
+the production token means stopping production first. Don't: get a second bot.
+It takes a few minutes, and after that local work never touches the server.
+
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and give it a
+   name you will recognise in a chat list — `Noter (dev)`.
+2. Put the token it returns in `.env.dev`:
+
+   ```bash
+   echo 'TELEGRAM_TOKEN=<the dev bot token>' > .env.dev
+   ```
+
+   `.env.dev` only needs the values that differ from `.env`; everything else
+   falls through, because variables already in the environment win over the
+   ones `python-dotenv` loads from `.env`. It is gitignored, like `.env`.
+
+   Point `NOTION_DATABASE_ID` at a scratch database too, if you would rather
+   not write test entries into your real journal.
+3. Run it:
+
+   ```bash
+   make run
+   ```
+
+Start a chat with the dev bot and send it a voice message. The production bot
+keeps running the whole time.
+
+### make dev
 
 ```bash
-make dev
+make dev        # stops the bot on the server, then runs this one
+make stop-dev   # starts it again
 ```
 
-When done, restore the bot on VPS:
-
-```bash
-make stop-dev
-```
+This is the old way and it is kept only so that existing habits do not break.
+It stops the bot on the server for as long as you are working, and it stays
+stopped if the command is interrupted, if this machine sleeps, or if you simply
+forget `make stop-dev`. Nothing will tell you. Use `make run`.
 
 ## Deployment
 

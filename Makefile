@@ -9,7 +9,22 @@ APP_DIR ?= /opt/noter
 UNIT ?= noter
 PY ?= .venv/bin/python
 
-.PHONY: check deploy rollback dev stop-dev require-host require-clean require-dev-tools
+.PHONY: run check deploy rollback dev stop-dev require-host require-clean require-dev-tools
+
+# Run the bot on this machine against a development bot of your own, so that
+# local work never touches the one on the server. .env.dev holds whatever
+# differs from .env — usually just TELEGRAM_TOKEN — and wins, because
+# python-dotenv does not overwrite variables that are already in the
+# environment. See "Development" in the README.
+run:
+	@test -f .env.dev || { \
+	  echo 'make: .env.dev is missing.'                                        >&2; \
+	  echo 'make: It holds the token of a second bot from @BotFather, so that'  >&2; \
+	  echo 'make: running the bot here does not fight the one on the server.'   >&2; \
+	  echo 'make: See "Development" in the README.'                             >&2; \
+	  exit 1; \
+	}
+	@set -a; . ./.env.dev; set +a; exec $(PY) bot.py
 
 # The same four things CI runs, so a failure is found here rather than in a
 # pull request — or, before `make deploy` depended on it, on the server.
