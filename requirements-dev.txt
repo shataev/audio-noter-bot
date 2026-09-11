@@ -1,0 +1,7 @@
+# Development and CI only — the VPS installs requirements.txt and nothing else.
+# Pinned for the same reason the runtime dependencies are: a ruff upgrade can
+# change formatting rules and turn a green CI run red without a code change.
+-r requirements.txt
+ruff==0.16.7
+pytest==9.1.1
+pytest-asyncio==1.4.0

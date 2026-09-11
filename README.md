@@ -65,12 +65,22 @@ The bot works with the Notion Journal database described in the [official guide]
 
 ## Installation
 
+Needs Python 3.10 or newer — that is the floor the pinned dependencies set, and
+the code annotates with `dict | None`.
+
 ```bash
 git clone https://github.com/shataev/audio-noter-bot.git
 cd audio-noter-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+To work on the bot, install the development tools too — `ruff` and `pytest`,
+the same versions CI runs:
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 ## Configuration
@@ -97,71 +107,449 @@ cp .env.example .env
 
 ## Development
 
-Run locally (stops the bot on VPS to avoid conflicts):
+Telegram allows one poller per bot token, so running this bot locally against
+the production token means stopping production first. Don't: get a second bot.
+It takes a few minutes, and after that local work never touches the server.
 
-```bash
-make dev
-```
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and give it a
+   name you will recognise in a chat list — `Noter (dev)`.
+2. Put the token it returns in `.env.dev`:
 
-When done, restore the bot on VPS:
+   ```bash
+   echo 'TELEGRAM_TOKEN=<the dev bot token>' > .env.dev
+   ```
 
-```bash
-make stop-dev
-```
+   `.env.dev` only needs the values that differ from `.env`; everything else
+   falls through, because variables already in the environment win over the
+   ones `python-dotenv` loads from `.env`. It is gitignored, like `.env`.
+
+   Point `NOTION_DATABASE_ID` at a scratch database too, if you would rather
+   not write test entries into your real journal.
+3. Run it:
+
+   ```bash
+   make run
+   ```
+
+Start a chat with the dev bot and send it a voice message. The production bot
+keeps running the whole time.
+
+### What happened to `make dev`
+
+`make dev` used to ssh into the server, stop the bot, and run a local one
+against the same token — leaving production down for as long as you worked, and
+longer if the command was interrupted or the machine slept. Nothing told you.
+
+It is gone, and it could not survive anyway: the deploy key is a
+forced-command key, and stopping the bot is not one of the two things it can
+ask for. Both targets now print this and exit. Use `make run`.
 
 ## Deployment
 
-Deploy to VPS with one command:
+The bot is deployed by one command over ssh, to a key that cannot do anything
+else. Three accounts are involved and each is deliberately weaker than the last:
+
+| Account | Can | Cannot |
+|---|---|---|
+| you, on your machine | ask for a deploy or a rollback | reach a shell on the server |
+| `noter-deploy`, on the server | write the code directory, restart the unit, read its journal | read the credentials |
+| `noter`, on the server | run the bot | write the code, or be logged into |
+
+### Configuring your side
+
+`HOST` is the name of an entry in your `~/.ssh/config`. The address, the login
+and the key live there, which is why this repository — which is public — never
+has to contain any of them.
+
+```
+Host noter-vps
+    HostName <your server>
+    User noter-deploy
+    IdentityFile ~/.ssh/id_ed25519_noter_deploy
+    IdentitiesOnly yes
+```
+
+Then point `make` at that alias. `deploy.mk` is gitignored and holds nothing
+else — everything about the server itself is configured on the server:
+
+```bash
+cp deploy.mk.example deploy.mk
+$EDITOR deploy.mk        # HOST = noter-vps
+```
+
+`make deploy HOST=noter-vps` works for a one-off. With `HOST` unset, `make
+deploy` stops with an explanation before it opens a connection.
+
+### Server-side setup
+
+Everything here is run **as root on the server**, once.
+
+**1. The deploy account.** It owns the code and nothing else. No password, and
+nothing logs into it interactively — the key below is the only way in.
+
+```bash
+useradd --system --create-home --shell /bin/bash noter-deploy
+chown -R noter-deploy:noter-deploy /opt/noter
+chmod -R a+rX,go-w /opt/noter
+```
+
+It owns `/opt/noter` so that `git pull` and `pip install` need no privilege at
+all. The alternative — leaving the directory root-owned and widening `sudo` to
+cover `git` and `pip` — would be much worse: `pip install` runs code from the
+package index, and `sudo pip install` runs it as root. Ownership solves the
+same problem without handing anything root.
+
+`noter`, the account the bot runs as, owns none of it and only reads.
+
+**2. The forced-command key.** Generate a keypair for deploys on *your* machine
+(`ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_noter_deploy`), then put the public
+half in `/home/noter-deploy/.ssh/authorized_keys` — on one line:
+
+```
+restrict,command="/usr/local/bin/noter-deploy" ssh-ed25519 AAAA...your key... deploy
+```
+
+`command=` means that whatever the client asks for, the server runs
+`/usr/local/bin/noter-deploy` and passes the request along in
+`SSH_ORIGINAL_COMMAND`. `restrict` turns off port and agent forwarding, X11 and
+pty allocation. The key cannot get a shell, and the wrapper accepts exactly two
+requests: `deploy <revision>` and `rollback <revision>`.
+
+```bash
+install -d -m 700 -o noter-deploy -g noter-deploy /home/noter-deploy/.ssh
+$EDITOR /home/noter-deploy/.ssh/authorized_keys
+chown noter-deploy:noter-deploy /home/noter-deploy/.ssh/authorized_keys
+chmod 600 /home/noter-deploy/.ssh/authorized_keys
+```
+
+**3. The wrapper.** One copy, from the checkout:
+
+```bash
+install -m 755 -o root -g root /opt/noter/deploy/noter-deploy /usr/local/bin/noter-deploy
+```
+
+Root-owned and not writable by `noter-deploy`, so the account the key logs into
+cannot rewrite the only program that key can run.
+
+**4. The sudo rules.** The deploy account reaches systemd through exactly these
+three commands and nothing else. `visudo -f /etc/sudoers.d/noter-deploy` and
+paste:
+
+```
+noter-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart noter
+noter-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl is-active noter
+noter-deploy ALL=(root) NOPASSWD: /usr/bin/journalctl -u noter *
+```
+
+These match what the wrapper calls, exactly — including `is-active` *without*
+`--quiet`, because sudo matches the whole argument list and `--quiet` would not
+be permitted by the rule above. `NOPASSWD` is not optional: a deploy has no
+terminal, so a password prompt is a hang rather than a question.
+
+Note what is **not** there: `systemctl show -p NRestarts`. Detecting a crash
+loop matters — `Restart=always` means an "active" unit can be one that has died
+five times in the last ten seconds — but it does not need a fourth rule.
+systemd writes `Scheduled restart job, restart counter is at N.` into the unit's
+own journal, which the third rule already allows reading, and the wrapper reads
+it there. If the paths differ on your server, `command -v systemctl journalctl`
+says what they are; they must match the rules byte for byte.
+
+Check the rules before relying on them:
+
+```bash
+sudo -u noter-deploy sudo -n /usr/bin/systemctl is-active noter
+```
+
+**5. The credentials, which the deploy account must not be able to read.** This
+is the point of keeping them in `/etc/noter/noter.env` rather than in a `.env`
+inside `/opt/noter`:
+
+```bash
+chown root:root /etc/noter/noter.env
+chmod 600 /etc/noter/noter.env
+```
+
+systemd reads that file as root and hands the values to the service before
+dropping to the `noter` user, so nothing else ever needs read access to it. A
+`.env` in the code directory would instead be readable by whoever owns that
+directory — which is now `noter-deploy`. That is the difference between a deploy
+account that can restart the bot and one that can read the owner's diary and
+four live API tokens. Keep it out of `/opt/noter`.
+
+### Deploying
 
 ```bash
 make deploy
 ```
 
-This pushes changes to GitHub, pulls them on the VPS, and restarts the bot.
+Locally it refuses to do anything until the working tree is clean and `make
+check` passes, so uncommitted work cannot be half-deployed and code that does
+not compile cannot leave the machine. Then it pushes, and asks the server to
+deploy that exact revision:
+
+```
+ssh noter-vps deploy 4065fbd…              # the full 40-character revision
+```
+
+The server pulls, **checks that the revision it ended up on is the one that was
+asked for** — the client pushes the branch you are on and the server pulls the
+branch it is on, and when those differ nothing you wrote gets deployed — then
+installs `requirements.txt`, restarts the unit, waits, and proves the bot is
+actually up rather than assuming it:
+
+- the unit is still `active`;
+- it has not restarted since the deploy — `Restart=always` otherwise hides a
+  crash loop behind an `active` unit, and systemd's own
+  `restart counter is at N` lines in the journal are what give it away;
+- the journal since the restart contains `Bot started`, the line the bot logs
+  once it has registered its handlers and begun polling. Note that it is logged
+  immediately *before* polling starts, so a failure inside polling itself — a
+  revoked token, a second poller — still satisfies it; the `active` check ten
+  seconds later is what catches those.
+
+If any of those fails it prints the last 40 journal lines and the revision that
+was running before, and exits non-zero. Checking `systemctl status` immediately
+after a restart proves nothing on its own: a bot that is about to die on a
+missing import is reported `active` for the second or two it takes to get there.
+
+### Rolling back
+
+Every deploy prints the revision it replaced, and a failed deploy repeats it:
+
+```bash
+make rollback REV=<git-revision>
+```
+
+That resets the server's checkout to that revision, reinstalls dependencies,
+restarts, and runs the same liveness check — a rollback that reports success
+into a revision which also crash-loops would be a false reassurance at the worst
+possible moment. The next `make deploy` fast-forwards back onto the branch as
+usual.
+
+Both verbs are the only two things the deploy key can ask for. Anything else —
+an empty request, a malformed revision, `systemctl stop noter` — is refused
+before it is used for anything.
 
 ### First-time VPS setup
+
+The bot runs as its own unprivileged user. It holds four live API credentials
+and everything it transcribes is a diary, so it is given no more of the machine
+than it needs. Run these as root on the server.
+
+**1. Create the service user.** System account, no home directory, no shell —
+nothing ever logs in as it.
+
+```bash
+useradd --system --no-create-home --shell /usr/sbin/nologin noter
+```
+
+**2. Check out the code.** It ends up owned by `noter-deploy`, the account that
+deploys — see [Server-side setup](#server-side-setup), which creates it. What
+matters is that `noter` does not own it: the service only ever reads the code,
+and a bot that cannot rewrite what it is running is one less thing to worry
+about.
 
 ```bash
 git clone https://github.com/shataev/audio-noter-bot.git /opt/noter
 cd /opt/noter
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-nano .env  # fill in all values
+.venv/bin/pip install -r requirements.txt
 ```
 
-Create `/etc/systemd/system/noter.service`:
+**3. Put the credentials in `/etc/noter/noter.env`** — not in a `.env` sitting
+next to the code. Same `KEY=value` lines as `.env.example`, with no `export`
+and no shell expansion.
+
+```bash
+install -d -m 755 /etc/noter
+cp .env.example /etc/noter/noter.env
+$EDITOR /etc/noter/noter.env      # fill in all values
+chown root:root /etc/noter/noter.env
+chmod 600 /etc/noter/noter.env
+```
+
+systemd reads this file as root and hands the values to the service, so the
+`noter` user never needs read access to it at all.
+
+**4. Install the unit** from [`deploy/noter.service`](deploy/noter.service):
+
+```bash
+cp /opt/noter/deploy/noter.service /etc/systemd/system/noter.service
+systemctl daemon-reload
+systemctl enable --now noter
+```
+
+**5. Check it started.**
+
+```bash
+systemctl status noter
+journalctl -u noter -n 20 --no-pager    # should contain "Bot started"
+```
+
+**6. Set up the deploy path** — the account, the key, the wrapper and the sudo
+rules — from [Server-side setup](#server-side-setup). Until that is done the bot
+runs, but `make deploy` has nothing to talk to.
+
+### The unit
 
 ```ini
 [Unit]
 Description=Noter Telegram Bot
-After=network.target
+Documentation=https://github.com/shataev/audio-noter-bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=root
+Type=simple
+User=noter
+Group=noter
 WorkingDirectory=/opt/noter
 ExecStart=/opt/noter/.venv/bin/python bot.py
 Restart=always
 RestartSec=5
+EnvironmentFile=/etc/noter/noter.env
+StateDirectory=noter
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+What each line is for:
+
+| Directive | Why |
+|---|---|
+| `User=noter`, `Group=noter` | The bot shells out to nothing and serves one person. Running it as root meant a bug in any of the three API clients was a bug with root's authority. |
+| `EnvironmentFile=/etc/noter/noter.env` | Keeps the four live tokens out of the working directory, in one root-owned mode-600 file, instead of a `.env` that any process running as the service user could read. |
+| `StateDirectory=noter` | Creates `/var/lib/noter` owned by the service user, exported as `$STATE_DIRECTORY`. The only writable path the bot has, and where any runtime state file belongs. |
+| `StateDirectoryMode=0700` | The default is 0755, which with systemd's default `UMask=0022` would leave saved drafts world-readable on the server. A draft is a diary entry; `noter` is the only account that reads one. |
+| `NoNewPrivileges=yes` | Nothing the bot runs ever needs to gain privileges, so setuid escalation is switched off for the whole process tree. |
+| `PrivateTmp=yes` | Voice messages are written to a temporary file before transcription. A private `/tmp` keeps those recordings out of the shared one and clears them on stop. |
+| `PrivateDevices=yes` | It touches no hardware; hides physical devices and blocks creating device nodes. |
+| `ProtectSystem=strict` | The whole filesystem read-only except the state directory — `/opt/noter` included, so the service cannot modify its own code. |
+| `ProtectHome=yes` | `/home`, `/root` and `/run/user` are hidden. Nothing the bot needs lives there. |
+| `ProtectProc=invisible` | Other users' processes disappear from `/proc`. |
+| `ProtectKernelTunables=yes` | It never writes to `/proc/sys` or `/sys`. |
+| `ProtectKernelModules=yes` | It never loads a kernel module. |
+| `ProtectControlGroups=yes` | It never edits cgroups. |
+| `ProtectClock=yes` | It reads the clock for timezone handling and scheduled jobs; it never sets it. |
+| `RestrictSUIDSGID=yes` | It never creates setuid or setgid files. |
+| `RestrictNamespaces=yes` | It never creates namespaces of its own. |
+| `LockPersonality=yes` | It never changes its execution domain. |
+| `RestrictAddressFamilies=…` | HTTPS to Telegram, OpenAI and Notion, plus the local sockets glibc and journald need — nothing else. |
+| `SystemCallFilter=@system-service` | systemd's baseline set for ordinary services. If the bot ever fails to start with an unexplained `EPERM`, this is the first line to remove. |
+
+`MemoryDenyWriteExecute` is deliberately absent: it breaks JIT compilation and
+some native extensions, and Python is exactly the runtime that trips over it.
+
+`systemd-analyze security noter` scores the result, and
+`systemd-analyze verify /etc/systemd/system/noter.service` checks it parses.
+
+### Migrating an existing root install
+
+The transcriptions in the journal are personal data and `.env` holds four live
+tokens, so file ownership is the point of this, not a formality. In order, as
+root:
+
 ```bash
+# 1. Create the service user.
+useradd --system --no-create-home --shell /usr/sbin/nologin noter
+
+# 2. Move the credentials out of the working directory.
+install -d -m 755 /etc/noter
+mv /opt/noter/.env /etc/noter/noter.env
+chown root:root /etc/noter/noter.env
+chmod 600 /etc/noter/noter.env
+
+# 3. Make sure nothing is left behind: config.py calls load_dotenv(), which
+#    reads .env from the working directory if one is there.
+ls -la /opt/noter/.env    # must be "No such file or directory"
+
+# 4. Fix ownership of the code: the deploy account owns it, the service user
+#    only reads it. This is also what lets `git pull` and `pip install` run
+#    without sudo. /opt/noter is root-owned today, so this is the step that
+#    makes deploying as noter-deploy possible at all.
+chown -R noter-deploy:noter-deploy /opt/noter
+chmod -R a+rX,go-w /opt/noter
+
+# 5. Install the new unit and reload.
+cp /opt/noter/deploy/noter.service /etc/systemd/system/noter.service
 systemctl daemon-reload
-systemctl enable noter
-systemctl start noter
+
+# 6. Restart, and confirm it came back.
+systemctl restart noter
+sleep 10
+systemctl is-active noter
+journalctl -u noter -n 20 --no-pager    # should contain "Bot started"
 ```
 
-Useful commands:
+If it does not come back, `journalctl -u noter -n 50` says why; the usual cause
+is a value that did not survive the move into `noter.env`. Putting `User=root`
+back and reloading returns you to where you started.
+
+Step 2 is the one that matters most and the one that is easy to half-finish.
+Before it, `.env` sits in `/opt/noter` — which step 4 hands to `noter-deploy`,
+so a deploy account would be able to read the Telegram, OpenAI and Notion tokens
+and every transcription they can fetch. After it, systemd reads the values as
+root and passes them in, and no account on the machine except root can read the
+file. Do not reorder these two, and do not skip step 3.
+
+Anything the bot wrote under `/opt/noter` while it ran as root — there is
+nothing today, but check — needs `chown noter:noter` and moving to
+`/var/lib/noter`, because `ProtectSystem=strict` makes `/opt/noter` read-only
+to the service.
+
+The `.venv` moves owner with the rest of `/opt/noter` in step 4. If it was built
+by root and any file in it is mode 600, `chmod -R a+rX,go-w` above fixes the
+read bits; `noter` needs to read and execute it, and `noter-deploy` needs to
+write it when dependencies change.
+
+### Useful commands
 
 ```bash
 systemctl status noter        # check status
 journalctl -u noter -f        # live logs
 systemctl restart noter       # restart manually
+systemd-analyze security noter
 ```
+
+## Continuous integration
+
+Every push, and every pull request against `main`, runs
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml): it byte-compiles the
+project, runs `ruff check` and `ruff format --check`, and runs `pytest`.
+
+The same checks run locally, and `make deploy` will not deploy without them:
+
+```bash
+pip install -r requirements-dev.txt
+make check
+```
+
+Ruff is currently scoped away from `bot.py`, `config.py` and `services/` — see
+the note in `pyproject.toml`. Byte-compiling and `tests/test_imports.py` still
+cover those files.
+
+`tests/` is not scoped away: new test files have to satisfy line length 100,
+`select = ["E", "F", "I", "UP", "B"]` and `ruff format`. Run `make check` before
+opening a pull request and there are no surprises.
 
 ## Project structure
 
@@ -189,3 +577,7 @@ Both Whisper and GPT-4o-mini are very cheap for personal use:
 | GPT-4o-mini | $0.15 / 1M tokens | ~$0.00005                     |
 
 100 entries/month ≈ **$0.60**
+
+## License
+
+Released under the [MIT License](LICENSE).

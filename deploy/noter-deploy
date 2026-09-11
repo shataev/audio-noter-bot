@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+#
+# The deploy key's forced command. Install on the server as
+# /usr/local/bin/noter-deploy, owned by root, mode 755 — see "Server-side
+# setup" in the README.
+#
+# authorized_keys entry for the deploy key:
+#
+#   restrict,command="/usr/local/bin/noter-deploy" ssh-ed25519 AAAA... deploy
+#
+# With a forced command the key cannot reach a shell. Whatever the client asked
+# for arrives in SSH_ORIGINAL_COMMAND and is the ONLY input this script takes.
+# It is untrusted: anyone holding the key can send any string. So it is matched
+# against a strict pattern first and never reaches a shell, an eval, or a
+# command line before it has.
+#
+#   deploy   <40-hex revision>   fast-forward to exactly that revision, restart
+#   rollback <7..40-hex revision>  reset to that revision, restart
+#
+# Both verify the bot is alive afterwards and exit non-zero if it is not.
+# Anything else is refused.
+#
+# To try it on the server without ssh, run it as the deploy user with the
+# request as arguments:  sudo -u noter-deploy /usr/local/bin/noter-deploy deploy <sha>
+
+set -Eeuo pipefail
+
+# --- server-side configuration ---------------------------------------------
+APP_DIR=${NOTER_APP_DIR:-/opt/noter}
+UNIT=${NOTER_UNIT:-noter}
+
+# Seconds to let the bot get through its imports and reach run_polling before
+# asking whether it is still alive.
+SETTLE_SECONDS=${NOTER_SETTLE_SECONDS:-10}
+
+# The line bot.py logs once the handlers are registered and polling begins.
+START_LINE='Bot started'
+
+# These must be byte-identical to the paths in /etc/sudoers.d/noter-deploy, or
+# sudo will refuse the command. Check with `command -v systemctl journalctl`.
+SYSTEMCTL=${NOTER_SYSTEMCTL:-/usr/bin/systemctl}
+JOURNALCTL=${NOTER_JOURNALCTL:-/usr/bin/journalctl}
+
+# --- plumbing ---------------------------------------------------------------
+say() { printf -- '-- %s\n' "$*"; }
+die() { printf 'noter-deploy: %s\n' "$*" >&2; exit 2; }
+
+# The deploy user reaches systemd through three NOPASSWD sudo rules and nothing
+# else. -n because there is no terminal here: a password prompt would hang.
+if [ "$(id -u)" -eq 0 ]; then
+    as_root() { "$@"; }
+else
+    as_root() { sudo -n "$@"; }
+fi
+
+# --- request parsing --------------------------------------------------------
+# SSH_ORIGINAL_COMMAND when invoked as the forced command; argv when the owner
+# runs it by hand on the server. Never an implicit HEAD.
+request=${SSH_ORIGINAL_COMMAND:-$*}
+
+[ -n "$request" ] || die "no request. Expected 'deploy <revision>' or 'rollback <revision>'."
+
+if [[ $request =~ ^deploy\ ([0-9a-f]{40})$ ]]; then
+    action=deploy
+    revision=${BASH_REMATCH[1]}
+elif [[ $request =~ ^rollback\ ([0-9a-f]{7,40})$ ]]; then
+    action=rollback
+    revision=${BASH_REMATCH[1]}
+else
+    # Deliberately does not echo the request back: it is attacker-controlled
+    # and this goes to the client's terminal.
+    die "refused. Expected 'deploy <40-hex revision>' or 'rollback <7-40-hex revision>'."
+fi
+
+cd "$APP_DIR" || die "$APP_DIR is missing or unreadable."
+
+previous=$(git rev-parse HEAD)
+restart_attempted=no
+
+fail() {
+    trap - ERR
+    echo >&2
+    echo "${action^^} FAILED: $1" >&2
+    echo >&2
+
+    if [ "$restart_attempted" = yes ]; then
+        as_root "$JOURNALCTL" -u "$UNIT" -n 40 --no-pager >&2 || true
+        echo >&2
+    fi
+
+    # The thing that matters when something fails halfway: whether the code on
+    # disk still matches the process that is running.
+    if [ "$(git rev-parse HEAD)" = "$previous" ]; then
+        echo "The checkout is unchanged, still at $previous." >&2
+        echo "$UNIT is running whatever it was running before." >&2
+    else
+        echo "The checkout has MOVED to $(git rev-parse HEAD) and no longer" >&2
+        echo "matches the running process. Put it back with:" >&2
+        echo >&2
+        echo "    make rollback REV=$previous" >&2
+    fi
+    exit 1
+}
+
+# Everything from here reports through fail() rather than dying under set -e
+# with no explanation of the state it left behind.
+trap 'fail "\"$BASH_COMMAND\" failed (line $LINENO)"' ERR
+
+# --- liveness ---------------------------------------------------------------
+# Restart=always means "active" is not proof: the unit keeps coming back, so a
+# process that dies on a missing import still shows active a moment later. The
+# three things below distinguish a bot that started from one that is looping.
+#
+# systemd's own journal lines carry the restart counter, which is why this needs
+# no `systemctl show -p NRestarts` and no fourth sudo rule.
+verify_alive() {
+    local window=$1 state log bot_lines starts
+
+    state=$(as_root "$SYSTEMCTL" is-active "$UNIT" || true)
+    [ "$state" = active ] ||
+        fail "$UNIT is '$state', not active, $SETTLE_SECONDS seconds after the restart"
+
+    log=$(as_root "$JOURNALCTL" -u "$UNIT" --since "@$window" --no-pager)
+
+    # systemd logs an automatic restart as "Scheduled restart job, restart
+    # counter is at N", and gives up with "start request repeated too quickly".
+    # Either in this window means it has died at least once since the restart.
+    # -i because the second of these is "Start request repeated too quickly."
+    # in systemd's own wording, and that capital is not worth depending on.
+    if grep -qiE 'restart counter is at|start request repeated too quickly' <<<"$log"; then
+        fail "$UNIT has restarted since the $action — it is crash-looping"
+    fi
+
+    # Count only the bot's own lines: systemd's "Started noter.service" echoes
+    # the unit description and would otherwise be counted as a startup.
+    bot_lines=$(grep -vE ' systemd\[[0-9]+\]: ' <<<"$log" || true)
+    starts=$(grep -cF "$START_LINE" <<<"$bot_lines" || true)
+
+    case "${starts:-0}" in
+        0) fail "$UNIT is running but never logged \"$START_LINE\" — it did not finish starting" ;;
+        1) : ;;
+        *) fail "$UNIT logged \"$START_LINE\" $starts times — it is crash-looping" ;;
+    esac
+}
+
+restart_and_verify() {
+    say "restarting $UNIT"
+    # Epoch form: journalctl reads "@<seconds>" as absolute UTC, so the window
+    # cannot be shifted by sudo resetting TZ between here and the read.
+    local window
+    window=$(date +%s)
+    restart_attempted=yes
+    as_root "$SYSTEMCTL" restart "$UNIT"
+
+    say "waiting ${SETTLE_SECONDS}s for it to settle"
+    sleep "$SETTLE_SECONDS"
+
+    verify_alive "$window"
+}
+
+install_dependencies() {
+    say "installing dependencies"
+    # Runs as the deploy user, which owns APP_DIR and the virtualenv. Not
+    # through sudo: `pip install` executes code from the package index, and
+    # there is no reason for that to be root.
+    "$APP_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check -r requirements.txt
+}
+
+# --- actions ----------------------------------------------------------------
+say "currently deployed: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+
+case "$action" in
+deploy)
+    say "requested:          ${revision:0:7}"
+
+    say "fetching"
+    git pull --ff-only
+
+    # The client pushes the branch it is on; this checkout pulls the branch it
+    # is on. They are not necessarily the same, and when they are not, every
+    # later check passes while none of the requested work has been deployed.
+    landed=$(git rev-parse HEAD)
+    [ "$landed" = "$revision" ] || fail "$(
+        printf '%s\n' \
+            "the checkout is at $landed, not the $revision that was requested." \
+            "" \
+            "        This checkout is on branch '$(git rev-parse --abbrev-ref HEAD)'." \
+            "        Either the deploy came from a different branch, or the push" \
+            "        has not reached the branch this server tracks. Nothing has" \
+            "        been restarted."
+    )"
+
+    install_dependencies
+    restart_and_verify
+
+    trap - ERR
+    echo
+    say "deployed: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+    say "$UNIT is up and logged \"$START_LINE\""
+    say "previous revision was $previous (make rollback REV=$previous)"
+    ;;
+
+rollback)
+    say "rolling back to $revision"
+
+    git fetch --quiet origin
+    # reset rather than a detached checkout, so the next deploy fast-forwards
+    # back onto the branch normally.
+    git reset --hard "$revision"
+
+    install_dependencies
+    restart_and_verify
+
+    trap - ERR
+    echo
+    say "rolled back to $(git rev-parse --short HEAD), $UNIT is up"
+    ;;
+esac

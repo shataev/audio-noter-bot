@@ -1,0 +1,74 @@
+# Install to /etc/systemd/system/noter.service. See "First-time VPS setup" and
+# "Migrating an existing root install" in the README.
+
+[Unit]
+Description=Noter Telegram Bot
+Documentation=https://github.com/shataev/audio-noter-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noter
+Group=noter
+WorkingDirectory=/opt/noter
+ExecStart=/opt/noter/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+# The credentials are not in the working directory. systemd reads this file as
+# root before the service starts, so it can be root-owned and mode 600: the
+# noter user never needs to be able to read it.
+EnvironmentFile=/etc/noter/noter.env
+
+# /var/lib/noter, created and owned by the service user. The only path the bot
+# can write to, and where any runtime state file belongs. 0700 rather than the
+# default 0755: a saved draft is a diary entry, and noter is the only account
+# that ever reads one. Without this, systemd's default UMask=0022 would leave
+# both the directory and the file world-readable.
+StateDirectory=noter
+StateDirectoryMode=0700
+
+# --- Sandboxing ---------------------------------------------------------
+# The bot downloads voice messages, calls three HTTPS APIs and writes a log
+# line. Nothing below takes anything away from it, and each one is something
+# an attacker who got as far as running code in this process would want.
+
+# It never needs more privilege than it starts with; blocks setuid escalation.
+NoNewPrivileges=yes
+# Voice messages are written to a temporary file. A private /tmp keeps other
+# people's recordings out of the shared one, and cleans up on stop.
+PrivateTmp=yes
+# It touches no hardware.
+PrivateDevices=yes
+# The whole filesystem read-only except StateDirectory — including /opt/noter,
+# so the service cannot rewrite the code it is running.
+ProtectSystem=strict
+# /home, /root and /run/user hidden. Nothing it needs is there.
+ProtectHome=yes
+# Other users' processes hidden from /proc.
+ProtectProc=invisible
+# It never tunes the kernel, loads modules, or edits cgroups.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# It never sets the system clock; it only reads it.
+ProtectClock=yes
+# It never creates setuid files.
+RestrictSUIDSGID=yes
+# It never creates namespaces of its own.
+RestrictNamespaces=yes
+# It never changes its execution domain.
+LockPersonality=yes
+# HTTPS out and the local sockets glibc and journald need; nothing else.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The syscalls a normal userspace service uses. If the bot ever fails to start
+# with EPERM from something surprising, this is the line to remove first.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# MemoryDenyWriteExecute is deliberately not set: it breaks JIT and some
+# native extensions, and Python is exactly the runtime that trips over it.
+
+[Install]
+WantedBy=multi-user.target
