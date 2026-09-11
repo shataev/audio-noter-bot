@@ -654,3 +654,130 @@ async def test_error_handler_tells_the_user_without_quoting_the_exception(fake_b
     assert "secret-ish body" not in fake_bot.sent[-1].text
     assert "400" not in fake_bot.sent[-1].text
     assert "secret-ish body" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Defect 4 — a second Save press
+# --------------------------------------------------------------------------- #
+
+import asyncio
+
+
+async def _open_preview(monkeypatch, tmp_path, fake_bot, context, title="Заголовок"):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, title, "тело", ["sport"])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    return context.user_data["buttons_msg_id"]
+
+
+@pytest.mark.asyncio
+async def test_two_save_presses_write_one_entry(tmp_path, monkeypatch, fake_bot, context, no_network):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    first = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+    second = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert len(no_network) == 1
+    assert no_network[0] == ("Заголовок", "тело", ["sport"])
+    assert first == bot.ConversationHandler.END
+    assert second == bot.ConversationHandler.END
+    assert fake_bot.answered[-1] == bot.ALREADY_SAVED
+    assert fake_bot.find(buttons_id).text == "✓ Saved to Notion"
+    assert fake_bot.find(buttons_id).reply_markup is None
+
+
+@pytest.mark.asyncio
+async def test_a_press_during_the_notion_round_trip_is_refused(tmp_path, monkeypatch, fake_bot, context):
+    """Two presses that genuinely overlap: the guard is read and set with no await."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_save_entry(title, text, tags):
+        calls.append((title, text, tags))
+        started.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(bot, "save_entry", slow_save_entry)
+
+    first = asyncio.create_task(
+        bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+    )
+    await started.wait()
+
+    # Bounded: a second press that is not refused blocks on the first save instead of
+    # returning, so without the guard this fails rather than hanging the suite.
+    try:
+        second = await asyncio.wait_for(
+            bot.save_callback(callback_update(fake_bot, "save", buttons_id), context),
+            timeout=2,
+        )
+    except asyncio.TimeoutError:  # pragma: no cover - only reached without the guard
+        release.set()
+        await first
+        pytest.fail("a second Save press entered the save path instead of being refused")
+
+    assert second == bot.PREVIEW
+    assert fake_bot.answered[-1] == bot.SAVE_IN_FLIGHT
+
+    release.set()
+    assert await first == bot.ConversationHandler.END
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_keyboard_is_gone_before_the_save_starts(tmp_path, monkeypatch, fake_bot, context):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    markup_during_save = []
+
+    async def inspect_save_entry(title, text, tags):
+        markup_during_save.append(fake_bot.find(buttons_id).reply_markup)
+        return True
+
+    monkeypatch.setattr(bot, "save_entry", inspect_save_entry)
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert markup_during_save == [None]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_save_can_be_retried(tmp_path, monkeypatch, fake_bot, context):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    attempts = []
+
+    async def flaky_save_entry(title, text, tags):
+        attempts.append((title, text, tags))
+        if len(attempts) == 1:
+            raise RuntimeError("Notion PATCH pages error 502: upstream")
+        return True
+
+    monkeypatch.setattr(bot, "save_entry", flaky_save_entry)
+
+    state = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"]["title"] == "Заголовок"
+    assert context.user_data.get("saving") is False
+    failed = fake_bot.find(buttons_id)
+    assert failed.text == bot.NOTION_FAILED
+    assert failed.reply_markup is not None, "Save must still be pressable after a failure"
+    assert "502" not in failed.text
+
+    state = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert len(attempts) == 2
+    assert fake_bot.find(buttons_id).text == "✓ Added to today's page"
+
+
+@pytest.mark.asyncio
+async def test_only_the_last_few_saved_previews_are_remembered(tmp_path, monkeypatch, fake_bot, context, no_network):
+    for _ in range(bot.SAVED_BUTTONS_REMEMBERED + 3):
+        buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+        await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert len(context.user_data[bot.SAVED_BUTTONS_KEY]) == bot.SAVED_BUTTONS_REMEMBERED
+    assert len(no_network) == bot.SAVED_BUTTONS_REMEMBERED + 3

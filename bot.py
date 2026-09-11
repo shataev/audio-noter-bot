@@ -51,7 +51,14 @@ DRAFT_KEYS = (
     "tags_msg_id",
     "buttons_msg_id",
     "edit_prompt_msg_id",
+    "saving",
 )
+
+# Message ids of previews that were saved, so a press arriving from a client whose view
+# has not caught up is answered honestly instead of being called a lost draft. Only a
+# handful are worth keeping.
+SAVED_BUTTONS_KEY = "saved_buttons"
+SAVED_BUTTONS_REMEMBERED = 10
 
 # Long enough that no realistic dictate-and-edit session gets cut off, short enough
 # that a preview abandoned in the morning is not still live when the 21:00 jobs run.
@@ -112,6 +119,9 @@ DRAFT_TIMED_OUT = "✕ Draft discarded — the preview went unanswered for 30 mi
 NOTHING_TO_CANCEL = "There is no draft open right now."
 DRAFT_GONE = "That draft is no longer available. Send a new voice message and I'll start over."
 SOMETHING_BROKE = "Something went wrong on my side. It is in the log — please try that again."
+SAVE_IN_FLIGHT = "Still saving — one moment."
+ALREADY_SAVED = "Already saved."
+SAVING_NOTICE = "Saving to Notion..."
 
 TITLE_TEMPLATE = "<b>{title}</b>"
 TAG_TEMPLATE = "<code>{tag}</code>"
@@ -191,6 +201,14 @@ async def _delete_messages(bot: Bot, chat_id: int, message_ids) -> None:
             logger.warning("Could not delete message %s", message_id, exc_info=True)
 
 
+def _remember_saved(context: ContextTypes.DEFAULT_TYPE, buttons_msg_id: int | None) -> None:
+    if buttons_msg_id is None:
+        return
+    saved = context.user_data.setdefault(SAVED_BUTTONS_KEY, [])
+    saved.append(buttons_msg_id)
+    del saved[:-SAVED_BUTTONS_REMEMBERED]
+
+
 async def _draft_missing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Deals with an action aimed at a draft that is no longer there.
 
@@ -201,6 +219,13 @@ async def _draft_missing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     if query is None:
         await update.effective_message.reply_text(DRAFT_GONE)
+        return ConversationHandler.END
+
+    message_id = query.message.message_id if query.message is not None else None
+    if message_id is not None and message_id in context.user_data.get(SAVED_BUTTONS_KEY, []):
+        # This preview was saved and already says so. A late press must not claim the
+        # draft was lost, and must not write anything a second time.
+        await query.answer(ALREADY_SAVED)
         return ConversationHandler.END
 
     await query.answer(DRAFT_GONE)
@@ -322,17 +347,44 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await _draft_missing(update, context)
 
     query = update.callback_query
+
+    # Read and set with no await in between, so two presses cannot both get past here
+    # whatever the application's update concurrency is set to.
+    if context.user_data.get("saving"):
+        await query.answer(SAVE_IN_FLIGHT)
+        return PREVIEW
+    context.user_data["saving"] = True
+
     await query.answer()
+
+    # The keyboard comes off before the round trip, not after it returns. Saving is two
+    # HTTP requests when today's page already exists, and Telegram leaves a button live
+    # until the message is edited.
+    try:
+        await query.edit_message_text(SAVING_NOTICE, reply_markup=None)
+    except Exception:
+        logger.warning("Could not take the buttons off the preview before saving", exc_info=True)
 
     try:
         updated = await save_entry(pending["title"], pending["text"], pending["tags"])
-        status = "Added to today's page" if updated else "Saved to Notion"
-        await query.edit_message_text(f"✓ {status}")
     except Exception:
         logger.exception("Error saving to Notion")
-        await query.edit_message_text(NOTION_FAILED)
+        # A genuine failure keeps the draft and puts the keyboard back, so Save can be
+        # pressed again rather than the whole note having to be dictated again.
+        context.user_data["saving"] = False
+        try:
+            await query.edit_message_text(
+                NOTION_FAILED,
+                reply_markup=_preview_keyboard(highlighted=pending["title"].startswith("⭐ ")),
+            )
+        except Exception:
+            logger.warning("Could not restore the preview keyboard after a failed save", exc_info=True)
+        return PREVIEW
 
-    context.user_data.clear()
+    status = "Added to today's page" if updated else "Saved to Notion"
+    _remember_saved(context, context.user_data.get("buttons_msg_id"))
+    _clear_draft(context)
+    await query.edit_message_text(f"✓ {status}", reply_markup=None)
     return ConversationHandler.END
 
 
