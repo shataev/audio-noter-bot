@@ -1,4 +1,5 @@
 """Notion read paths: cursors are followed, so nothing is silently truncated."""
+
 # config.py reads os.environ at import time and raises KeyError on a missing
 # value, so the stubs have to be in place before anything from the project is
 # imported. setdefault throughout, so a real environment always wins.
@@ -54,13 +55,15 @@ def _pages_of(items: list, size: int) -> list[dict]:
     """Splits items into Notion-shaped paginated responses."""
     responses = []
     for start in range(0, len(items), size):
-        chunk = items[start:start + size]
+        chunk = items[start : start + size]
         has_more = start + size < len(items)
-        responses.append({
-            "results": chunk,
-            "has_more": has_more,
-            "next_cursor": f"cursor-{start + size}" if has_more else None,
-        })
+        responses.append(
+            {
+                "results": chunk,
+                "has_more": has_more,
+                "next_cursor": f"cursor-{start + size}" if has_more else None,
+            }
+        )
     return responses
 
 

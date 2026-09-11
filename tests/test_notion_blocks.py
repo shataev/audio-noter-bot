@@ -1,4 +1,5 @@
 """Notion write paths: block chunking, day titles and the children limit."""
+
 # config.py reads os.environ at import time and raises KeyError on a missing
 # value, so the stubs have to be in place before anything from the project is
 # imported. setdefault throughout, so a real environment always wins.
@@ -58,8 +59,7 @@ def _plain_text(blocks: list[dict]) -> str:
 
 
 LONG_ENTRY = "\n\n".join(
-    " ".join(f"Предложение номер {n} этого абзаца." for n in range(1, 31))
-    for _ in range(6)
+    " ".join(f"Предложение номер {n} этого абзаца." for n in range(1, 31)) for _ in range(6)
 )
 
 

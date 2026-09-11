@@ -1,4 +1,5 @@
 """The chat models are configuration, not source."""
+
 # config.py reads os.environ at import time and raises KeyError on a missing
 # value, so the stubs have to be in place before anything from the project is
 # imported. setdefault throughout, so a real environment always wins.
@@ -40,9 +41,7 @@ def _recorder(payload: str):
 async def test_the_formatter_model_comes_from_configuration(monkeypatch):
     payload = {"title": "Заголовок", "text": "Текст", "tags": ["Работа"]}
     calls, create = _recorder(json.dumps(payload))
-    monkeypatch.setattr(
-        formatter.client.chat.completions, "create", create, raising=False
-    )
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
     monkeypatch.setattr(settings, "formatter_model", "gpt-4o")
 
     title, text, tags = await formatter.format_entry("сырая расшифровка")

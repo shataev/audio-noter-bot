@@ -1,4 +1,5 @@
 """Transcription: the size guard and where the language comes from."""
+
 # config.py reads os.environ at import time and raises KeyError on a missing
 # value, so the stubs have to be in place before anything from the project is
 # imported. setdefault throughout, so a real environment always wins.

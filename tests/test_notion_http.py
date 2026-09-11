@@ -1,4 +1,5 @@
 """Notion transport: the shared client, its timeout, and what is retried."""
+
 # config.py reads os.environ at import time and raises KeyError on a missing
 # value, so the stubs have to be in place before anything from the project is
 # imported. setdefault throughout, so a real environment always wins.
@@ -70,9 +71,7 @@ async def test_rate_limiting_is_retried_and_then_succeeds(no_waiting, monkeypatc
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request)
         if len(attempts) == 1:
-            return httpx.Response(
-                429, headers={"Retry-After": "2"}, json={"code": "rate_limited"}
-            )
+            return httpx.Response(429, headers={"Retry-After": "2"}, json={"code": "rate_limited"})
         return httpx.Response(200, json={"results": [], "has_more": False})
 
     _install(handler)
@@ -162,9 +161,7 @@ async def test_appending_blocks_is_still_retried_after_a_rate_limit(no_waiting, 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request)
         if len(attempts) == 1:
-            return httpx.Response(
-                429, headers={"Retry-After": "1"}, json={"code": "rate_limited"}
-            )
+            return httpx.Response(429, headers={"Retry-After": "1"}, json={"code": "rate_limited"})
         return httpx.Response(200, json={"ok": True})
 
     _install(handler)
