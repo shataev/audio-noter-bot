@@ -49,7 +49,7 @@ MAX_TITLE_CHARS = MAX_TEXT_CHARS
 # model that ignored the instruction on garbled input, or a paragraph pasted
 # into the edit flow — cannot consume the whole budget on its own.
 MAX_ENTRY_TITLE_CHARS = 100
-ELLIPSIS = "\u2026"
+ELLIPSIS = "…"
 
 _client: httpx.AsyncClient | None = None
 
@@ -145,7 +145,8 @@ async def _request(
                     f"Notion {method} {path} returned {status}: {response.text[:500]}",
                     status_code=status,
                 )
-            wait = _retry_after(response) or delay
+            retry_after = _retry_after(response)
+            wait = delay if retry_after is None else retry_after
             logger.warning(
                 "Notion %s %s returned %s, retrying in %.1fs", method, path, status, wait
             )
@@ -157,7 +158,7 @@ async def _request(
     raise NotionError(f"Notion {method} {path} exhausted its {attempts} attempts")
 
 
-_SENTENCE_END = re.compile(r"(?<=[.!?\u2026])\s+")
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 _WHITESPACE = re.compile(r"\s+")
 _PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
 
