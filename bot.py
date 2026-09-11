@@ -51,6 +51,7 @@ DRAFT_KEYS = (
     "tags_msg_id",
     "buttons_msg_id",
     "edit_prompt_msg_id",
+    "editing_state",
     "saving",
 )
 
@@ -281,12 +282,17 @@ def _discard_temp_file(path: str | None) -> None:
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
 
-    # A recording sent while a preview is still open replaces it. The old preview keeps
-    # its message ids in user_data, and those are about to be overwritten, so its
-    # buttons have to come off first or they would end up driving the new draft.
-    previous = _clear_draft(context)
-    if previous.get("pending") is not None:
-        await _retire_preview(context.bot, update.effective_chat.id, previous, DRAFT_REPLACED)
+    # A recording sent while a preview is still open replaces it — but only once the
+    # replacement exists. Everything below can fail, and a draft the user has not saved
+    # yet must not be thrown away for a recording that never arrives: the old preview
+    # stays live and the failed recording is the one that is lost. Which means failing
+    # has to leave the conversation exactly where it found it — including mid-edit,
+    # where the preview's keyboard is off and the prompt the user can still answer is
+    # the only way back.
+    if context.user_data.get("pending") is None:
+        on_failure = ConversationHandler.END
+    else:
+        on_failure = context.user_data.get("editing_state", PREVIEW)
 
     await message.reply_text("Listening...")
 
@@ -303,7 +309,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         except Exception:
             logger.exception("Error downloading voice message")
             await message.reply_text(DOWNLOAD_FAILED)
-            return ConversationHandler.END
+            return on_failure
 
         try:
             await message.reply_text("Transcribing...")
@@ -311,7 +317,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         except Exception:
             logger.exception("Error transcribing voice message")
             await message.reply_text(TRANSCRIBE_FAILED)
-            return ConversationHandler.END
+            return on_failure
     finally:
         _discard_temp_file(tmp_path)
 
@@ -323,7 +329,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except Exception:
         logger.exception("Error formatting transcription")
         await message.reply_text(FORMAT_FAILED)
-        return ConversationHandler.END
+        return on_failure
 
     try:
         title_msg = await reply_html(message, _title_body(title))
@@ -333,7 +339,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except Exception:
         logger.exception("Error sending the preview")
         await message.reply_text(PREVIEW_FAILED)
-        return ConversationHandler.END
+        return on_failure
+
+    # The new preview is up, so the old one can go. Its message ids live under the same
+    # keys that are about to be overwritten, so its buttons have to come off here or
+    # they would end up driving the new draft. The editing prompt goes too: a "send a
+    # new title" that belonged to the replaced draft answers to nothing now.
+    previous = _clear_draft(context)
+    if previous.get("pending") is not None:
+        chat_id = update.effective_chat.id
+        await _retire_preview(context.bot, chat_id, previous, DRAFT_REPLACED)
+        await _delete_messages(context.bot, chat_id, [previous["edit_prompt_msg_id"]])
 
     context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
     context.user_data["title_msg_id"] = title_msg.message_id
@@ -430,6 +446,7 @@ async def edit_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_reply_markup(reply_markup=None)
     prompt = await query.message.reply_text("Send a new title:")
     context.user_data["edit_prompt_msg_id"] = prompt.message_id
+    context.user_data["editing_state"] = EDIT_TITLE
     return EDIT_TITLE
 
 
@@ -442,6 +459,7 @@ async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_reply_markup(reply_markup=None)
     prompt = await query.message.reply_text("Send a new text:")
     context.user_data["edit_prompt_msg_id"] = prompt.message_id
+    context.user_data["editing_state"] = EDIT_TEXT
     return EDIT_TEXT
 
 
@@ -464,7 +482,9 @@ async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
-    # Popped, so /cancel does not later try to delete a prompt that is already gone.
+    # Popped, so /cancel does not later try to delete a prompt that is already gone,
+    # and so an interrupted recording is not sent back to an edit that is finished.
+    context.user_data.pop("editing_state", None)
     await _delete_messages(context.bot, chat_id, [
         context.user_data.pop("edit_prompt_msg_id", None),
         user_msg.message_id,
@@ -490,7 +510,9 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
-    # Popped, so /cancel does not later try to delete a prompt that is already gone.
+    # Popped, so /cancel does not later try to delete a prompt that is already gone,
+    # and so an interrupted recording is not sent back to an edit that is finished.
+    context.user_data.pop("editing_state", None)
     await _delete_messages(context.bot, chat_id, [
         context.user_data.pop("edit_prompt_msg_id", None),
         user_msg.message_id,
@@ -507,6 +529,7 @@ async def edit_tags_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_reply_markup(reply_markup=None)
     prompt = await query.message.reply_text("Send tags separated by commas:")
     context.user_data["edit_prompt_msg_id"] = prompt.message_id
+    context.user_data["editing_state"] = EDIT_TAGS
     return EDIT_TAGS
 
 
@@ -530,7 +553,9 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message_id=context.user_data["buttons_msg_id"],
         reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
     )
-    # Popped, so /cancel does not later try to delete a prompt that is already gone.
+    # Popped, so /cancel does not later try to delete a prompt that is already gone,
+    # and so an interrupted recording is not sent back to an edit that is finished.
+    context.user_data.pop("editing_state", None)
     await _delete_messages(context.bot, chat_id, [
         context.user_data.pop("edit_prompt_msg_id", None),
         user_msg.message_id,

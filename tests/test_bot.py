@@ -474,6 +474,113 @@ async def test_a_new_recording_takes_the_buttons_off_the_old_preview(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_a_failed_new_recording_leaves_the_old_draft_alone(tmp_path, monkeypatch, fake_bot, context):
+    """Replacing a preview is only earned by a recording that makes it all the way.
+
+    The second recording is too large for the Bot API, so the download raises. The
+    first draft has not been saved yet and a transcription and a formatting call have
+    already been paid for; it has to survive, buttons and all.
+    """
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", ["sport"])
+    await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
+    first = dict(context.user_data)
+
+    await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Вторая", "тело", [], download_fails=True
+    )
+    state = await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert state == bot.PREVIEW, "the conversation must stay on the surviving preview"
+    assert fake_bot.sent[-1].text == bot.DOWNLOAD_FAILED
+    assert context.user_data["pending"] == first["pending"]
+    assert context.user_data["buttons_msg_id"] == first["buttons_msg_id"]
+
+    buttons = fake_bot.find(first["buttons_msg_id"])
+    assert buttons.reply_markup is not None, "the surviving draft keeps working buttons"
+    assert buttons.text != bot.DRAFT_REPLACED
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_recording_still_ends_the_conversation(tmp_path, monkeypatch, fake_bot, context):
+    """With no draft to protect there is nothing to stay open for."""
+    await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [], download_fails=True
+    )
+
+    state = await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recording_sent_mid_edit_leaves_the_edit_open(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Opening an edit takes the preview's keyboard off, so PREVIEW is not a way back.
+
+    A recording that fails while the bot is waiting for a new title has to leave the
+    conversation in EDIT_TITLE, with the prompt still standing and still answerable.
+    """
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    await bot.edit_title_callback(callback_update(fake_bot, "edit_title", buttons_id), context)
+    prompt_id = context.user_data["edit_prompt_msg_id"]
+    assert fake_bot.find(buttons_id).reply_markup is None
+
+    await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Вторая", "тело", [], download_fails=True
+    )
+    state = await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert state == bot.EDIT_TITLE
+    assert context.user_data["edit_prompt_msg_id"] == prompt_id
+    assert prompt_id not in fake_bot.deleted
+
+    # And the prompt still works: the draft the user came back to is the first one.
+    await bot.receive_new_title(text_update(fake_bot, "Исправленный"), context)
+    assert context.user_data["pending"]["title"] == "Исправленный"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_edit_is_not_somewhere_a_failed_recording_returns_to(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Once the edit is answered the prompt is gone; PREVIEW is the way back again."""
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
+    await bot.edit_title_callback(
+        callback_update(fake_bot, "edit_title", context.user_data["buttons_msg_id"]), context
+    )
+    await bot.receive_new_title(text_update(fake_bot, "Исправленный"), context)
+
+    await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Вторая", "тело", [], download_fails=True
+    )
+    state = await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert state == bot.PREVIEW
+
+
+@pytest.mark.asyncio
+async def test_a_new_recording_clears_the_replaced_drafts_edit_prompt(tmp_path, monkeypatch, fake_bot, context):
+    """Dictating over an open "send a new title" must not leave the prompt behind."""
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Первая", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=1), context)
+    await bot.edit_title_callback(
+        callback_update(fake_bot, "edit_title", context.user_data["buttons_msg_id"]), context
+    )
+    prompt_id = context.user_data["edit_prompt_msg_id"]
+
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Вторая", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert prompt_id in fake_bot.deleted
+    assert context.user_data.get("edit_prompt_msg_id") is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_discards_the_draft_and_its_messages(tmp_path, monkeypatch, fake_bot, context):
     await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", ["sport"])
     await bot.handle_voice(voice_update(fake_bot), context)
