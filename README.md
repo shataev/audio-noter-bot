@@ -134,84 +134,147 @@ It takes a few minutes, and after that local work never touches the server.
 Start a chat with the dev bot and send it a voice message. The production bot
 keeps running the whole time.
 
-### make dev
+### What happened to `make dev`
 
-```bash
-make dev        # stops the bot on the server, then runs this one
-make stop-dev   # starts it again
-```
+`make dev` used to ssh into the server, stop the bot, and run a local one
+against the same token — leaving production down for as long as you worked, and
+longer if the command was interrupted or the machine slept. Nothing told you.
 
-This is the old way and it is kept only so that existing habits do not break.
-It stops the bot on the server for as long as you are working, and it stays
-stopped if the command is interrupted, if this machine sleeps, or if you simply
-forget `make stop-dev`. Nothing will tell you. Use `make run`.
+It is gone, and it could not survive anyway: the deploy key is a
+forced-command key, and stopping the bot is not one of the two things it can
+ask for. Both targets now print this and exit. Use `make run`.
 
 ## Deployment
 
-### Configuring the target
+The bot is deployed by one command over ssh, to a key that cannot do anything
+else. Three accounts are involved and each is deliberately weaker than the last:
 
-This repository is public, so it does not contain the address of the server it
-deploys to. `make` reads that from `deploy.mk`, which is gitignored and stays on
-your machine:
+| Account | Can | Cannot |
+|---|---|---|
+| you, on your machine | ask for a deploy or a rollback | reach a shell on the server |
+| `noter-deploy`, on the server | write the code directory, restart the unit, read its journal | read the credentials |
+| `noter`, on the server | run the bot | write the code, or be logged into |
+
+### Configuring your side
+
+`HOST` is the name of an entry in your `~/.ssh/config`. The address, the login
+and the key live there, which is why this repository — which is public — never
+has to contain any of them.
+
+```
+Host noter-vps
+    HostName <your server>
+    User noter-deploy
+    IdentityFile ~/.ssh/id_ed25519_noter_deploy
+    IdentitiesOnly yes
+```
+
+Then point `make` at that alias. `deploy.mk` is gitignored and holds nothing
+else — everything about the server itself is configured on the server:
 
 ```bash
 cp deploy.mk.example deploy.mk
-$EDITOR deploy.mk        # set HOST
+$EDITOR deploy.mk        # HOST = noter-vps
 ```
 
-`HOST` is an ssh destination. Prefer an alias defined in `~/.ssh/config` over a
-literal `user@host`, so the address, the login and the key live in one place:
+`make deploy HOST=noter-vps` works for a one-off. With `HOST` unset, `make
+deploy` stops with an explanation before it opens a connection.
 
-```
-Host noter
-    HostName 203.0.113.10
-    User deploy
-    IdentityFile ~/.ssh/id_ed25519_noter
-```
+### Server-side setup
 
-`APP_DIR` (default `/opt/noter`) and `UNIT` (default `noter`) can be set in the
-same file. Any of the three can also be passed for a single command, e.g.
-`make deploy HOST=noter`. With none of them set, `make deploy` stops with an
-explanation before it opens a connection.
+Everything here is run **as root on the server**, once.
 
-### The deploy user
-
-`make deploy` connects as one account and does three things as it: `git pull`,
-`pip install`, and `systemctl` / `journalctl` through `sudo`. So that account
-must
-
-- **own `APP_DIR` and its `.venv`.** The pull and the install deliberately do
-  not go through `sudo` — the less that runs as root on the server, the better.
-- **be able to restart the unit and read its journal without a password.** A
-  deploy has no terminal, so a `sudo` password prompt is a hang, not a question.
-
-Deploying as root satisfies both with nothing to set up. To deploy as an
-ordinary user instead — `deploy` in the examples — give it the code and a
-narrow rule:
+**1. The deploy account.** It owns the code and nothing else. No password, and
+nothing logs into it interactively — the key below is the only way in.
 
 ```bash
-chown -R deploy:deploy /opt/noter
-visudo -f /etc/sudoers.d/noter-deploy
+useradd --system --create-home --shell /bin/bash noter-deploy
+chown -R noter-deploy:noter-deploy /opt/noter
+chmod -R a+rX,go-w /opt/noter
 ```
 
+It owns `/opt/noter` so that `git pull` and `pip install` need no privilege at
+all. The alternative — leaving the directory root-owned and widening `sudo` to
+cover `git` and `pip` — would be much worse: `pip install` runs code from the
+package index, and `sudo pip install` runs it as root. Ownership solves the
+same problem without handing anything root.
+
+`noter`, the account the bot runs as, owns none of it and only reads.
+
+**2. The forced-command key.** Generate a keypair for deploys on *your* machine
+(`ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_noter_deploy`), then put the public
+half in `/home/noter-deploy/.ssh/authorized_keys` — on one line:
+
 ```
-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart noter, \
-                            /usr/bin/systemctl is-active --quiet noter, \
-                            /usr/bin/systemctl show -p NRestarts --value noter, \
-                            /usr/bin/journalctl -u noter *
+restrict,command="/usr/local/bin/noter-deploy" ssh-ed25519 AAAA...your key... deploy
 ```
 
-Check it before you rely on it — the paths have to match `command -v systemctl`
-and `command -v journalctl` on your server:
+`command=` means that whatever the client asks for, the server runs
+`/usr/local/bin/noter-deploy` and passes the request along in
+`SSH_ORIGINAL_COMMAND`. `restrict` turns off port and agent forwarding, X11 and
+pty allocation. The key cannot get a shell, and the wrapper accepts exactly two
+requests: `deploy <revision>` and `rollback <revision>`.
 
 ```bash
-sudo -n systemctl is-active --quiet noter; echo $?
+install -d -m 700 -o noter-deploy -g noter-deploy /home/noter-deploy/.ssh
+$EDITOR /home/noter-deploy/.ssh/authorized_keys
+chown noter-deploy:noter-deploy /home/noter-deploy/.ssh/authorized_keys
+chmod 600 /home/noter-deploy/.ssh/authorized_keys
 ```
 
-If that asks for a password, the deploy fails at the restart.
+**3. The wrapper.** One copy, from the checkout:
 
-Whichever account you use, the one that must **not** own the code is `noter`,
-the user the bot runs as. It only ever reads it.
+```bash
+install -m 755 -o root -g root /opt/noter/deploy/noter-deploy /usr/local/bin/noter-deploy
+```
+
+Root-owned and not writable by `noter-deploy`, so the account the key logs into
+cannot rewrite the only program that key can run.
+
+**4. The sudo rules.** The deploy account reaches systemd through exactly these
+three commands and nothing else. `visudo -f /etc/sudoers.d/noter-deploy` and
+paste:
+
+```
+noter-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart noter
+noter-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl is-active noter
+noter-deploy ALL=(root) NOPASSWD: /usr/bin/journalctl -u noter *
+```
+
+These match what the wrapper calls, exactly — including `is-active` *without*
+`--quiet`, because sudo matches the whole argument list and `--quiet` would not
+be permitted by the rule above. `NOPASSWD` is not optional: a deploy has no
+terminal, so a password prompt is a hang rather than a question.
+
+Note what is **not** there: `systemctl show -p NRestarts`. Detecting a crash
+loop matters — `Restart=always` means an "active" unit can be one that has died
+five times in the last ten seconds — but it does not need a fourth rule.
+systemd writes `Scheduled restart job, restart counter is at N.` into the unit's
+own journal, which the third rule already allows reading, and the wrapper reads
+it there. If the paths differ on your server, `command -v systemctl journalctl`
+says what they are; they must match the rules byte for byte.
+
+Check the rules before relying on them:
+
+```bash
+sudo -u noter-deploy sudo -n /usr/bin/systemctl is-active noter
+```
+
+**5. The credentials, which the deploy account must not be able to read.** This
+is the point of keeping them in `/etc/noter/noter.env` rather than in a `.env`
+inside `/opt/noter`:
+
+```bash
+chown root:root /etc/noter/noter.env
+chmod 600 /etc/noter/noter.env
+```
+
+systemd reads that file as root and hands the values to the service before
+dropping to the `noter` user, so nothing else ever needs read access to it. A
+`.env` in the code directory would instead be readable by whoever owns that
+directory — which is now `noter-deploy`. That is the difference between a deploy
+account that can restart the bot and one that can read the owner's diary and
+four live API tokens. Keep it out of `/opt/noter`.
 
 ### Deploying
 
@@ -221,14 +284,23 @@ make deploy
 
 Locally it refuses to do anything until the working tree is clean and `make
 check` passes, so uncommitted work cannot be half-deployed and code that does
-not compile cannot leave the machine. Then it pushes.
+not compile cannot leave the machine. Then it pushes, and asks the server to
+deploy that exact revision:
 
-On the server it pulls, installs `requirements.txt`, restarts the unit, waits,
-and then proves the bot is actually up rather than assuming it:
+```
+ssh noter-vps deploy 4065fbd…              # the full 40-character revision
+```
+
+The server pulls, **checks that the revision it ended up on is the one that was
+asked for** — the client pushes the branch you are on and the server pulls the
+branch it is on, and when those differ nothing you wrote gets deployed — then
+installs `requirements.txt`, restarts the unit, waits, and proves the bot is
+actually up rather than assuming it:
 
 - the unit is still `active`;
 - it has not restarted since the deploy — `Restart=always` otherwise hides a
-  crash loop behind an `active` unit;
+  crash loop behind an `active` unit, and systemd's own
+  `restart counter is at N` lines in the journal are what give it away;
 - the journal since the restart contains `Bot started`, the line the bot logs
   once it has registered its handlers and begun polling. Note that it is logged
   immediately *before* polling starts, so a failure inside polling itself — a
@@ -249,8 +321,14 @@ make rollback REV=<git-revision>
 ```
 
 That resets the server's checkout to that revision, reinstalls dependencies,
-restarts, and runs the same liveness check. The next `make deploy`
-fast-forwards back onto the branch as usual.
+restarts, and runs the same liveness check — a rollback that reports success
+into a revision which also crash-loops would be a false reassurance at the worst
+possible moment. The next `make deploy` fast-forwards back onto the branch as
+usual.
+
+Both verbs are the only two things the deploy key can ask for. Anything else —
+an empty request, a malformed revision, `systemctl stop noter` — is refused
+before it is used for anything.
 
 ### First-time VPS setup
 
@@ -265,11 +343,11 @@ nothing ever logs in as it.
 useradd --system --no-create-home --shell /usr/sbin/nologin noter
 ```
 
-**2. Check out the code.** It ends up owned by whoever you deploy as — root
-here; see [The deploy user](#the-deploy-user) to use an ordinary account
-instead. What matters is that `noter` does not own it: the service only ever
-reads the code, and a bot that cannot rewrite what it is running is one less
-thing to worry about.
+**2. Check out the code.** It ends up owned by `noter-deploy`, the account that
+deploys — see [Server-side setup](#server-side-setup), which creates it. What
+matters is that `noter` does not own it: the service only ever reads the code,
+and a bot that cannot rewrite what it is running is one less thing to worry
+about.
 
 ```bash
 git clone https://github.com/shataev/audio-noter-bot.git /opt/noter
@@ -307,6 +385,10 @@ systemctl enable --now noter
 systemctl status noter
 journalctl -u noter -n 20 --no-pager    # should contain "Bot started"
 ```
+
+**6. Set up the deploy path** — the account, the key, the wrapper and the sudo
+rules — from [Server-side setup](#server-side-setup). Until that is done the bot
+runs, but `make deploy` has nothing to talk to.
 
 ### The unit
 
@@ -398,12 +480,12 @@ chmod 600 /etc/noter/noter.env
 #    reads .env from the working directory if one is there.
 ls -la /opt/noter/.env    # must be "No such file or directory"
 
-# 4. Fix ownership of the code. The deploy user owns it, the service user only
-#    reads it. DEPLOY_USER is whoever you ssh in as — root unless you set up a
-#    separate account, see "The deploy user" above.
-DEPLOY_USER=root
-chown -R "$DEPLOY_USER:$DEPLOY_USER" /opt/noter
-chmod -R go-w /opt/noter
+# 4. Fix ownership of the code: the deploy account owns it, the service user
+#    only reads it. This is also what lets `git pull` and `pip install` run
+#    without sudo. /opt/noter is root-owned today, so this is the step that
+#    makes deploying as noter-deploy possible at all.
+chown -R noter-deploy:noter-deploy /opt/noter
+chmod -R a+rX,go-w /opt/noter
 
 # 5. Install the new unit and reload.
 cp /opt/noter/deploy/noter.service /etc/systemd/system/noter.service
@@ -420,10 +502,22 @@ If it does not come back, `journalctl -u noter -n 50` says why; the usual cause
 is a value that did not survive the move into `noter.env`. Putting `User=root`
 back and reloading returns you to where you started.
 
+Step 2 is the one that matters most and the one that is easy to half-finish.
+Before it, `.env` sits in `/opt/noter` — which step 4 hands to `noter-deploy`,
+so a deploy account would be able to read the Telegram, OpenAI and Notion tokens
+and every transcription they can fetch. After it, systemd reads the values as
+root and passes them in, and no account on the machine except root can read the
+file. Do not reorder these two, and do not skip step 3.
+
 Anything the bot wrote under `/opt/noter` while it ran as root — there is
 nothing today, but check — needs `chown noter:noter` and moving to
 `/var/lib/noter`, because `ProtectSystem=strict` makes `/opt/noter` read-only
 to the service.
+
+The `.venv` moves owner with the rest of `/opt/noter` in step 4. If it was built
+by root and any file in it is mode 600, `chmod -R a+rX,go-w` above fixes the
+read bits; `noter` needs to read and execute it, and `noter-deploy` needs to
+write it when dependencies change.
 
 ### Useful commands
 
