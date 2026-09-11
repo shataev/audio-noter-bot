@@ -279,8 +279,13 @@ def _split_day_title(title: str) -> tuple[str, list[str]]:
     prefix, separator, rest = title.partition(" | ")
     if not separator:
         return title, []
-    entries = [part.strip() for part in rest.split(", ")]
-    return prefix, [entry for entry in entries if entry and entry != ELLIPSIS]
+    entries = [part.strip() for part in rest.split(", ") if part.strip()]
+    # Strip the drop marker, which is only ever written first. Matching it by
+    # position rather than by value keeps an entry genuinely named "…" — one
+    # character, but it is a name the user chose — from being dropped silently.
+    if entries and entries[0] == ELLIPSIS:
+        entries = entries[1:]
+    return prefix, entries
 
 
 def _compose_day_title(prefix: str, entries: list[str], limit: int = MAX_TITLE_CHARS) -> str:
@@ -308,10 +313,17 @@ def _compose_day_title(prefix: str, entries: list[str], limit: int = MAX_TITLE_C
         return head + joined
 
     # Last resort: keep the date prefix and the newest names, drop the oldest.
-    kept = [_truncate(names[-1], room)]
+    # The marker standing in for what is dropped costs room too, so it comes out
+    # of the budget before the newest name is measured against it, not after.
+    marker = f"{ELLIPSIS}, "
+    seed_room = room - len(marker)
+    if seed_room <= 0:
+        return _truncate(f"{head}{names[-1]}", limit)
+
+    kept = [_truncate(names[-1], seed_room)]
     for index in range(len(names) - 2, -1, -1):
         candidate = ", ".join([names[index], *kept])
-        if len(candidate) + len(ELLIPSIS) + 2 > room:
+        if len(candidate) + len(marker) > room:
             break
         kept.insert(0, names[index])
     kept.insert(0, ELLIPSIS)

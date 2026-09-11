@@ -258,3 +258,60 @@ async def test_update_page_sends_a_title_within_the_limit():
     assert len(sent) <= notion.MAX_TITLE_CHARS
     assert sent.startswith("9 сентября | ")
     assert sent.endswith("Свежая запись")
+
+
+@pytest.mark.parametrize("prefix_length", [0, 100, 1000, 1890, 1895, 1897, 1950, 1996, 1998, 2100])
+def test_the_title_limit_holds_whatever_the_date_prefix_is(prefix_length):
+    """The drop marker costs room too, and has to be paid for before the seed.
+
+    A page renamed by hand to something enormous is exactly the unbounded-input
+    case the guard exists for, so the guard must not be the thing that produces
+    the 400 it prevents. Short prefixes alone cannot catch this: they leave
+    room ~1990, where the three characters of the marker never matter.
+    """
+    title = notion._compose_day_title("П" * prefix_length, ["Я" * 100] * 30)
+
+    assert len(title) <= notion.MAX_TITLE_CHARS
+
+
+def test_an_entry_named_like_the_drop_marker_keeps_its_name():
+    """The marker is only ever written first, so match it by position."""
+    title = notion._compose_day_title("9 мая", ["Реальная запись", notion.ELLIPSIS])
+
+    assert notion._split_day_title(title)[1] == ["Реальная запись", notion.ELLIPSIS]
+
+
+@pytest.mark.asyncio
+async def test_no_request_body_exceeds_the_payload_limit():
+    """The 500KB budget has to hold in bytes on the wire, not in characters.
+
+    Cyrillic is two bytes per character in UTF-8, so an entry that looks modest
+    in characters is twice the size in the body httpx actually sends.
+    """
+    text = "\n\n".join("Я" * 8000 for _ in range(60))
+    assert len(text.encode("utf-8")) > notion.MAX_PAYLOAD_BYTES
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/query"):
+            return _no_today_page(request)
+        seen.append(request)
+        return httpx.Response(200, json={"id": "page-1"})
+
+    _install(handler)
+    await notion.save_entry("Огромная запись", text, [])
+
+    assert len(seen) > 1, "one body cannot hold this entry"
+    blocks = []
+    for request in seen:
+        assert len(request.content) <= notion.MAX_PAYLOAD_BYTES, (
+            f"a {len(request.content)} byte body would be rejected"
+        )
+        children = json.loads(request.content)["children"]
+        assert len(children) < notion.MAX_CHILDREN_PER_REQUEST, (
+            "size drove this split, not the children count"
+        )
+        blocks.extend(children)
+
+    assert _plain_text(blocks) == text
