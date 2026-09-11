@@ -7,9 +7,6 @@
 # Local deploy configuration: which host to deploy to. See deploy.mk.example.
 deploy.mk
 
-# Local agent-orchestration config. Never commit this.
-spur.yaml
-
 # Python
 .venv/
 venv/
