@@ -38,6 +38,9 @@ MAX_TEXT_CHARS = 2000
 MAX_RICH_TEXT_PER_BLOCK = 100
 MAX_CHILDREN_PER_REQUEST = 100
 MAX_PAYLOAD_BYTES = 450_000
+# Paginated endpoints return at most 100 results and default to the same value;
+# it is sent explicitly so the page size is a decision rather than a default.
+MAX_PAGE_SIZE = 100
 # A page title is rich text too, so 2000 characters is the hard ceiling for the
 # whole accumulated day title.
 MAX_TITLE_CHARS = MAX_TEXT_CHARS
@@ -355,6 +358,14 @@ def _combine_tags(existing_page: dict | None, new_tags: list[str]) -> list[dict]
 
 
 async def get_today_page() -> dict | None:
+    """Returns today's diary page, or None if it has not been created yet.
+
+    Deliberately not paginated: there should be exactly one page per date. Two
+    results are asked for so that a duplicate is noticed instead of silently
+    ignored, and the sort makes the choice stable — entries keep going to the
+    page they have been going to all day rather than to whichever page the API
+    happened to list first.
+    """
     resp = await _request(
         "POST",
         f"/databases/{settings.notion_database_id}/query",
@@ -362,10 +373,17 @@ async def get_today_page() -> dict | None:
             "filter": {
                 "property": "Created",
                 "date": {"equals": _today_date()},
-            }
+            },
+            "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+            "page_size": 2,
         },
     )
     results = resp.json().get("results", [])
+    if len(results) > 1:
+        logger.warning(
+            "More than one Notion page is dated %s; appending to the oldest (%s)",
+            _today_date(), results[0].get("id"),
+        )
     return results[0] if results else None
 
 
@@ -431,20 +449,33 @@ async def get_week_pages() -> list[dict]:
     tz = zoneinfo.ZoneInfo(settings.timezone)
     today = datetime.now(tz).date()
     week_ago = today - timedelta(days=6)
-    resp = await _request(
-        "POST",
-        f"/databases/{settings.notion_database_id}/query",
-        json={
-            "filter": {
-                "and": [
-                    {"property": "Created", "date": {"on_or_after": week_ago.isoformat()}},
-                    {"property": "Created", "date": {"on_or_before": today.isoformat()}},
-                ]
-            },
-            "sorts": [{"property": "Created", "direction": "ascending"}],
+    body = {
+        "filter": {
+            "and": [
+                {"property": "Created", "date": {"on_or_after": week_ago.isoformat()}},
+                {"property": "Created", "date": {"on_or_before": today.isoformat()}},
+            ]
         },
-    )
-    return resp.json().get("results", [])
+        "sorts": [{"property": "Created", "direction": "ascending"}],
+        "page_size": MAX_PAGE_SIZE,
+    }
+
+    pages: list[dict] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        payload = body if cursor is None else {**body, "start_cursor": cursor}
+        resp = await _request(
+            "POST", f"/databases/{settings.notion_database_id}/query", json=payload
+        )
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        cursor = data.get("next_cursor")
+        # The cursor check also stops a server that keeps handing back the same
+        # one from spinning this loop forever.
+        if not data.get("has_more") or not cursor or cursor in seen:
+            return pages
+        seen.add(cursor)
 
 
 async def save_entry(entry_title: str, entry_text: str, entry_tags: list[str]) -> bool:
@@ -459,6 +490,23 @@ async def save_entry(entry_title: str, entry_text: str, entry_tags: list[str]) -
 
 
 async def get_page_blocks(page_id: str) -> list[dict]:
-    """Returns the top-level blocks of a page."""
-    resp = await _request("GET", f"/blocks/{page_id}/children")
-    return resp.json().get("results", [])
+    """Returns every top-level block of a page, following Notion's cursor.
+
+    One response carries at most 100 blocks. A saved entry costs three blocks
+    after the first, so a single request stops seeing a busy day somewhere
+    around its mid-thirties entry.
+    """
+    blocks: list[dict] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        params = {"page_size": MAX_PAGE_SIZE}
+        if cursor is not None:
+            params["start_cursor"] = cursor
+        resp = await _request("GET", f"/blocks/{page_id}/children", params=params)
+        data = resp.json()
+        blocks.extend(data.get("results", []))
+        cursor = data.get("next_cursor")
+        if not data.get("has_more") or not cursor or cursor in seen:
+            return blocks
+        seen.add(cursor)
