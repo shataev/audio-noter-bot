@@ -1,25 +1,17 @@
-# Copy this to deploy.mk and fill it in. deploy.mk is gitignored: this
-# repository is public, and the address of the server it deploys to is not
-# something to publish.
+# Copy this to deploy.mk and set HOST. deploy.mk is gitignored.
 #
 #     cp deploy.mk.example deploy.mk
 #
-# HOST is an ssh destination. An ssh_config alias is better than user@host:
-# the address, the login and the key then live in ~/.ssh/config, and the
-# Makefile never has to know any of them. In ~/.ssh/config:
+# HOST is the name of an entry in your ~/.ssh/config — not a hostname and not
+# an address. The address, the login and the key belong there, which is why
+# this repository, which is public, never has to know any of them:
 #
-#     Host noter
-#         HostName 203.0.113.10
-#         User deploy
-#         IdentityFile ~/.ssh/id_ed25519_noter
+#     Host noter-vps
+#         HostName <your server>
+#         User noter-deploy
+#         IdentityFile ~/.ssh/id_ed25519_noter_deploy
+#         IdentitiesOnly yes
 #
-# Whoever you connect as must own APP_DIR and be able to restart the unit
-# without a password prompt. Deploying as root needs no setup; see "The deploy
-# user" in the README to use an ordinary account instead.
-HOST = noter
-
-# Where the checkout lives on the server. Defaults to /opt/noter.
-# APP_DIR = /opt/noter
-
-# Name of the systemd unit. Defaults to noter.
-# UNIT = noter
+# That key is a forced-command key on the server: it can ask for a deploy or a
+# rollback and cannot reach a shell. See "Deployment" in the README.
+HOST = noter-vps

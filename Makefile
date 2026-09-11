@@ -1,12 +1,9 @@
-# Where to deploy is not in this file, and not in this repository: it is public.
-# Put HOST (and APP_DIR or UNIT, if they are not the defaults) in deploy.mk,
-# which is gitignored. See deploy.mk.example.
-#
-# A value on the command line — `make deploy HOST=...` — overrides deploy.mk.
+# The server this deploys to is not named in this repository, and does not need
+# to be: HOST is the name of an entry in your own ~/.ssh/config, which holds the
+# address, the login and the key. Put it in deploy.mk, which is gitignored —
+# see deploy.mk.example — or pass it for one command: make deploy HOST=...
 -include deploy.mk
 
-APP_DIR ?= /opt/noter
-UNIT ?= noter
 PY ?= .venv/bin/python
 
 .PHONY: run check deploy rollback dev stop-dev require-host require-clean require-dev-tools
@@ -35,40 +32,41 @@ check: require-dev-tools
 	$(PY) -m pytest -q
 
 # Nothing reaches the network until the tree is clean and the checks pass.
-# The revision is passed through to the server, which refuses to call a deploy
-# successful unless that is the revision it ends up on.
+#
+# The deploy key on the server is a forced-command key: it cannot reach a shell,
+# and the request below arrives at /usr/local/bin/noter-deploy as
+# SSH_ORIGINAL_COMMAND. Sending the revision explicitly is what lets the server
+# refuse to call a deploy successful unless that is the revision it ends up on.
 deploy: require-host require-clean check
 	git push
-	@echo "-- deploying $$(git rev-parse --short HEAD) to $(HOST):$(APP_DIR)"
-	@ssh $(HOST) bash -s -- '$(APP_DIR)' '$(UNIT)' "$$(git rev-parse HEAD)" < scripts/remote-deploy.sh
+	@echo "-- deploying $$(git rev-parse --short HEAD) via $(HOST)"
+	ssh $(HOST) deploy $$(git rev-parse HEAD)
 
 # Put the server back on an earlier revision. `make deploy` prints the one it
-# replaced, and the remote script repeats it when a deploy fails.
+# replaced, and the server repeats it when a deploy fails.
 rollback: require-host
 	@if [ -z "$(REV)" ]; then \
 	  echo 'make: usage: make rollback REV=<git-revision>' >&2; \
 	  exit 1; \
 	fi
-	@ssh $(HOST) bash -s -- '$(APP_DIR)' '$(UNIT)' '$(REV)' < scripts/remote-rollback.sh
+	ssh $(HOST) rollback $(REV)
 
-# Deprecated: running the bot locally against the production token means
-# stopping production first, and leaving it stopped if this command is
-# interrupted. Set up a second bot instead — see "Development" in the README.
-dev: require-host
-	@echo '!! make dev STOPS THE BOT ON $(HOST). It stays stopped until you'   >&2
-	@echo '!! run `make stop-dev`, including if this command is interrupted or' >&2
-	@echo '!! this machine sleeps. Nobody is watching the journal for you.'     >&2
-	@echo '!!'                                                                  >&2
-	@echo '!! The fix is a second bot token and a local .env of your own; the'  >&2
-	@echo '!! README section "Development" has the five minutes it takes.'      >&2
-	@echo '!!'                                                                  >&2
-	@echo '!! Ctrl-C now, or wait 5 seconds.'                                   >&2
-	@sleep 5
-	ssh $(HOST) "systemctl stop $(UNIT)"
-	$(PY) bot.py
-
-stop-dev: require-host
-	ssh $(HOST) "systemctl start $(UNIT)"
+# Kept as signposts. Both stopped the bot on the server so that a local run
+# would not fight it for the same Telegram token, and both are now impossible:
+# the deploy key accepts two requests and neither of them is "stop".
+dev stop-dev:
+	@{ \
+	  echo 'make: `make $@` is gone.'; \
+	  echo; \
+	  echo 'It used to stop the bot on the server so that a local run would not'; \
+	  echo 'fight it for the same Telegram token — and left it stopped whenever'; \
+	  echo 'the command was interrupted. The deploy key can no longer stop'; \
+	  echo 'anything; it can deploy and it can roll back.'; \
+	  echo; \
+	  echo 'Use a second bot instead. `make run` starts it, and production is'; \
+	  echo 'never touched. See "Development" in the README.'; \
+	} >&2; \
+	exit 1
 
 # Fail before anything touches the network, with an explanation rather than an
 # ssh error about a host called "".
@@ -77,20 +75,21 @@ require-host:
 	{ \
 	  echo 'make: HOST is not set, so there is nothing to deploy to.'; \
 	  echo; \
-	  echo 'The deploy target is deliberately not in this repository — it is public.'; \
-	  echo 'Create deploy.mk, which is gitignored:'; \
+	  echo 'HOST is the name of an entry in your ~/.ssh/config — that is where'; \
+	  echo 'the address, the login and the key live, which is why none of them'; \
+	  echo 'appear in this repository. Create deploy.mk, which is gitignored:'; \
 	  echo; \
 	  echo '    cp deploy.mk.example deploy.mk'; \
-	  echo '    $$EDITOR deploy.mk        # set HOST'; \
+	  echo '    $$EDITOR deploy.mk        # set HOST to your ssh alias'; \
 	  echo; \
-	  echo 'HOST is an ssh destination: an ssh_config alias (preferred) or user@host.'; \
-	  echo 'For a one-off:  make deploy HOST=<ssh-destination>'; \
+	  echo 'For a one-off:  make deploy HOST=<your-ssh-alias>'; \
+	  echo 'See "Deployment" in the README for the matching ~/.ssh/config entry.'; \
 	} >&2; \
 	exit 1
 
-# Deploying pushes this branch and the server pulls its own; the files on your
-# disk are never copied anywhere. Uncommitted work is therefore not deployed,
-# and the server would be running something other than what you are reading.
+# Deploying pushes this branch and the server pulls it; the files on your disk
+# are never copied anywhere. Uncommitted work is therefore not deployed, and the
+# server would be running something other than what you are reading.
 require-clean:
 	@if [ -z "$$(git status --porcelain)" ]; then exit 0; fi; \
 	{ \
