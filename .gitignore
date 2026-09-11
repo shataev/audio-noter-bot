@@ -1,4 +1,36 @@
+# Secrets — the live Telegram, OpenAI and Notion credentials.
+# .env.example is the template and is committed on purpose.
 .env
+.env.*
+!.env.example
+
+# Local deploy configuration: which host to deploy to. See deploy.mk.example.
+deploy.mk
+
+# Local agent-orchestration config. Never commit this.
+spur.yaml
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local state the bot writes at runtime: draft persistence, scratch files, logs.
+# Deliberately broad, because the draft-state file does not have a final name
+# yet. Put any new state file in state/ or give it one of these suffixes.
+state/
+data/
+*.state
+*.state.json
+*.pickle
+*.db
+*.sqlite3
+*.log
