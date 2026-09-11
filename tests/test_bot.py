@@ -264,7 +264,7 @@ def test_daily_summary_runs_every_day(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 AWKWARD_TITLE = "Отчёт за 1*2 недели & R&D <итоги>"
-AWKWARD_TAGS = ["c++_dev", "prod`ready"]
+AWKWARD_TAGS = ["c++_dev", "prod`ready", "R&D", "<draft>"]
 AWKWARD_REPORT = "Неделя была насыщенной.\n- 5*5 тренировок\n- R&D <итоги>"
 
 
@@ -295,7 +295,10 @@ async def test_tags_typed_by_the_user_do_not_break_the_message(fake_bot, context
 
     assert state == bot.PREVIEW
     tags_body = fake_bot.find(context.user_data["tags_msg_id"]).text
-    assert tags_body == "<code>Daily</code> <code>c++_dev</code> <code>prod`ready</code>"
+    assert tags_body == (
+        "<code>Daily</code> <code>c++_dev</code> <code>prod`ready</code>"
+        " <code>R&amp;D</code> <code>&lt;draft&gt;</code>"
+    )
 
 
 @pytest.mark.asyncio
@@ -316,14 +319,14 @@ async def test_weekly_report_with_an_unpaired_asterisk_is_delivered(monkeypatch,
 @pytest.mark.asyncio
 async def test_daily_summary_job_with_an_unpaired_asterisk_is_delivered(monkeypatch, fake_bot, context):
     async def fake_summary():
-        return "День прошёл 3*4 раза лучше"
+        return "День прошёл 3*4 раза лучше & <ярче>"
 
     monkeypatch.setattr(bot, "generate_daily_summary", fake_summary)
 
     await bot.send_daily_summary(context)
 
     body = fake_bot.sent[-1].text
-    assert body == "<b>Daily summary</b>\n\nДень прошёл 3*4 раза лучше"
+    assert body == "<b>Daily summary</b>\n\nДень прошёл 3*4 раза лучше &amp; &lt;ярче&gt;"
 
 
 def test_render_escapes_every_interpolated_value():
