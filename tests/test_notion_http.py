@@ -70,7 +70,9 @@ async def test_rate_limiting_is_retried_and_then_succeeds(no_waiting, monkeypatc
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request)
         if len(attempts) == 1:
-            return httpx.Response(429, headers={"Retry-After": "2"}, json={"code": "rate_limited"})
+            return httpx.Response(
+                429, headers={"Retry-After": "2"}, json={"code": "rate_limited"}
+            )
         return httpx.Response(200, json={"results": [], "has_more": False})
 
     _install(handler)
@@ -89,21 +91,30 @@ async def test_a_validation_error_is_not_retried(no_waiting, monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request)
         return httpx.Response(
-            400, json={"object": "error", "code": "validation_error", "message": "body failed validation"}
+            400,
+            json={
+                "object": "error",
+                "code": "validation_error",
+                "message": "body failed validation",
+            },
         )
 
     _install(handler)
     with pytest.raises(notion.NotionError) as raised:
         await notion._request("POST", "/pages", json={})
 
-    assert len(attempts) == 1, "a 400 fails identically every time; retrying only wastes the user's wait"
+    assert len(attempts) == 1, (
+        "a 400 fails identically every time; retrying only wastes the user's wait"
+    )
     assert no_waiting == []
     assert raised.value.status_code == 400
     assert "validation_error" in str(raised.value)
 
 
 @pytest.mark.asyncio
-async def test_a_transient_server_error_is_retried_for_a_repeatable_request(no_waiting, monkeypatch):
+async def test_a_transient_server_error_is_retried_for_a_repeatable_request(
+    no_waiting, monkeypatch
+):
     monkeypatch.setattr(settings, "notion_max_retries", 3)
     monkeypatch.setattr(settings, "notion_retry_base_delay", 1.0)
     attempts = []
@@ -151,7 +162,9 @@ async def test_appending_blocks_is_still_retried_after_a_rate_limit(no_waiting, 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request)
         if len(attempts) == 1:
-            return httpx.Response(429, headers={"Retry-After": "1"}, json={"code": "rate_limited"})
+            return httpx.Response(
+                429, headers={"Retry-After": "1"}, json={"code": "rate_limited"}
+            )
         return httpx.Response(200, json={"ok": True})
 
     _install(handler)
@@ -164,7 +177,9 @@ async def test_appending_blocks_is_still_retried_after_a_rate_limit(no_waiting, 
 
 
 @pytest.mark.asyncio
-async def test_a_connection_failure_before_sending_is_retried_even_when_appending(no_waiting, monkeypatch):
+async def test_a_connection_failure_before_sending_is_retried_even_when_appending(
+    no_waiting, monkeypatch
+):
     monkeypatch.setattr(settings, "notion_max_retries", 2)
     attempts = []
 
@@ -232,6 +247,8 @@ async def test_a_stalled_connection_fails_within_the_configured_timeout(monkeypa
         server.close()
         await server.wait_closed()
 
-    assert elapsed < 5, f"the 0.5s timeout was not enforced; the call took {elapsed:.1f}s"
+    # Not "< 5": httpx's own default is 5.0s, so that assertion would still pass
+    # if the explicit timeout were dropped again.
+    assert elapsed < 2, f"the 0.5s timeout was not enforced; the call took {elapsed:.1f}s"
     assert isinstance(raised.value, RuntimeError), "callers catching RuntimeError still see it"
     assert "ReadTimeout" in str(raised.value)

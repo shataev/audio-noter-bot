@@ -92,7 +92,9 @@ async def test_the_daily_summary_sees_the_whole_day(monkeypatch):
     for n in range(1, 41):
         if n > 1:
             blocks.append({"type": "divider", "divider": {}})
-        blocks.append({"type": "heading_3", "heading_3": {"rich_text": [{"plain_text": f"Запись {n}"}]}})
+        blocks.append(
+            {"type": "heading_3", "heading_3": {"rich_text": [{"plain_text": f"Запись {n}"}]}}
+        )
         blocks.append(_paragraph(f"Текст записи номер {n}"))
     assert len(blocks) > 100
 
@@ -102,7 +104,11 @@ async def test_the_daily_summary_sees_the_whole_day(monkeypatch):
         if request.url.path.endswith("/query"):
             return httpx.Response(
                 200,
-                json={"results": [_page("page-1", "9 сентября | Запись 1")], "has_more": False, "next_cursor": None},
+                json={
+                    "results": [_page("page-1", "9 сентября | Запись 1")],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
             )
         cursor = request.url.params.get("start_cursor")
         index = 0 if cursor is None else int(cursor.split("-")[1]) // 100
@@ -161,7 +167,9 @@ async def test_a_duplicate_page_for_today_is_reported_and_resolved_stably(caplog
 
     def handler(request: httpx.Request) -> httpx.Response:
         bodies.append(json.loads(request.content))
-        return httpx.Response(200, json={"results": duplicates, "has_more": False, "next_cursor": None})
+        return httpx.Response(
+            200, json={"results": duplicates, "has_more": False, "next_cursor": None}
+        )
 
     _install(handler)
     with caplog.at_level("WARNING"):
