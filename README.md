@@ -451,6 +451,10 @@ Ruff is currently scoped away from `bot.py`, `config.py` and `services/` — see
 the note in `pyproject.toml`. Byte-compiling and `tests/test_imports.py` still
 cover those files.
 
+`tests/` is not scoped away: new test files have to satisfy line length 100,
+`select = ["E", "F", "I", "UP", "B"]` and `ruff format`. Run `make check` before
+opening a pull request and there are no surprises.
+
 ## Project structure
 
 ```

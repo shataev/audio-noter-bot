@@ -10,6 +10,12 @@ target-version = "py310"
 # work, so they are excluded for the moment. Drop these exclusions once both
 # branches have landed — `ruff check` reports 21 violations in them today,
 # all of them import order, line length and two unused imports.
+#
+# tests/ is deliberately NOT excluded: new code should meet the rules from the
+# day it is written, which is the whole point of adding them now. Anything
+# under tests/ has to satisfy line-length 100, select = E,F,I,UP,B, and
+# `ruff format`. `make check` reports all three before a deploy, and CI before
+# a merge.
 extend-exclude = ["bot.py", "config.py", "services"]
 
 [tool.ruff.lint]
