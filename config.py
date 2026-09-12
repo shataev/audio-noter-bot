@@ -40,6 +40,12 @@ class _Settings:
     allowed_user_id: int = int(os.environ["ALLOWED_USER_ID"])
     timezone: str = os.getenv("TIMEZONE", "Europe/Moscow")
 
+    # When a diary day ends. A note dictated at half past midnight belongs to the
+    # day that has just been lived through, not to the one that started thirty
+    # minutes ago — so anything before this hour is filed under the previous
+    # date. 0 restores plain calendar days.
+    diary_day_start_hour: int = int(os.getenv("DIARY_DAY_START_HOUR", "4"))
+
     # OpenAI models.
     # gpt-transcribe rather than whisper-1, which has not been updated since
     # 2022 and is measurably worse outside English at the same price per minute.
@@ -64,6 +70,13 @@ class _Settings:
     notion_timeout: float = float(os.getenv("NOTION_TIMEOUT_SECONDS", "30"))
     notion_max_retries: int = int(os.getenv("NOTION_MAX_RETRIES", "3"))
     notion_retry_base_delay: float = float(os.getenv("NOTION_RETRY_BASE_DELAY", "1"))
+
+    @property
+    def day_start_hour(self) -> int:
+        hour = self.diary_day_start_hour
+        if not 0 <= hour <= 23:
+            raise ValueError(f"DIARY_DAY_START_HOUR must be 0-23, got {hour}")
+        return hour
 
     @property
     def keywords(self) -> list[str]:

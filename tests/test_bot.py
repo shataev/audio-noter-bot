@@ -15,7 +15,7 @@ os.environ.setdefault("ALLOWED_USER_ID", "1")
 os.environ.setdefault("TIMEZONE", "Europe/Moscow")
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree
 
 import pytest
@@ -676,8 +676,8 @@ def no_network(monkeypatch):
     """Nothing in these tests may reach Notion or OpenAI; there are no credentials."""
     calls = []
 
-    async def fake_save_entry(title, text, tags):
-        calls.append((title, text, tags))
+    async def fake_save_entry(title, text, tags, day=None):
+        calls.append((title, text, tags, day))
         return False
 
     monkeypatch.setattr(bot, "save_entry", fake_save_entry)
@@ -894,7 +894,7 @@ async def test_two_save_presses_write_one_entry(
     second = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
 
     assert len(no_network) == 1
-    assert no_network[0] == ("Заголовок", "тело", ["sport"])
+    assert no_network[0] == ("Заголовок", "тело", ["sport"], bot.diary_today())
     assert first == bot.ConversationHandler.END
     assert second == bot.ConversationHandler.END
     assert fake_bot.answered[-1] == bot.ALREADY_SAVED
@@ -913,8 +913,8 @@ async def test_a_press_during_the_notion_round_trip_is_refused(
     release = asyncio.Event()
     calls = []
 
-    async def slow_save_entry(title, text, tags):
-        calls.append((title, text, tags))
+    async def slow_save_entry(title, text, tags, day=None):
+        calls.append((title, text, tags, day))
         started.set()
         await release.wait()
         return True
@@ -953,7 +953,7 @@ async def test_the_keyboard_is_gone_before_the_save_starts(
     buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
     markup_during_save = []
 
-    async def inspect_save_entry(title, text, tags):
+    async def inspect_save_entry(title, text, tags, day=None):
         markup_during_save.append(fake_bot.find(buttons_id).reply_markup)
         return True
 
@@ -969,7 +969,7 @@ async def test_a_failed_save_can_be_retried(tmp_path, monkeypatch, fake_bot, con
     buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
     attempts = []
 
-    async def flaky_save_entry(title, text, tags):
+    async def flaky_save_entry(title, text, tags, day=None):
         attempts.append((title, text, tags))
         if len(attempts) == 1:
             raise RuntimeError("Notion PATCH pages error 502: upstream")
@@ -1171,3 +1171,129 @@ async def test_the_environment_seeds_the_list_and_the_chat_adds_to_it(
     await bot.handle_voice(voice_update(fake_bot), context)
 
     assert transcribed_with[-1] == ["Паттайя", "Кэт", "Спур"], "seeded first, no repeat"
+
+
+def _keyboard_rows(fake_bot, message_id):
+    markup = fake_bot.find(message_id).reply_markup
+    return [[button.callback_data for button in row] for row in markup.inline_keyboard]
+
+
+def _labels(fake_bot, message_id):
+    markup = fake_bot.find(message_id).reply_markup
+    return [button.text for row in markup.inline_keyboard for button in row]
+
+
+@pytest.mark.asyncio
+async def test_a_new_draft_is_filed_under_the_diary_today(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert context.user_data["pending"]["date"] == bot.diary_today().isoformat()
+    assert "📅 Today" in _labels(fake_bot, context.user_data["buttons_msg_id"])
+
+
+@pytest.mark.asyncio
+async def test_the_date_button_opens_a_picker_of_the_last_week(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+
+    await bot.date_open_callback(callback_update(fake_bot, "date_open", buttons_id), context)
+
+    offered = [d for row in _keyboard_rows(fake_bot, buttons_id) for d in row]
+    assert len(offered) == bot.DATE_CHOICES + 1, "a week of days plus Back"
+    assert offered[-1] == "date_back"
+    assert offered[0] == f"date:{bot.diary_today().isoformat()}"
+    labels = _labels(fake_bot, buttons_id)
+    assert "• Today" in labels, "the chosen day is marked"
+    assert "Yesterday" in labels
+
+
+@pytest.mark.asyncio
+async def test_choosing_a_day_files_the_draft_under_it_and_closes_the_picker(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    yesterday = bot.diary_today() - timedelta(days=1)
+
+    await bot.date_open_callback(callback_update(fake_bot, "date_open", buttons_id), context)
+    await bot.date_chosen_callback(
+        callback_update(fake_bot, f"date:{yesterday.isoformat()}", buttons_id), context
+    )
+
+    assert context.user_data["pending"]["date"] == yesterday.isoformat()
+    rows = _keyboard_rows(fake_bot, buttons_id)
+    assert ["save"] in rows, "the action buttons are back"
+    assert "📅 Yesterday" in _labels(fake_bot, buttons_id)
+
+
+@pytest.mark.asyncio
+async def test_back_closes_the_picker_without_changing_the_date(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    before = context.user_data["pending"]["date"]
+
+    await bot.date_open_callback(callback_update(fake_bot, "date_open", buttons_id), context)
+    await bot.date_back_callback(callback_update(fake_bot, "date_back", buttons_id), context)
+
+    assert context.user_data["pending"]["date"] == before
+    assert ["save"] in _keyboard_rows(fake_bot, buttons_id)
+
+
+@pytest.mark.asyncio
+async def test_the_chosen_day_is_what_gets_saved(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    chosen = bot.diary_today() - timedelta(days=3)
+
+    await bot.date_chosen_callback(
+        callback_update(fake_bot, f"date:{chosen.isoformat()}", buttons_id), context
+    )
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert no_network[0][3] == chosen
+
+
+@pytest.mark.asyncio
+async def test_the_date_survives_an_edit_of_the_title(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
+    """Every editing path rebuilds the keyboard; none of them may reset the day."""
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    chosen = bot.diary_today() - timedelta(days=2)
+    await bot.date_chosen_callback(
+        callback_update(fake_bot, f"date:{chosen.isoformat()}", buttons_id), context
+    )
+
+    await bot.edit_title_callback(callback_update(fake_bot, "edit_title", buttons_id), context)
+    await bot.receive_new_title(text_update(fake_bot, "Новый заголовок"), context)
+
+    assert context.user_data["pending"]["date"] == chosen.isoformat()
+    assert "📅" in " ".join(_labels(fake_bot, buttons_id))
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_date_callback_changes_nothing(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    before = context.user_data["pending"]["date"]
+
+    await bot.date_chosen_callback(
+        callback_update(fake_bot, "date:not-a-date", buttons_id), context
+    )
+
+    assert context.user_data["pending"]["date"] == before
+    assert ["save"] in _keyboard_rows(fake_bot, buttons_id)

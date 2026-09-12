@@ -3,7 +3,7 @@ import logging
 import os
 import tempfile
 import zoneinfo
-from datetime import time, timedelta
+from datetime import date, time, timedelta
 
 from telegram import Bot, Message, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -22,7 +22,7 @@ from telegram.ext import (
 
 from config import settings
 from services.formatter import format_entry
-from services.notion import save_entry
+from services.notion import day_label, diary_today, save_entry
 from services.summary import generate_daily_summary, generate_weekly_report
 from services.whisper import merge_keywords, transcribe
 
@@ -110,6 +110,7 @@ HELP_TEXT = """<b>How to use Noter</b>
 <b>✎ Title</b> — send a new title
 <b>✎ Text</b> — send a new text
 <b>✎ Tags</b> — send tags separated by commas: <code>sport, health, work</code>
+<b>📅 Date</b> — file the entry under an earlier day; the picker offers the last week
 <b>/cancel</b> — throw the current draft away, same as the ✕ Cancel button
 
 <b>Misheard words</b>
@@ -126,6 +127,11 @@ TRANSCRIBE_FAILED = "I couldn't transcribe that voice message. Send it again and
 FORMAT_FAILED = "I transcribed it but couldn't turn it into an entry. Send the voice message again."
 PREVIEW_FAILED = "I couldn't show the preview for that entry. Send the voice message again."
 NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to try again."
+
+# How far back the date picker goes. A week covers "I forgot to write this up on
+# Sunday"; anything older is rare enough to be worth editing in Notion directly,
+# and a longer list stops fitting on a phone screen.
+DATE_CHOICES = 7
 
 KEYWORDS_KEY = "transcription_keywords"
 
@@ -267,7 +273,41 @@ async def _draft_missing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
-def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
+def _draft_day(context: ContextTypes.DEFAULT_TYPE) -> date:
+    """The date the open draft will be filed under; today's when nothing is set."""
+    stored = (context.user_data.get("pending") or {}).get("date")
+    return date.fromisoformat(stored) if stored else diary_today()
+
+
+def _date_button_label(day: date) -> str:
+    """What the date button says. Relative where that is clearer than a date."""
+    today = diary_today()
+    if day == today:
+        return "📅 Today"
+    if day == today - timedelta(days=1):
+        return "📅 Yesterday"
+    return f"📅 {day.strftime('%a %d %b')}"
+
+
+def _date_picker_keyboard(chosen: date) -> InlineKeyboardMarkup:
+    """The last DATE_CHOICES diary days, newest first, three to a row."""
+    today = diary_today()
+    buttons = []
+    for offset in range(DATE_CHOICES):
+        day = today - timedelta(days=offset)
+        label = _date_button_label(day).removeprefix("📅 ")
+        buttons.append(
+            InlineKeyboardButton(
+                f"• {label}" if day == chosen else label,
+                callback_data=f"date:{day.isoformat()}",
+            )
+        )
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("← Back", callback_data="date_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _preview_keyboard(highlighted: bool = False, day: date | None = None) -> InlineKeyboardMarkup:
     highlight_btn = (
         InlineKeyboardButton("⭐ Highlighted", callback_data="toggle_highlight")
         if highlighted else
@@ -279,6 +319,7 @@ def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✎ Text", callback_data="edit_text"),
             InlineKeyboardButton("✎ Tags", callback_data="edit_tags"),
         ],
+        [InlineKeyboardButton(_date_button_label(day or diary_today()), callback_data="date_open")],
         [highlight_btn],
         [InlineKeyboardButton("✓ Save", callback_data="save")],
         # Its own row, under Save rather than beside it. Discarding is the one
@@ -367,7 +408,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         title_msg = await reply_html(message, _title_body(title))
         text_msg = await message.reply_text(text)
         tags_msg = await reply_html(message, _tags_line(tags))
-        buttons_msg = await message.reply_text("Actions:", reply_markup=_preview_keyboard(highlighted=False))
+        buttons_msg = await message.reply_text(
+            "Actions:", reply_markup=_preview_keyboard(highlighted=False, day=diary_today())
+        )
     except Exception:
         logger.exception("Error sending the preview")
         await message.reply_text(PREVIEW_FAILED)
@@ -383,7 +426,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await _retire_preview(context.bot, chat_id, previous, DRAFT_REPLACED)
         await _delete_messages(context.bot, chat_id, [previous["edit_prompt_msg_id"]])
 
-    context.user_data["pending"] = {"title": title, "text": text, "tags": tags}
+    # The date is decided when the draft is made, not when it is saved: dictating
+    # at 23:58 and pressing Save at 00:01 must not file the entry under tomorrow.
+    context.user_data["pending"] = {
+        "title": title, "text": text, "tags": tags, "date": diary_today().isoformat(),
+    }
     context.user_data["title_msg_id"] = title_msg.message_id
     context.user_data["text_msg_id"] = text_msg.message_id
     context.user_data["tags_msg_id"] = tags_msg.message_id
@@ -417,7 +464,9 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         logger.warning("Could not take the buttons off the preview before saving", exc_info=True)
 
     try:
-        updated = await save_entry(pending["title"], pending["text"], pending["tags"])
+        updated = await save_entry(
+            pending["title"], pending["text"], pending["tags"], _draft_day(context)
+        )
     except Exception:
         logger.exception("Error saving to Notion")
         # A genuine failure keeps the draft and puts the keyboard back, so Save can be
@@ -426,7 +475,9 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         try:
             await query.edit_message_text(
                 NOTION_FAILED,
-                reply_markup=_preview_keyboard(highlighted=pending["title"].startswith("⭐ ")),
+                reply_markup=_preview_keyboard(
+                    highlighted=pending["title"].startswith("⭐ "), day=_draft_day(context)
+                ),
             )
         except Exception:
             logger.warning("Could not restore the preview keyboard after a failed save", exc_info=True)
@@ -464,7 +515,61 @@ async def toggle_highlight_callback(update: Update, context: ContextTypes.DEFAUL
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(highlighted=highlighted),
+        reply_markup=_preview_keyboard(highlighted=highlighted, day=_draft_day(context)),
+    )
+    return PREVIEW
+
+
+async def date_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Swaps the action buttons for the day picker, in the same message."""
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=_date_picker_keyboard(_draft_day(context))
+    )
+    return PREVIEW
+
+
+async def date_chosen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Files the draft under the chosen day and puts the action buttons back."""
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
+    query = update.callback_query
+    try:
+        day = date.fromisoformat(query.data.split(":", 1)[1])
+    except ValueError:
+        # Only reachable from a button this bot did not draw. Nothing is changed,
+        # and the keyboard goes back rather than leaving the picker open.
+        logger.warning("Ignoring a date callback that is not a date: %r", query.data)
+        day = _draft_day(context)
+    else:
+        context.user_data["pending"]["date"] = day.isoformat()
+
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=_preview_keyboard(
+            highlighted=context.user_data["pending"]["title"].startswith("⭐ "), day=day
+        )
+    )
+    return PREVIEW
+
+
+async def date_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Closes the picker without changing the date."""
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=_preview_keyboard(
+            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
+            day=_draft_day(context),
+        )
     )
     return PREVIEW
 
@@ -512,7 +617,10 @@ async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
+        reply_markup=_preview_keyboard(
+            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
+            day=_draft_day(context),
+        ),
     )
     # Popped, so /cancel does not later try to delete a prompt that is already gone,
     # and so an interrupted recording is not sent back to an edit that is finished.
@@ -540,7 +648,10 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
+        reply_markup=_preview_keyboard(
+            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
+            day=_draft_day(context),
+        ),
     )
     # Popped, so /cancel does not later try to delete a prompt that is already gone,
     # and so an interrupted recording is not sent back to an edit that is finished.
@@ -583,7 +694,10 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(highlighted=context.user_data["pending"]["title"].startswith("⭐ ")),
+        reply_markup=_preview_keyboard(
+            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
+            day=_draft_day(context),
+        ),
     )
     # Popped, so /cancel does not later try to delete a prompt that is already gone,
     # and so an interrupted recording is not sent back to an edit that is finished.
@@ -824,6 +938,9 @@ def build_application() -> Application:
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(edit_tags_callback, pattern="^edit_tags$"),
                 CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+                CallbackQueryHandler(date_open_callback, pattern="^date_open$"),
+                CallbackQueryHandler(date_back_callback, pattern="^date_back$"),
+                CallbackQueryHandler(date_chosen_callback, pattern=r"^date:\d{4}-\d{2}-\d{2}$"),
                 *command_handlers,
             ],
             EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_title), *command_handlers],
@@ -852,7 +969,8 @@ def build_application() -> Application:
     # never steals a callback from a live draft.
     app.add_handler(CallbackQueryHandler(
         _draft_missing,
-        pattern="^(save|toggle_highlight|edit_title|edit_text|edit_tags|cancel)$",
+        pattern=r"^(save|toggle_highlight|edit_title|edit_text|edit_tags|cancel"
+                r"|date_open|date_back|date:\d{4}-\d{2}-\d{2})$",
     ))
 
     app.add_error_handler(handle_error)

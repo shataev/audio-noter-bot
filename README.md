@@ -34,6 +34,7 @@ After the voice message is processed, the bot sends four messages in sequence:
 
 ```
 [ ✎ Title ]  [ ✎ Text ]  [ ✎ Tags ]
+[           📅 Today             ]
 [      Mark as Highlight ⭐       ]
 [            ✓ Save              ]
 [           ✕ Cancel             ]
@@ -67,6 +68,22 @@ merged with whatever has been added since.
 
 Current models take the list as `keywords`; `whisper-1`, which has no such
 parameter, gets the same words folded into its free-text `prompt`.
+
+### Which day an entry belongs to
+
+A diary day does not end at midnight. A note dictated at half past one is about
+the day just lived through, not the one that started ninety minutes ago, so
+anything recorded before `DIARY_DAY_START_HOUR` (default 4) is filed under the
+previous date. The date picker, the daily summary and the weekly report all use
+the same boundary. Set it to `0` for plain calendar days.
+
+The entry's day is decided when the draft is made, not when Save is pressed, so
+dictating at 23:58 and saving at 00:01 does not move the entry to the next day.
+
+**📅** in the preview opens a picker of the last seven diary days — for the
+evening when you write up something you forgot on Sunday. The chosen day is
+marked with a dot; **← Back** closes the picker without changing anything.
+Anything older than a week is rare enough to be worth editing in Notion itself.
 
 ### Highlights
 
@@ -131,6 +148,7 @@ cp .env.example .env
 | `NOTION_DATABASE_ID` | ID from the database URL: `notion.so/workspace/{ID}?v=...`        |
 | `ALLOWED_USER_ID`    | Your Telegram user ID — get it from [@userinfobot](https://t.me/userinfobot) |
 | `TIMEZONE`           | Your timezone, e.g. `Asia/Bangkok`, `Europe/Moscow`                |
+| `DIARY_DAY_START_HOUR` | When a diary day ends. Default `4`; `0` for calendar days |
 
 ### Connecting Notion integration to your database
 
