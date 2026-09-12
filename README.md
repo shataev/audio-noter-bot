@@ -21,6 +21,7 @@ A Telegram bot that turns voice messages into structured diary entries in Notion
 | `/start`  | Welcome message and quick overview |
 | `/help`   | Detailed usage instructions        |
 | `/cancel` | Throw away the draft being previewed |
+| `/keywords` | Manage the words the transcriber should lean towards |
 
 ## Editing before saving
 
@@ -44,6 +45,28 @@ under Save rather than beside it — discarding cannot be undone, the transcript
 has already been paid for, and a misplaced thumb should not be able to do it.
 
 Clicking an edit button removes the buttons and prompts you to send a new value. After you send it, the corresponding message updates in place and the buttons return.
+
+### Misheard words
+
+Names, places and jargon are what a transcriber gets wrong, and it gets them
+wrong the same way every time — `Кэт` comes back as `Скет`, `Спур` as `Споре`.
+Tell it what to expect:
+
+```
+/keywords add Кэт, Спур, Паттайя
+/keywords                       # show the list
+/keywords remove Спур
+/keywords clear
+```
+
+They are hints, not instructions: a word appears in a transcript only when it is
+actually in the audio. The list is kept with the bot's own state, so it survives
+a restart and a deploy, and it is edited from the chat rather than from the
+server. `TRANSCRIPTION_KEYWORDS` in the environment seeds a fresh install and is
+merged with whatever has been added since.
+
+Current models take the list as `keywords`; `whisper-1`, which has no such
+parameter, gets the same words folded into its free-text `prompt`.
 
 ### Highlights
 

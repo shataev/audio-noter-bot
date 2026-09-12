@@ -177,6 +177,11 @@ class FakeContext:
     def __init__(self, fake_bot):
         self.bot = fake_bot
         self.user_data = {}
+        # bot_data is where the transcription keywords live, and args is what a
+        # CommandHandler fills in from the message. Both exist on the real
+        # CallbackContext; a double without them hides a missing attribute.
+        self.bot_data = {}
+        self.args = []
 
 
 class FakeFile:
@@ -224,7 +229,10 @@ async def stub_voice_pipeline(
     monkeypatch.setattr(bot.tempfile, "tempdir", str(tmp_path))
     fake_bot.files["voice-1"] = FakeFile(fail=download_fails)
 
-    async def fake_transcribe(path):
+    transcribed_with: list[list[str]] = []
+
+    async def fake_transcribe(path, keywords=None):
+        transcribed_with.append(list(keywords or []))
         return "raw transcription"
 
     async def fake_format(transcription):
@@ -232,6 +240,7 @@ async def stub_voice_pipeline(
 
     monkeypatch.setattr(bot, "transcribe", fake_transcribe)
     monkeypatch.setattr(bot, "format_entry", fake_format)
+    return transcribed_with
 
 
 def preview_bodies(fake_bot):
@@ -1081,3 +1090,84 @@ async def test_cancelling_twice_does_not_claim_the_second_press_lost_a_draft(
     # with something that reads like a different, worse outcome.
     assert fake_bot.find(buttons_id).text in (bot.DRAFT_CANCELLED, bot.DRAFT_GONE)
     assert "pending" not in context.user_data
+
+
+async def _keywords(fake_bot, context, *args):
+    context.args = list(args)
+    await bot.handle_keywords(text_update(fake_bot, "/keywords"), context)
+    return fake_bot.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_keywords_starts_empty_and_says_how_to_begin(fake_bot, context):
+    assert await _keywords(fake_bot, context) == bot.KEYWORDS_EMPTY
+
+
+@pytest.mark.asyncio
+async def test_keywords_add_stores_several_at_once(fake_bot, context):
+    reply = await _keywords(fake_bot, context, "add", "Кэт,", "Спур,", "бабулечки")
+
+    assert context.bot_data[bot.KEYWORDS_KEY] == ["Кэт", "Спур", "бабулечки"]
+    assert "Кэт" in reply and "Спур" in reply and "бабулечки" in reply
+
+
+@pytest.mark.asyncio
+async def test_keywords_add_does_not_repeat_a_word_in_another_case(fake_bot, context):
+    await _keywords(fake_bot, context, "add", "Кэт")
+    await _keywords(fake_bot, context, "add", "кэт,", "Спур")
+
+    assert context.bot_data[bot.KEYWORDS_KEY] == ["Кэт", "Спур"]
+
+
+@pytest.mark.asyncio
+async def test_keywords_remove_drops_one_regardless_of_case(fake_bot, context):
+    await _keywords(fake_bot, context, "add", "Кэт,", "Спур")
+
+    await _keywords(fake_bot, context, "remove", "спур")
+
+    assert context.bot_data[bot.KEYWORDS_KEY] == ["Кэт"]
+
+
+@pytest.mark.asyncio
+async def test_keywords_clear_empties_the_list(fake_bot, context):
+    await _keywords(fake_bot, context, "add", "Кэт,", "Спур")
+
+    reply = await _keywords(fake_bot, context, "clear")
+
+    assert context.bot_data[bot.KEYWORDS_KEY] == []
+    assert reply == bot.KEYWORDS_EMPTY
+
+
+@pytest.mark.asyncio
+async def test_keywords_with_an_unknown_verb_explains_itself(fake_bot, context):
+    assert await _keywords(fake_bot, context, "делай") == bot.KEYWORDS_USAGE
+
+
+@pytest.mark.asyncio
+async def test_keywords_added_in_the_chat_reach_the_transcriber(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The whole point: a word heard wrong is fixed from the chat, not over ssh."""
+    transcribed_with = await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", []
+    )
+    await _keywords(fake_bot, context, "add", "Кэт,", "Спур")
+
+    await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert transcribed_with[-1] == ["Кэт", "Спур"]
+
+
+@pytest.mark.asyncio
+async def test_the_environment_seeds_the_list_and_the_chat_adds_to_it(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    monkeypatch.setattr(bot.settings, "transcription_keywords", "Паттайя, Кэт")
+    transcribed_with = await stub_voice_pipeline(
+        monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", []
+    )
+    await _keywords(fake_bot, context, "add", "кэт,", "Спур")
+
+    await bot.handle_voice(voice_update(fake_bot), context)
+
+    assert transcribed_with[-1] == ["Паттайя", "Кэт", "Спур"], "seeded first, no repeat"

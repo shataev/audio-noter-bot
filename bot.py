@@ -24,7 +24,7 @@ from config import settings
 from services.formatter import format_entry
 from services.notion import save_entry
 from services.summary import generate_daily_summary, generate_weekly_report
-from services.whisper import transcribe
+from services.whisper import merge_keywords, transcribe
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -112,6 +112,9 @@ HELP_TEXT = """<b>How to use Noter</b>
 <b>✎ Tags</b> — send tags separated by commas: <code>sport, health, work</code>
 <b>/cancel</b> — throw the current draft away, same as the ✕ Cancel button
 
+<b>Misheard words</b>
+<b>/keywords add Кэт, Спур</b> — tell the transcriber about names it keeps getting wrong. <b>/keywords</b> on its own shows the list.
+
 <b>Daily summary</b>
 Every day at 21:00 I send a summary of all entries recorded that day. If there are none, I'll send a friendly nudge instead."""
 
@@ -123,6 +126,20 @@ TRANSCRIBE_FAILED = "I couldn't transcribe that voice message. Send it again and
 FORMAT_FAILED = "I transcribed it but couldn't turn it into an entry. Send the voice message again."
 PREVIEW_FAILED = "I couldn't show the preview for that entry. Send the voice message again."
 NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to try again."
+
+KEYWORDS_KEY = "transcription_keywords"
+
+KEYWORDS_USAGE = (
+    "<b>Transcription keywords</b>\n\n"
+    "Words the transcriber should lean towards — names, places, anything it hears "
+    "wrong the same way every time. They are hints: a word appears in a transcript "
+    "only if it is actually in the audio.\n\n"
+    "<code>/keywords</code> — show the list\n"
+    "<code>/keywords add Кэт, Спур</code> — add one or more, comma separated\n"
+    "<code>/keywords remove Спур</code> — drop one or more\n"
+    "<code>/keywords clear</code> — empty the list"
+)
+KEYWORDS_EMPTY = "No keywords yet. <code>/keywords add Кэт, Спур</code> to start one."
 
 DRAFT_REPLACED = "✕ Draft discarded — a newer recording replaced it."
 DRAFT_CANCELLED = "✕ Draft discarded."
@@ -328,7 +345,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
         try:
             await message.reply_text("Transcribing...")
-            transcription = await transcribe(tmp_path)
+            transcription = await transcribe(tmp_path, _keywords_for_transcription(context))
         except Exception:
             logger.exception("Error transcribing voice message")
             await message.reply_text(TRANSCRIBE_FAILED)
@@ -626,6 +643,63 @@ async def handle_preview_timeout(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
+def _stored_keywords(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """The words added from the chat. bot_data rides the persistence already wired up."""
+    return context.bot_data.setdefault(KEYWORDS_KEY, [])
+
+
+def _keywords_for_transcription(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """What the environment seeded plus what has been added since."""
+    return merge_keywords(settings.keywords, _stored_keywords(context))
+
+
+def _keywords_list(words: list[str]) -> str:
+    if not words:
+        return KEYWORDS_EMPTY
+    listed = "\n".join(render("• {word}", word=w) for w in words)
+    return render("<b>Transcription keywords</b> ({count})", count=str(len(words))) + "\n" + listed
+
+
+async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage the transcription hints without touching the server.
+
+    Misheard words are found while using the bot, one at a time, so the place to
+    fix them is the same chat — not an environment variable behind an ssh login.
+    TRANSCRIPTION_KEYWORDS still seeds a fresh install; this list adds to it.
+    """
+    words = _stored_keywords(context)
+    args = context.args or []
+
+    if not args:
+        await reply_html(update.effective_message, _keywords_list(_keywords_for_transcription(context)))
+        return
+
+    verb, rest = args[0].lower(), " ".join(args[1:])
+    given = [w.strip() for w in rest.split(",") if w.strip()]
+
+    if verb == "add" and given:
+        merged = merge_keywords(words, given)
+        context.bot_data[KEYWORDS_KEY] = merged
+        added = len(merged) - len(words)
+        await reply_html(
+            update.effective_message,
+            render("Added {n}.", n=str(added)) + "\n" + _keywords_list(_keywords_for_transcription(context)),
+        )
+    elif verb == "remove" and given:
+        dropped = {w.casefold() for w in given}
+        context.bot_data[KEYWORDS_KEY] = [w for w in words if w.casefold() not in dropped]
+        await reply_html(
+            update.effective_message, _keywords_list(_keywords_for_transcription(context))
+        )
+    elif verb == "clear":
+        context.bot_data[KEYWORDS_KEY] = []
+        await reply_html(
+            update.effective_message, _keywords_list(_keywords_for_transcription(context))
+        )
+    else:
+        await reply_html(update.effective_message, KEYWORDS_USAGE)
+
+
 async def handle_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Generating weekly report...")
     try:
@@ -736,6 +810,7 @@ def build_application() -> Application:
         CommandHandler("start", handle_start),
         CommandHandler("help", handle_help),
         CommandHandler("weekly", handle_weekly),
+        CommandHandler("keywords", handle_keywords),
     ]
     cancel_handler = CommandHandler("cancel", handle_cancel)
 
