@@ -354,20 +354,50 @@ def _extract_title(page: dict) -> str:
     return "".join(p["plain_text"] for p in parts)
 
 
+# "Commas are not valid. Names must be unique (case-insensitive)." — the multi-select
+# property object. A name that breaks either rule is a 400 that fails the whole save,
+# after the transcription and the formatting have already been paid for.
+MAX_TAGS = 100  # a multi_select holds at most 100 options
+
+
+def _tag_names(names: list[str]) -> list[str]:
+    """Splits on commas, trims, drops what is left empty.
+
+    Splitting rather than stripping the comma out, because a comma in a tag means
+    the producer meant a list: gpt-4o-mini answers "работа, дом" as one string, and
+    the manual editor has taken comma-separated input since the beginning. Turning
+    it into "работадом" would be the one reading nobody intended.
+    """
+    cleaned = []
+    for name in names:
+        for part in str(name).split(","):
+            part = part.strip()
+            if part:
+                cleaned.append(part)
+    return cleaned
+
+
 def _combine_tags(existing_page: dict | None, new_tags: list[str]) -> list[dict]:
     """Merges page tags with new ones, always prepends Daily, no duplicates."""
     existing = []
     if existing_page:
         existing = [t["name"] for t in existing_page["properties"].get("Tags", {}).get("multi_select", [])]
-    all_tags = ["Daily"] + [t for t in (existing + new_tags) if t != "Daily"]
-    # deduplicate while preserving order
+    all_tags = ["Daily"] + [
+        t for t in _tag_names(existing + new_tags) if t.casefold() != "daily"
+    ]
+    # Deduplicate while preserving order, case-insensitively because that is how
+    # Notion compares them: sending both "Работа" and "работа" is the same 400.
+    # The first spelling wins, so an existing tag keeps the case it already has.
     seen = set()
     unique = []
     for t in all_tags:
-        if t not in seen:
-            seen.add(t)
+        if t.casefold() not in seen:
+            seen.add(t.casefold())
             unique.append(t)
-    return [{"name": t} for t in unique]
+    # Truncating loses a tag; not truncating loses the entry. Daily is first and
+    # the page's existing tags come before this entry's, so what goes is the
+    # newest of an already implausible number of them.
+    return [{"name": t} for t in unique[:MAX_TAGS]]
 
 
 async def get_today_page() -> dict | None:
