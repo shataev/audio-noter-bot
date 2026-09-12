@@ -40,13 +40,23 @@ class _Settings:
     allowed_user_id: int = int(os.environ["ALLOWED_USER_ID"])
     timezone: str = os.getenv("TIMEZONE", "Europe/Moscow")
 
-    # OpenAI models. Defaults keep the models the bot has always used.
-    transcription_model: str = os.getenv("TRANSCRIPTION_MODEL", "whisper-1")
+    # OpenAI models.
+    # gpt-transcribe rather than whisper-1, which has not been updated since
+    # 2022 and is measurably worse outside English at the same price per minute.
+    transcription_model: str = os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe")
     formatter_model: str = os.getenv("FORMATTER_MODEL", "gpt-4o-mini")
     summary_model: str = os.getenv("SUMMARY_MODEL", "gpt-4o-mini")
 
-    # Transcription. An empty value (or "auto") lets the model detect the language.
-    transcription_language: str = os.getenv("TRANSCRIPTION_LANGUAGE", "ru")
+    # Transcription. An empty value (or "auto") lets the model detect the
+    # language, which is the default: dictation is not reliably monolingual, and
+    # forcing "ru" mangles the English and Thai words that turn up in it.
+    transcription_language: str = os.getenv("TRANSCRIPTION_LANGUAGE", "auto")
+
+    # Literal terms the transcriber should lean towards — names of people and
+    # places, jargon, anything it gets wrong the same way every time. Comma
+    # separated. Hints, not instructions: a keyword appears in the transcript
+    # only if it is actually in the audio.
+    transcription_keywords: str = os.getenv("TRANSCRIPTION_KEYWORDS", "")
     # The transcription endpoint rejects uploads above 25 MB.
     max_audio_mb: float = float(os.getenv("MAX_AUDIO_MB", "25"))
 
@@ -54,6 +64,10 @@ class _Settings:
     notion_timeout: float = float(os.getenv("NOTION_TIMEOUT_SECONDS", "30"))
     notion_max_retries: int = int(os.getenv("NOTION_MAX_RETRIES", "3"))
     notion_retry_base_delay: float = float(os.getenv("NOTION_RETRY_BASE_DELAY", "1"))
+
+    @property
+    def keywords(self) -> list[str]:
+        return [k.strip() for k in self.transcription_keywords.split(",") if k.strip()]
 
     @property
     def max_audio_bytes(self) -> int:

@@ -18,6 +18,39 @@ def _read_file(path: str) -> bytes:
         return audio_file.read()
 
 
+def _model_options() -> dict:
+    """Language and vocabulary options, spelled the way the model expects.
+
+    The endpoint takes both spellings of each idea and the *model* decides which
+    it accepts, so sending the wrong one is a 400 rather than something ignored:
+
+    - whisper-1 takes ``language`` (one code) and biases its vocabulary through
+      ``prompt``, a free-text string it treats as preceding context.
+    - gpt-transcribe and its relatives take ``languages`` (a list, because
+      dictation is not reliably monolingual) and ``keywords`` (a list of literal
+      terms), which is the same idea with an interface that cannot be mistaken
+      for an instruction to the model.
+
+    Omitting the language entirely is what asks the endpoint to detect it, and
+    that is the default.
+    """
+    legacy = settings.transcription_model == "whisper-1"
+    options: dict = {}
+
+    language = settings.transcription_language.strip()
+    if language.lower() not in _AUTO_DETECT:
+        options["language" if legacy else "languages"] = language if legacy else [language]
+
+    keywords = settings.keywords
+    if keywords:
+        # whisper-1's prompt is prose, not a list: the documented way to bias it
+        # towards a vocabulary is to write the words out as if they had just
+        # been said. 224 tokens is its limit, so this is a hint, not a glossary.
+        options["prompt" if legacy else "keywords"] = ", ".join(keywords) if legacy else keywords
+
+    return options
+
+
 async def transcribe(audio_path: str) -> str:
     size = os.path.getsize(audio_path)
     if size > settings.max_audio_bytes:
@@ -29,11 +62,7 @@ async def transcribe(audio_path: str) -> str:
     # Reading the file is blocking, and the handler is on the bot's event loop.
     audio_bytes = await asyncio.to_thread(_read_file, audio_path)
 
-    options = {}
-    language = settings.transcription_language.strip()
-    # Omitting the parameter is what asks the endpoint to detect the language.
-    if language.lower() not in _AUTO_DETECT:
-        options["language"] = language
+    options = _model_options()
 
     response = await client.audio.transcriptions.create(
         model=settings.transcription_model,
