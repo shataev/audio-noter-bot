@@ -1,7 +1,35 @@
+import logging
 import os
+
 from dotenv import load_dotenv
 
-load_dotenv()
+
+def _load_env_file() -> None:
+    """Load .env if there is one, and survive one that cannot be read.
+
+    On a hardened install the credentials come from systemd's EnvironmentFile,
+    read as root before the service drops to its own user, and there is no .env
+    at all. But python-dotenv looks for one anyway, and if it finds a file it
+    cannot open it raises PermissionError out of the import — which took the bot
+    down on the server the moment it stopped running as root and a leftover
+    root-owned .env was still sitting in the working directory.
+
+    A .env that cannot be read is not an error worth dying for: either the real
+    values are already in the environment, in which case nothing is missing, or
+    they are not, and config below fails with a KeyError naming the variable,
+    which is a far better message than a traceback out of a library.
+    """
+    try:
+        load_dotenv()
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "ignoring an unreadable .env (%s); "
+            "settings must come from the environment instead",
+            exc,
+        )
+
+
+_load_env_file()
 
 
 class _Settings:
