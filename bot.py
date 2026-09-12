@@ -110,7 +110,7 @@ HELP_TEXT = """<b>How to use Noter</b>
 <b>✎ Title</b> — send a new title
 <b>✎ Text</b> — send a new text
 <b>✎ Tags</b> — send tags separated by commas: <code>sport, health, work</code>
-<b>/cancel</b> — throw the current draft away
+<b>/cancel</b> — throw the current draft away, same as the ✕ Cancel button
 
 <b>Daily summary</b>
 Every day at 21:00 I send a summary of all entries recorded that day. If there are none, I'll send a friendly nudge instead."""
@@ -264,6 +264,11 @@ def _preview_keyboard(highlighted: bool = False) -> InlineKeyboardMarkup:
         ],
         [highlight_btn],
         [InlineKeyboardButton("✓ Save", callback_data="save")],
+        # Its own row, under Save rather than beside it. Discarding is the one
+        # irreversible thing in this keyboard — the transcription and the
+        # formatting have already been paid for and the messages are deleted —
+        # so it does not sit a thumb's width from the button pressed every time.
+        [InlineKeyboardButton("✕ Cancel", callback_data="cancel")],
     ])
 
 
@@ -573,6 +578,17 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return PREVIEW
 
 
+async def _discard_draft(context: ContextTypes.DEFAULT_TYPE, chat_id: int, draft: dict) -> bool:
+    """Takes a cleared draft off the screen. True if the preview said so itself."""
+    await _delete_messages(context.bot, chat_id, [
+        draft["title_msg_id"],
+        draft["text_msg_id"],
+        draft["tags_msg_id"],
+        draft["edit_prompt_msg_id"],
+    ])
+    return await _retire_preview(context.bot, chat_id, draft, DRAFT_CANCELLED)
+
+
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     draft = _clear_draft(context)
     if draft.get("pending") is None:
@@ -580,14 +596,23 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     chat_id = update.effective_chat.id
-    await _delete_messages(context.bot, chat_id, [
-        draft["title_msg_id"],
-        draft["text_msg_id"],
-        draft["tags_msg_id"],
-        draft["edit_prompt_msg_id"],
-    ])
-    if not await _retire_preview(context.bot, chat_id, draft, DRAFT_CANCELLED):
+    if not await _discard_draft(context, chat_id, draft):
         await update.effective_message.reply_text(DRAFT_CANCELLED)
+    return ConversationHandler.END
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """The ✕ Cancel button. Same outcome as /cancel, reached without typing.
+
+    /cancel stays: it is the way out when the preview has scrolled away, and it
+    is the conversation's fallback, which a callback cannot be.
+    """
+    if context.user_data.get("pending") is None:
+        return await _draft_missing(update, context)
+
+    await update.callback_query.answer()
+    draft = _clear_draft(context)
+    await _discard_draft(context, update.effective_chat.id, draft)
     return ConversationHandler.END
 
 
@@ -723,6 +748,7 @@ def build_application() -> Application:
                 CallbackQueryHandler(edit_title_callback, pattern="^edit_title$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(edit_tags_callback, pattern="^edit_tags$"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
                 *command_handlers,
             ],
             EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_title), *command_handlers],
@@ -751,7 +777,7 @@ def build_application() -> Application:
     # never steals a callback from a live draft.
     app.add_handler(CallbackQueryHandler(
         _draft_missing,
-        pattern="^(save|toggle_highlight|edit_title|edit_text|edit_tags)$",
+        pattern="^(save|toggle_highlight|edit_title|edit_text|edit_tags|cancel)$",
     ))
 
     app.add_error_handler(handle_error)
