@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import zoneinfo
 import httpx
 from config import settings
@@ -337,15 +337,27 @@ MONTHS_RU = {
 }
 
 
-def _today_date() -> str:
+def diary_today(now: datetime | None = None) -> date:
+    """The date a note recorded *now* belongs to.
+
+    Not the calendar date: a diary day ends when the day being written about
+    ends, which for anyone who dictates before bed is some hours after midnight.
+    With DIARY_DAY_START_HOUR=4, a note at 01:30 goes on the page for the day
+    that has just been lived through rather than opening a new one for a day
+    that has barely started. 0 gives plain calendar days.
+    """
     tz = zoneinfo.ZoneInfo(settings.timezone)
-    return datetime.now(tz).date().isoformat()  # e.g. "2026-04-09"
+    local = now.astimezone(tz) if now else datetime.now(tz)
+    return (local - timedelta(hours=settings.day_start_hour)).date()
 
 
-def _today_label() -> str:
-    tz = zoneinfo.ZoneInfo(settings.timezone)
-    now = datetime.now(tz)
-    return f"{now.day} {MONTHS_RU[now.month]}"
+def day_label(day: date) -> str:
+    """The date as it appears at the front of a page title: "9 мая"."""
+    return f"{day.day} {MONTHS_RU[day.month]}"
+
+
+def _resolve_day(day: date | None) -> date:
+    return day if day is not None else diary_today()
 
 
 def _extract_title(page: dict) -> str:
@@ -400,7 +412,7 @@ def _combine_tags(existing_page: dict | None, new_tags: list[str]) -> list[dict]
     return [{"name": t} for t in unique[:MAX_TAGS]]
 
 
-async def get_today_page() -> dict | None:
+async def get_today_page(day: date | None = None) -> dict | None:
     """Returns today's diary page, or None if it has not been created yet.
 
     Deliberately not paginated: there should be exactly one page per date. Two
@@ -409,13 +421,14 @@ async def get_today_page() -> dict | None:
     page they have been going to all day rather than to whichever page the API
     happened to list first.
     """
+    day = _resolve_day(day)
     resp = await _request(
         "POST",
         f"/databases/{settings.notion_database_id}/query",
         json={
             "filter": {
                 "property": "Created",
-                "date": {"equals": _today_date()},
+                "date": {"equals": day.isoformat()},
             },
             "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
             "page_size": 2,
@@ -425,7 +438,7 @@ async def get_today_page() -> dict | None:
     if len(results) > 1:
         logger.warning(
             "More than one Notion page is dated %s; appending to the oldest (%s)",
-            _today_date(), results[0].get("id"),
+            day.isoformat(), results[0].get("id"),
         )
     return results[0] if results else None
 
@@ -441,8 +454,11 @@ async def _append_blocks(page_id: str, blocks: list[dict]) -> None:
         )
 
 
-async def create_page(entry_title: str, entry_text: str, entry_tags: list[str]) -> None:
-    title = _compose_day_title(_today_label(), [entry_title])
+async def create_page(
+    entry_title: str, entry_text: str, entry_tags: list[str], day: date | None = None
+) -> None:
+    day = _resolve_day(day)
+    title = _compose_day_title(day_label(day), [entry_title])
     batches = _batch_blocks(_entry_blocks(entry_title, entry_text, divider=False))
     resp = await _request(
         "POST",
@@ -451,7 +467,7 @@ async def create_page(entry_title: str, entry_text: str, entry_tags: list[str]) 
             "parent": {"database_id": settings.notion_database_id},
             "properties": {
                 "title": {"title": _rich_text(title)},
-                "Created": {"date": {"start": _today_date()}},
+                "Created": {"date": {"start": day.isoformat()}},
                 "Tags": {"multi_select": _combine_tags(None, entry_tags)},
             },
             "children": batches[0],
@@ -489,8 +505,7 @@ async def update_page(page: dict, entry_title: str, entry_text: str, entry_tags:
 
 async def get_week_pages() -> list[dict]:
     """Returns all diary pages created in the last 7 days, oldest first."""
-    tz = zoneinfo.ZoneInfo(settings.timezone)
-    today = datetime.now(tz).date()
+    today = diary_today()
     week_ago = today - timedelta(days=6)
     body = {
         "filter": {
@@ -521,14 +536,17 @@ async def get_week_pages() -> list[dict]:
         seen.add(cursor)
 
 
-async def save_entry(entry_title: str, entry_text: str, entry_tags: list[str]) -> bool:
-    """Creates or updates today's diary page. Returns True if updated, False if created."""
-    page = await get_today_page()
+async def save_entry(
+    entry_title: str, entry_text: str, entry_tags: list[str], day: date | None = None
+) -> bool:
+    """Creates or updates the diary page for a day. True if updated, False if created."""
+    day = _resolve_day(day)
+    page = await get_today_page(day)
     if page:
         await update_page(page, entry_title, entry_text, entry_tags)
         return True
     else:
-        await create_page(entry_title, entry_text, entry_tags)
+        await create_page(entry_title, entry_text, entry_tags, day)
         return False
 
 
