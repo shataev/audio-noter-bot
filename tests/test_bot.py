@@ -677,7 +677,7 @@ def no_network(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "data", ["save", "toggle_highlight", "edit_title", "edit_text", "edit_tags"]
+    "data", ["save", "toggle_highlight", "edit_title", "edit_text", "edit_tags", "cancel"]
 )
 async def test_a_callback_for_a_missing_draft_does_not_raise(fake_bot, context, data, no_network):
     """This is the state the bot comes back in after a restart: buttons, no user_data."""
@@ -690,6 +690,7 @@ async def test_a_callback_for_a_missing_draft_does_not_raise(fake_bot, context, 
         "edit_title": bot.edit_title_callback,
         "edit_text": bot.edit_text_callback,
         "edit_tags": bot.edit_tags_callback,
+        "cancel": bot.cancel_callback,
     }[data]
 
     state = await handler(update, context)
@@ -1016,3 +1017,67 @@ async def test_cancel_after_an_edit_does_not_chase_a_deleted_prompt(
     await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
 
     assert prompt_id not in fake_bot.deleted
+
+
+@pytest.mark.asyncio
+async def test_the_preview_offers_a_cancel_button(tmp_path, monkeypatch, fake_bot, context):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+
+    keyboard = fake_bot.find(context.user_data["buttons_msg_id"]).reply_markup
+    rows = [[button.callback_data for button in row] for row in keyboard.inline_keyboard]
+
+    assert ["cancel"] in rows, "there is a cancel button"
+    assert ["save", "cancel"] not in rows, "and it does not share a row with Save"
+    assert rows[-1] == ["cancel"], "it is the last row, furthest from the edit buttons"
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_button_discards_the_draft_like_the_command(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", ["sport"])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    content_ids = [context.user_data[key] for key in ("title_msg_id", "text_msg_id", "tags_msg_id")]
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert sorted(fake_bot.deleted) == sorted(content_ids)
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_button_deletes_an_open_edit_prompt(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Cancelling from an editing state must not leave "send a new title" behind."""
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    await bot.edit_title_callback(callback_update(fake_bot, "edit_title", buttons_id), context)
+    prompt_id = context.user_data["edit_prompt_msg_id"]
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert prompt_id in fake_bot.deleted
+
+
+@pytest.mark.asyncio
+async def test_cancelling_twice_does_not_claim_the_second_press_lost_a_draft(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Заголовок", "тело", [])
+    await bot.handle_voice(voice_update(fake_bot), context)
+    buttons_id = context.user_data["buttons_msg_id"]
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    # The first press already said "discarded"; the second must not overwrite that
+    # with something that reads like a different, worse outcome.
+    assert fake_bot.find(buttons_id).text in (bot.DRAFT_CANCELLED, bot.DRAFT_GONE)
+    assert "pending" not in context.user_data

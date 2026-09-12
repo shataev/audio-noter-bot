@@ -35,7 +35,13 @@ After the voice message is processed, the bot sends four messages in sequence:
 [ ✎ Title ]  [ ✎ Text ]  [ ✎ Tags ]
 [      Mark as Highlight ⭐       ]
 [            ✓ Save              ]
+[           ✕ Cancel             ]
 ```
+
+**✕ Cancel** throws the draft away: the preview messages are deleted and nothing
+reaches Notion. It is the same thing `/cancel` does, and it sits on its own row
+under Save rather than beside it — discarding cannot be undone, the transcription
+has already been paid for, and a misplaced thumb should not be able to do it.
 
 Clicking an edit button removes the buttons and prompts you to send a new value. After you send it, the corresponding message updates in place and the buttons return.
 
