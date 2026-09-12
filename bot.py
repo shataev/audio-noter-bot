@@ -30,6 +30,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
+
+# httpx logs every request at INFO, and the Telegram API puts the bot token in
+# the path: "POST https://api.telegram.org/bot<TOKEN>/getUpdates". Polling runs
+# every few seconds, so at INFO the token is written to the journal thousands of
+# times a day, where anyone who can read the unit's log can lift it — including
+# the deploy account, whose whole point is that it cannot reach the credentials.
+# WARNING keeps the failures and drops the successful-request line that carries
+# the secret.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 PREVIEW, EDIT_TITLE, EDIT_TEXT, EDIT_TAGS = range(4)
