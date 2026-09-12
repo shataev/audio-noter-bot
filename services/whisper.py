@@ -18,7 +18,23 @@ def _read_file(path: str) -> bytes:
         return audio_file.read()
 
 
-def _model_options() -> dict:
+def merge_keywords(*sources: list[str]) -> list[str]:
+    """One list, in the order the words were added, with no repeats.
+
+    Case-insensitively deduplicated, because "Кэт" and "кэт" are the same hint
+    and sending both spends the budget twice.
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for source in sources:
+        for word in source:
+            if word.casefold() not in seen:
+                seen.add(word.casefold())
+                merged.append(word)
+    return merged
+
+
+def _model_options(extra_keywords: list[str] | None = None) -> dict:
     """Language and vocabulary options, spelled the way the model expects.
 
     The endpoint takes both spellings of each idea and the *model* decides which
@@ -41,7 +57,7 @@ def _model_options() -> dict:
     if language.lower() not in _AUTO_DETECT:
         options["language" if legacy else "languages"] = language if legacy else [language]
 
-    keywords = settings.keywords
+    keywords = merge_keywords(settings.keywords, extra_keywords or [])
     if keywords:
         # whisper-1's prompt is prose, not a list: the documented way to bias it
         # towards a vocabulary is to write the words out as if they had just
@@ -51,7 +67,7 @@ def _model_options() -> dict:
     return options
 
 
-async def transcribe(audio_path: str) -> str:
+async def transcribe(audio_path: str, keywords: list[str] | None = None) -> str:
     size = os.path.getsize(audio_path)
     if size > settings.max_audio_bytes:
         raise AudioTooLargeError(
@@ -62,7 +78,7 @@ async def transcribe(audio_path: str) -> str:
     # Reading the file is blocking, and the handler is on the bot's event loop.
     audio_bytes = await asyncio.to_thread(_read_file, audio_path)
 
-    options = _model_options()
+    options = _model_options(keywords)
 
     response = await client.audio.transcriptions.create(
         model=settings.transcription_model,
