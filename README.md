@@ -5,8 +5,10 @@ A Telegram bot that turns voice messages into structured diary entries in Notion
 ## How it works
 
 1. You send a voice message to the bot
-2. OpenAI Whisper transcribes the audio
-3. GPT-4o-mini formats the transcription into a title, clean text, and tags
+2. OpenAI `gpt-transcribe` transcribes the audio
+3. GPT-4o-mini punctuates the transcription and picks a title and tags. It is
+   told not to rewrite: filler, repetition and unfinished sentences are kept,
+   because the entry is meant to read back as what was actually said
 4. The bot shows a preview — you can edit the title, text, or tags before saving
 5. Optionally mark the entry as a highlight ⭐
 6. Press Save — the entry is appended to today's Notion page (or a new page is created)
@@ -95,7 +97,7 @@ cp .env.example .env
 | Variable             | Description                                                        |
 |----------------------|--------------------------------------------------------------------|
 | `TELEGRAM_TOKEN`     | Bot token from [@BotFather](https://t.me/BotFather)               |
-| `OPENAI_API_KEY`     | OpenAI API key (used for Whisper + GPT-4o-mini)                    |
+| `OPENAI_API_KEY`     | OpenAI API key (used for transcription + GPT-4o-mini)              |
 | `NOTION_TOKEN`       | Internal integration secret from notion.so/profile/integrations    |
 | `NOTION_DATABASE_ID` | ID from the database URL: `notion.so/workspace/{ID}?v=...`        |
 | `ALLOWED_USER_ID`    | Your Telegram user ID — get it from [@userinfobot](https://t.me/userinfobot) |
@@ -559,7 +561,7 @@ noter/
 ├── bot.py                  # Telegram bot entry point
 ├── config.py               # Settings loaded from .env
 ├── services/
-│   ├── whisper.py          # Audio transcription via OpenAI Whisper
+│   ├── whisper.py          # Audio transcription via the OpenAI audio API
 │   ├── formatter.py        # Entry formatting via GPT-4o-mini
 │   ├── notion.py           # Notion API: create/update diary pages
 │   └── summary.py          # Daily summary and weekly report generation
@@ -570,11 +572,11 @@ noter/
 
 ## Estimated costs
 
-Both Whisper and GPT-4o-mini are very cheap for personal use:
+Both transcription and GPT-4o-mini are very cheap for personal use:
 
 | Service     | Price             | Cost per entry (~1 min voice) |
 |-------------|-------------------|-------------------------------|
-| Whisper     | $0.006 / minute   | ~$0.006                       |
+| Transcription | $0.006 / minute | ~$0.006                       |
 | GPT-4o-mini | $0.15 / 1M tokens | ~$0.00005                     |
 
 100 entries/month ≈ **$0.60**

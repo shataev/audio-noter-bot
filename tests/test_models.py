@@ -114,3 +114,44 @@ async def test_the_summary_model_defaults_to_the_one_that_was_hardcoded(monkeypa
     await summary.generate_daily_summary()
 
     assert calls[0]["model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_the_formatter_budget_follows_the_length_of_the_entry(monkeypatch):
+    """A constant ceiling truncates a long entry mid-JSON and loses the save.
+
+    The reply has to carry the whole entry back near enough word for word, so
+    the budget cannot be a constant that was picked for a short one.
+    """
+    calls, create = _recorder(json.dumps({"title": "З", "text": "Т"}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    short = "Короткая запись."
+    long = "Длинная запись. " * 2000  # 32000 characters
+
+    await formatter.format_entry(short)
+    await formatter.format_entry(long)
+
+    small, large = (call["max_completion_tokens"] for call in calls)
+    assert small == 1024, "the floor, so short entries are predictable"
+    assert large > small
+    assert large >= len(long) // 2, "enough room to echo the entry back"
+    assert large <= 16384, "and never past the model's own output limit"
+
+
+@pytest.mark.asyncio
+async def test_the_formatter_is_told_not_to_rewrite(monkeypatch):
+    """The entry is the author's own words; only the title is invented.
+
+    A product decision, not a prompt-engineering detail: a diary read back in a
+    year is worth what it is because of how it was said at the time.
+    """
+    calls, create = _recorder(json.dumps({"title": "З", "text": "Т"}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    await formatter.format_entry("ну вот эээ сегодня я это самое сходил на пробежку")
+
+    prompt = calls[0]["messages"][0]["content"]
+    assert "НЕ переписывая" in prompt
+    assert "слова-паразиты" in prompt, "filler is named as something to keep, not strip"
+    assert "Запрещено" in prompt

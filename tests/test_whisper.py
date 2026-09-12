@@ -95,7 +95,20 @@ async def test_the_language_comes_from_configuration(api, tmp_path, monkeypatch)
 
     await whisper.transcribe(path)
 
+    assert api.calls[0]["languages"] == ["en"]
+
+
+@pytest.mark.asyncio
+async def test_whisper_still_gets_the_singular_spelling(api, tmp_path, monkeypatch):
+    """The endpoint takes both, and the model decides which is a 400."""
+    monkeypatch.setattr(settings, "transcription_model", "whisper-1")
+    monkeypatch.setattr(settings, "transcription_language", "en")
+    path = _audio_file(tmp_path, 0.1)
+
+    await whisper.transcribe(path)
+
     assert api.calls[0]["language"] == "en"
+    assert "languages" not in api.calls[0]
 
 
 @pytest.mark.asyncio
@@ -106,15 +119,52 @@ async def test_an_empty_language_asks_the_endpoint_to_detect_it(api, tmp_path, m
     await whisper.transcribe(path)
 
     assert "language" not in api.calls[0], "omitting the parameter is what turns detection on"
+    assert "languages" not in api.calls[0]
 
 
 @pytest.mark.asyncio
-async def test_the_default_language_is_still_russian(api, tmp_path):
+async def test_the_default_is_to_detect_the_language(api, tmp_path):
+    """Dictation is not reliably monolingual, so nothing is forced."""
     path = _audio_file(tmp_path, 0.1)
 
     await whisper.transcribe(path)
 
-    assert api.calls[0]["language"] == "ru", "unchanged for the owner unless he sets it"
+    assert "language" not in api.calls[0]
+    assert "languages" not in api.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_keywords_are_sent_as_a_list_to_a_current_model(api, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "transcription_keywords", "Паттайя, Storyblok , ,Лёха")
+    path = _audio_file(tmp_path, 0.1)
+
+    await whisper.transcribe(path)
+
+    assert api.calls[0]["keywords"] == ["Паттайя", "Storyblok", "Лёха"]
+    assert "prompt" not in api.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_keywords_reach_whisper_through_its_prompt(api, tmp_path, monkeypatch):
+    """whisper-1 has no keywords parameter; prose is how it is biased."""
+    monkeypatch.setattr(settings, "transcription_model", "whisper-1")
+    monkeypatch.setattr(settings, "transcription_keywords", "Паттайя, Лёха")
+    path = _audio_file(tmp_path, 0.1)
+
+    await whisper.transcribe(path)
+
+    assert api.calls[0]["prompt"] == "Паттайя, Лёха"
+    assert "keywords" not in api.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_no_keywords_means_no_parameter(api, tmp_path):
+    path = _audio_file(tmp_path, 0.1)
+
+    await whisper.transcribe(path)
+
+    assert "keywords" not in api.calls[0]
+    assert "prompt" not in api.calls[0]
 
 
 @pytest.mark.asyncio
