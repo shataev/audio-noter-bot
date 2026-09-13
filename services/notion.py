@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import zoneinfo
 import httpx
@@ -571,3 +572,187 @@ async def get_page_blocks(page_id: str) -> list[dict]:
         if not data.get("has_more") or not cursor or cursor in seen:
             return blocks
         seen.add(cursor)
+
+
+# --------------------------------------------------------------------------- #
+# The coach's two memory pages.
+#
+# Separate from the diary entirely: two ordinary Notion pages beside the diary
+# database, each holding one bulleted list. They exist so the owner can read what
+# the bot believes about him without an ssh session, and edit it there — so every
+# write below is the smallest one that will do, and a block the bot did not put
+# on the page is never touched.
+#
+# The identity of a bullet is its block id, not its text. That is the whole point:
+# a bullet the owner rewords has to come back as the same fact, keeping when it
+# was learned and which entries taught it, and text comparison cannot do that.
+# --------------------------------------------------------------------------- #
+
+MEMORY_PROFILE_TITLE = "Memory — Author profile"
+MEMORY_RULES_TITLE = "Memory — Bot rules"
+
+BULLET = "bulleted_list_item"
+
+
+@dataclass(frozen=True)
+class Bullet:
+    """One line of a memory page, with the id that identifies it across edits."""
+
+    id: str
+    text: str
+
+
+def _plain_text(rich_text: list[dict]) -> str:
+    """The text of a rich text array as the owner sees it.
+
+    ``plain_text`` is what Notion returns and it already has any formatting the
+    owner applied flattened out of it; ``text.content`` is the fallback for a
+    fixture, or an object type that does not carry one.
+    """
+    pieces = []
+    for item in rich_text or []:
+        if not isinstance(item, dict):
+            continue
+        piece = item.get("plain_text")
+        if piece is None:
+            piece = (item.get("text") or {}).get("content")
+        if piece:
+            pieces.append(piece)
+    return "".join(pieces)
+
+
+def _bullet_block(text: str) -> dict:
+    """One bullet, split across as many rich text objects as its length needs."""
+    pieces = _split_text(text)[:MAX_RICH_TEXT_PER_BLOCK]
+    return {
+        "object": "block",
+        "type": BULLET,
+        BULLET: {"rich_text": [{"text": {"content": piece}} for piece in pieces]},
+    }
+
+
+async def memory_parent_page_id() -> str:
+    """The page the two memory pages live under: the diary database's own parent.
+
+    Beside the diary rather than inside it, because the diary database's schema is
+    a day and its entries and these are neither. A database that sits at the top
+    of the workspace has no parent page to put them beside, and there is no API
+    for creating a page at that level either, so that configuration has to name a
+    page explicitly through NOTION_MEMORY_PARENT_PAGE_ID.
+    """
+    configured = settings.notion_memory_parent_page_id
+    if configured:
+        return configured
+
+    resp = await _request("GET", f"/databases/{settings.notion_database_id}")
+    parent = resp.json().get("parent") or {}
+    page_id = parent.get("page_id")
+    if not page_id:
+        raise NotionError(
+            f"The diary database's parent is {parent.get('type')!r}, which is not a page. "
+            "Set NOTION_MEMORY_PARENT_PAGE_ID to the page the memory pages should live on."
+        )
+    return page_id
+
+
+async def find_child_page(parent_page_id: str, title: str) -> str | None:
+    """The id of the child page with that exact title, or None if there isn't one.
+
+    By listing the parent's children rather than by /search: search is indexed
+    asynchronously, so a page created a second ago is not reliably in it yet, and
+    a miss there would create a second page with the same name. A child_page
+    block's id *is* the id of the page it stands for.
+    """
+    for block in await get_page_blocks(parent_page_id):
+        if block.get("type") != "child_page":
+            continue
+        if (block.get("child_page") or {}).get("title") == title:
+            return block["id"]
+    return None
+
+
+async def create_child_page(parent_page_id: str, title: str) -> str:
+    """Creates an empty page with that title under a parent page."""
+    resp = await _request(
+        "POST",
+        "/pages",
+        json={
+            "parent": {"page_id": parent_page_id},
+            "properties": {"title": {"title": _rich_text(title)}},
+        },
+        # Creating a page twice leaves two pages with the same name, and the
+        # lookup above would then pick one of them at random forever.
+        repeatable=False,
+    )
+    page_id = resp.json()["id"]
+    logger.info("Created the memory page %r as %s", title, page_id)
+    return page_id
+
+
+async def read_bullets(page_id: str) -> list[Bullet]:
+    """Every bullet on a memory page, in order, with its block id.
+
+    Raises NotionError if the page could not be read. That distinction is the
+    reason this returns a list rather than swallowing the failure: an empty list
+    from here means the owner cleared the page, and the caller acts on it.
+    """
+    return [
+        Bullet(id=block["id"], text=_plain_text((block.get(BULLET) or {}).get("rich_text", [])))
+        for block in await get_page_blocks(page_id)
+        if block.get("type") == BULLET
+    ]
+
+
+async def write_bullets(page_id: str, texts: list[str]) -> list[str]:
+    """Makes the page's bulleted list read exactly `texts`, and returns its ids.
+
+    Bullets are updated where they stand rather than cleared and rewritten, for
+    three reasons: a block that keeps its id keeps the identity this whole feature
+    is built on, an unchanged line costs no request at all, and the page the owner
+    may have open does not flicker through being empty.
+
+    Only bulleted list items are touched. A heading or a paragraph he added
+    himself is left exactly where it is — it is his page.
+    """
+    existing = await read_bullets(page_id)
+    keys: list[str] = []
+
+    shared = min(len(existing), len(texts))
+    for index in range(shared):
+        bullet = existing[index]
+        keys.append(bullet.id)
+        if bullet.text == texts[index]:
+            continue
+        # Setting a block's content is an absolute write: replaying it writes the
+        # same words to the same block, so it is safe to retry.
+        await _request(
+            "PATCH",
+            f"/blocks/{bullet.id}",
+            json={BULLET: _bullet_block(texts[index])[BULLET]},
+        )
+
+    for batch in _batch_blocks([_bullet_block(text) for text in texts[shared:]]):
+        resp = await _request(
+            "PATCH",
+            f"/blocks/{page_id}/children",
+            json={"children": batch},
+            # Appending is the one request here that duplicates data if Notion
+            # applied it and the answer was lost.
+            repeatable=False,
+        )
+        keys.extend(block["id"] for block in resp.json().get("results", []))
+
+    for bullet in existing[len(texts) :]:
+        # Notion's delete moves the block to the trash rather than destroying it,
+        # and deleting an already-deleted block is not an error, so this is safe
+        # to replay.
+        await _request("DELETE", f"/blocks/{bullet.id}")
+
+    if len(keys) != len(texts):
+        # An append whose response did not carry every block it created. The
+        # lines are on the page; what is missing is their ids, and a fact with no
+        # key is matched by text until the next sync gives it one.
+        logger.warning(
+            "Wrote %d line(s) to %s but only %d id(s) came back", len(texts), page_id, len(keys)
+        )
+    return keys

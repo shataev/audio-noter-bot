@@ -133,6 +133,12 @@ class _Settings:
     # The transcription endpoint rejects uploads above 25 MB.
     max_audio_mb: float = float(os.getenv("MAX_AUDIO_MB", "25"))
 
+    # Where the coach's two memory pages live. Empty is the ordinary case: they
+    # are put beside the diary database, on whatever page that database sits on.
+    # A database at the very top of a workspace has no such page — and the API
+    # cannot create one there either — so that setup names a page here instead.
+    notion_memory_parent_page_id: str = os.getenv("NOTION_MEMORY_PARENT_PAGE_ID", "").strip()
+
     # Notion HTTP behaviour.
     notion_timeout: float = float(os.getenv("NOTION_TIMEOUT_SECONDS", "30"))
     notion_max_retries: int = int(os.getenv("NOTION_MAX_RETRIES", "3"))
