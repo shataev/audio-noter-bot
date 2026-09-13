@@ -53,8 +53,8 @@ if _provider not in (OPENAI, ANTHROPIC):
 # job, and gpt-4o-mini demonstrably does not hold it on a dictated entry: it
 # compresses, and the author loses words he cannot get back. That is a
 # correctness cost, not a quality one, so the role pays for a model that holds
-# the line. The shortfall guard in services/formatter.py still applies — a better
-# model rewrites less often, not never.
+# the line. The two-path split in services/formatter.py and the shortfall guard
+# beside it still apply — a better model rewrites less often, not never.
 _MODEL_DEFAULTS = {
     OPENAI: {
         # Reasoning-grade, and one of the models that accepts a reasoning
@@ -173,6 +173,19 @@ class _Settings:
     # language, which is the default: dictation is not reliably monolingual, and
     # forcing "ru" mangles the English and Thai words that turn up in it.
     transcription_language: str = os.getenv("TRANSCRIPTION_LANGUAGE", "auto")
+
+    # The longest entry the formatter is asked to hand back. Past it the model is
+    # asked for a title and tags only and the transcription is used untouched,
+    # because the longer the entry the more of the reply is a copy of the input
+    # and the more likely the model is to summarise it to fit.
+    #
+    # 6000 characters is roughly six or seven minutes of speaking, and it is the
+    # value the upstream fork has run on. Here it lands just under the point where
+    # an echoed reply stops being cheap: at about two characters per token it asks
+    # for some three thousand output tokens, more than any other call this bot
+    # makes. A setting rather than a constant so it can be moved without a deploy,
+    # in either direction, if the model in use turns out to hold on for longer.
+    formatter_full_text_limit: int = int(os.getenv("FORMATTER_FULL_TEXT_LIMIT", "6000"))
 
     # Literal terms the transcriber should lean towards — names of people and
     # places, jargon, anything it gets wrong the same way every time. Comma

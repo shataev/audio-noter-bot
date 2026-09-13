@@ -17,6 +17,7 @@ os.environ.setdefault("ALLOWED_USER_ID", "1")
 os.environ.setdefault("TIMEZONE", "Europe/Moscow")
 
 import json
+import logging
 import types
 
 import pytest
@@ -132,7 +133,10 @@ async def test_the_formatter_budget_follows_the_length_of_the_entry(monkeypatch)
     monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
 
     short = "Короткая запись."
-    long = "Длинная запись. " * 2000  # 32000 characters
+    # Still on the formatting path: the budget only has to grow up to the point
+    # where the entry stops being asked for back at all.
+    long = "Длинная запись. " * 300  # 4800 characters
+    assert len(long) <= settings.formatter_full_text_limit
 
     await formatter.format_entry(short)
     await formatter.format_entry(long)
@@ -246,3 +250,168 @@ def test_punctuation_cannot_disguise_a_loss():
 
     assert len(formatted) / len(dictated) > 0.9, "raw, this reply looks whole"
     assert formatter.measure_kept(dictated, formatted).too_little
+
+
+# --------------------------------------------------------------------------- #
+# Two paths through the formatter
+#
+# Above a length the model is not asked to hand the entry back at all: it is
+# asked to name it, and the transcription goes through as it is. That removes
+# the failure the guard above exists to catch, rather than detecting it — a model
+# that was never asked to echo six thousand characters cannot shorten them.
+#
+# The boundary is tested from both sides, because it is the whole of the
+# behaviour: which path an entry takes is decided by its length and nothing else.
+# --------------------------------------------------------------------------- #
+
+LIMIT = settings.formatter_full_text_limit
+DICTATION = "и вот еще что я хотел сказать про это самое "
+
+
+def _entry_of(length: int) -> str:
+    """A plausible dictation of exactly that many characters."""
+    return (DICTATION * (length // len(DICTATION) + 1))[:length]
+
+
+@pytest.mark.asyncio
+async def test_an_entry_at_the_limit_is_still_asked_to_be_formatted(monkeypatch):
+    entry = _entry_of(LIMIT)
+    calls, create = _recorder(json.dumps({"title": "Заголовок", "text": "Отформатировано."}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    title, text, _ = await formatter.format_entry(entry)
+
+    assert calls[0]["messages"][0]["content"] == formatter.SYSTEM_PROMPT
+    assert (title, text) == ("Заголовок", "Отформатировано.")
+
+
+@pytest.mark.asyncio
+async def test_one_character_past_the_limit_asks_for_metadata_only(monkeypatch):
+    entry = _entry_of(LIMIT + 1)
+    calls, create = _recorder(json.dumps({"title": "Заголовок", "tags": ["sport"]}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    title, text, tags = await formatter.format_entry(entry)
+
+    assert calls[0]["messages"][0]["content"] == formatter.METADATA_PROMPT
+    assert text == entry, "byte for byte what went in"
+    assert (title, tags) == ("Заголовок", ["sport"])
+
+
+@pytest.mark.asyncio
+async def test_the_long_prompt_says_not_to_return_the_text(monkeypatch):
+    """A model handed the whole entry will volunteer it back unless told not to."""
+    prompt = formatter.METADATA_PROMPT
+
+    assert '"text"' in prompt
+    assert "НЕ нужно" in prompt or "не нужно" in prompt
+    assert "Запрещено" in prompt
+    assert "пересказывать" in prompt
+    assert '"title"' in prompt and '"tags"' in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_long_path_does_not_pay_for_a_copy_of_the_entry(monkeypatch):
+    """The budget that grows with the input is the losing side of this argument."""
+    entry = _entry_of(LIMIT * 3)
+    calls, create = _recorder(json.dumps({"title": "Заголовок"}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    await formatter.format_entry(entry)
+
+    assert calls[0]["max_completion_tokens"] == 512
+    assert calls[0]["max_completion_tokens"] < len(entry) // 2
+
+
+@pytest.mark.asyncio
+async def test_a_reply_with_no_title_costs_a_heading_and_not_the_entry(monkeypatch):
+    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    calls, create = _recorder(json.dumps({"tags": []}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    title, text, tags = await formatter.format_entry(entry)
+
+    assert title == "ну вот сегодня я сходил", "the opening words, which is better than nothing"
+    assert text == entry
+    assert tags == []
+    assert calls, "the model was still asked"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_is_not_readable_json_still_keeps_the_entry(monkeypatch):
+    """Nothing the model returns can cost the owner the note on this path: the
+    text was safe before the call was made."""
+    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    _, create = _recorder("не json вовсе")
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    title, text, tags = await formatter.format_entry(entry)
+
+    assert text == entry
+    assert title == "ну вот сегодня я сходил"
+    assert tags == []
+
+
+@pytest.mark.asyncio
+async def test_a_blank_title_is_not_a_title(monkeypatch):
+    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    _, create = _recorder(json.dumps({"title": "   "}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    title, _, _ = await formatter.format_entry(entry)
+
+    assert title == "ну вот сегодня я сходил"
+
+
+@pytest.mark.asyncio
+async def test_tags_that_are_not_strings_are_dropped_rather_than_passed_on(monkeypatch):
+    entry = _entry_of(LIMIT + 1)
+    _, create = _recorder(json.dumps({"title": "З", "tags": ["sport", 7, None, "  ", "work"]}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    _, _, tags = await formatter.format_entry(entry)
+
+    assert tags == ["sport", "work"]
+
+
+@pytest.mark.asyncio
+async def test_a_long_entry_cannot_trip_the_shortfall_guard(monkeypatch):
+    """The two halves of the fix meet here: the guard is belt, this is braces."""
+    entry = _entry_of(LIMIT * 2)
+    _, create = _recorder(json.dumps({"title": "З"}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    _, text, _ = await formatter.format_entry(entry)
+
+    assert not formatter.measure_kept(entry, text).too_little
+    assert formatter.measure_kept(entry, text).ratio == 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_threshold_can_be_moved_without_a_deploy(monkeypatch):
+    """It is a setting because the right value depends on the model in use."""
+    monkeypatch.setattr(settings, "formatter_full_text_limit", 10)
+    calls, create = _recorder(json.dumps({"title": "З", "text": "Т"}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    _, text, _ = await formatter.format_entry("одиннадцать!")
+
+    assert calls[0]["messages"][0]["content"] == formatter.METADATA_PROMPT
+    assert text == "одиннадцать!"
+
+
+@pytest.mark.asyncio
+async def test_the_long_path_logs_lengths_and_never_the_entry(caplog):
+    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    _, create = _recorder(json.dumps({"title": "З"}))
+
+    with caplog.at_level(logging.DEBUG, logger="services.formatter"):
+        formatter.client.chat.completions.create = create
+        try:
+            await formatter.format_entry(entry)
+        finally:
+            del formatter.client.chat.completions.create
+
+    assert "пробежку" not in caplog.text
+    assert str(len(entry)) in caplog.text
+    assert str(settings.formatter_full_text_limit) in caplog.text
