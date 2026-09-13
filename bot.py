@@ -3,9 +3,17 @@ import logging
 import os
 import tempfile
 import zoneinfo
+from dataclasses import replace
 from datetime import date, time, timedelta
 
-from telegram import Bot, Message, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Bot,
+    Message,
+    ReplyParameters,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -20,7 +28,11 @@ from telegram.ext import (
     filters,
 )
 
-from config import settings
+from config import ANTHROPIC, settings
+from services.coach import conversation as coach
+from services.coach import prompts as coach_prompts
+from services.coach import threads as coach_threads
+from services.coach.store import MemoryStore
 from services.formatter import format_entry
 from services.notion import day_label, diary_today, save_entry
 from services.summary import generate_daily_summary, generate_weekly_report
@@ -63,6 +75,10 @@ DRAFT_KEYS = (
     "edit_prompt_msg_id",
     "editing_state",
     "saving",
+    # The coach is not part of the draft, but its in-flight flag is cleared with
+    # one: a call still in the air when the entry is saved must not leave the
+    # next draft's buttons refusing to answer.
+    "coach_in_flight",
 )
 
 # Message ids of previews that were saved, so a press arriving from a client whose view
@@ -81,6 +97,12 @@ PREVIEW_TIMEOUT = timedelta(minutes=30)
 # but it is local runtime state and is gitignored.
 STATE_FILE_NAME = "bot_state.pickle"
 CONVERSATION_NAME = "preview_flow"
+
+# The coach's two files, beside the draft pickle and under the same directory —
+# the only one the unit is allowed to write to. Both end in .state.json, which
+# .gitignore already covers, because neither is anybody's business but the owner's.
+COACH_MEMORY_FILE_NAME = "coach_memory.state.json"
+COACH_THREADS_FILE_NAME = "coach_threads.state.json"
 
 WELCOME_TEXT = """👋 Welcome to Noter!
 
@@ -115,6 +137,12 @@ HELP_TEXT = """<b>How to use Noter</b>
 
 <b>Misheard words</b>
 <b>/keywords add Кэт, Спур</b> — tell the transcriber about names it keeps getting wrong. <b>/keywords</b> on its own shows the list.
+
+<b>A second opinion</b>
+The buttons under <b>✓ Save</b> send the entry to a model that thinks about it and answers in a new message. The draft is never touched — it is an opinion, not an edit.
+🔥 <b>Разъёб</b> — blunt; 🧭 <b>Разбор</b> — structural; 🫂 <b>Поддержка</b> — kind.
+Reply to its message to keep talking, by text or by voice. A voice reply inside a conversation is never turned into a diary entry.
+Tell it to change how it answers — "don't start with a greeting" — and it writes the rule down itself. <b>/rules</b> shows what it has written.
 
 <b>Daily summary</b>
 Every day at 21:00 I send a summary of all entries recorded that day. If there are none, I'll send a friendly nudge instead."""
@@ -159,6 +187,28 @@ SOMETHING_BROKE = "Something went wrong on my side. It is in the log — please 
 SAVE_IN_FLIGHT = "Still saving — one moment."
 ALREADY_SAVED = "Already saved."
 SAVING_NOTICE = "Saving to Notion..."
+
+# The coach. Every one of these is one line: a model that has nothing useful to
+# say must not cost the owner more than the seconds he already waited, and above
+# all must not cost him the draft — which is why none of them mention it except
+# to say it is still there.
+COACH_THINKING = "{label} — думаю..."
+COACH_IN_FLIGHT = "Still thinking — one moment."
+COACH_FAILED = "The coach didn't answer. Your draft is exactly as it was."
+COACH_EMPTY = "The coach came back with nothing to say."
+# Said to a reply aimed at a conversation that has been pruned. Honest and short,
+# in the coach's own voice: silently starting a new conversation with none of the
+# context would answer confidently and wrongly, which is far worse.
+COACH_FORGOTTEN = "этот разговор уже не помню"
+RULES_TITLE = "<b>Rules the coach follows</b> ({count})"
+RULES_EMPTY = (
+    "No rules yet. Tell the coach how you want it to answer — "
+    "<i>«не начинай с приветствия»</i> — and it writes the rule down itself."
+)
+RULES_UNAVAILABLE = "I couldn't read the rules. It is in the log."
+
+# Telegram rejects a message body longer than this.
+TELEGRAM_TEXT_LIMIT = 4096
 
 TITLE_TEMPLATE = "<b>{title}</b>"
 TAG_TEMPLATE = "<code>{tag}</code>"
@@ -313,7 +363,7 @@ def _preview_keyboard(highlighted: bool = False, day: date | None = None) -> Inl
         if highlighted else
         InlineKeyboardButton("Mark as Highlight ⭐", callback_data="toggle_highlight")
     )
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("✎ Title", callback_data="edit_title"),
             InlineKeyboardButton("✎ Text", callback_data="edit_text"),
@@ -322,12 +372,25 @@ def _preview_keyboard(highlighted: bool = False, day: date | None = None) -> Inl
         [InlineKeyboardButton(_date_button_label(day or diary_today()), callback_data="date_open")],
         [highlight_btn],
         [InlineKeyboardButton("✓ Save", callback_data="save")],
-        # Its own row, under Save rather than beside it. Discarding is the one
-        # irreversible thing in this keyboard — the transcription and the
-        # formatting have already been paid for and the messages are deleted —
-        # so it does not sit a thumb's width from the button pressed every time.
-        [InlineKeyboardButton("✕ Cancel", callback_data="cancel")],
-    ])
+    ]
+
+    # The coach sits below Save and above Cancel. Below Save because saving is
+    # what this keyboard is for and a second opinion is optional; above Cancel
+    # because Cancel keeps the bottom row to itself. Drawn only when the active
+    # provider has a key: a button whose every press can only fail is worse than
+    # no button at all.
+    if coach_enabled():
+        rows.append([
+            InlineKeyboardButton(mode.label, callback_data=f"coach:{mode.key}")
+            for mode in coach_prompts.MODES
+        ])
+
+    # Its own row, under Save rather than beside it. Discarding is the one
+    # irreversible thing in this keyboard — the transcription and the
+    # formatting have already been paid for and the messages are deleted —
+    # so it does not sit a thumb's width from the button pressed every time.
+    rows.append([InlineKeyboardButton("✕ Cancel", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,21 +415,15 @@ def _discard_temp_file(path: str | None) -> None:
         logger.warning("Could not remove temporary audio file %s", path, exc_info=True)
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    message = update.effective_message
+async def _voice_to_text(context: ContextTypes.DEFAULT_TYPE, message: Message) -> str | None:
+    """Turns a voice message into a transcription, or says what failed and returns None.
 
-    # A recording sent while a preview is still open replaces it — but only once the
-    # replacement exists. Everything below can fail, and a draft the user has not saved
-    # yet must not be thrown away for a recording that never arrives: the old preview
-    # stays live and the failed recording is the one that is lost. Which means failing
-    # has to leave the conversation exactly where it found it — including mid-edit,
-    # where the preview's keyboard is off and the prompt the user can still answer is
-    # the only way back.
-    if context.user_data.get("pending") is None:
-        on_failure = ConversationHandler.END
-    else:
-        on_failure = context.user_data.get("editing_state", PREVIEW)
-
+    Shared by the draft flow and by a voice reply inside a coach conversation. The four
+    steps and the two failure messages are the same for both; what differs is entirely
+    what happens next — one builds a preview, the other continues a conversation and must
+    never build one — so this hands back a transcription or nothing and lets the caller
+    decide what that means.
+    """
     await message.reply_text("Listening...")
 
     # The download lives inside the guarded region: get_file and download_to_drive can
@@ -382,17 +439,37 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         except Exception:
             logger.exception("Error downloading voice message")
             await message.reply_text(DOWNLOAD_FAILED)
-            return on_failure
+            return None
 
         try:
             await message.reply_text("Transcribing...")
-            transcription = await transcribe(tmp_path, _keywords_for_transcription(context))
+            return await transcribe(tmp_path, _keywords_for_transcription(context))
         except Exception:
             logger.exception("Error transcribing voice message")
             await message.reply_text(TRANSCRIBE_FAILED)
-            return on_failure
+            return None
     finally:
         _discard_temp_file(tmp_path)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = update.effective_message
+
+    # A recording sent while a preview is still open replaces it — but only once the
+    # replacement exists. Everything below can fail, and a draft the user has not saved
+    # yet must not be thrown away for a recording that never arrives: the old preview
+    # stays live and the failed recording is the one that is lost. Which means failing
+    # has to leave the conversation exactly where it found it — including mid-edit,
+    # where the preview's keyboard is off and the prompt the user can still answer is
+    # the only way back.
+    if context.user_data.get("pending") is None:
+        on_failure = ConversationHandler.END
+    else:
+        on_failure = context.user_data.get("editing_state", PREVIEW)
+
+    transcription = await _voice_to_text(context, message)
+    if transcription is None:
+        return on_failure
 
     logger.info("Transcription: %s", transcription)
 
@@ -814,6 +891,358 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply_html(update.effective_message, KEYWORDS_USAGE)
 
 
+# --------------------------------------------------------------------------- #
+# The coach: a second opinion on the draft, and a conversation on top of it.
+#
+# Everything below obeys one rule that outranks the whole feature: nothing here
+# may cost the owner an unsaved entry. So no function in this section writes to
+# `pending` or to any of the preview's message ids, and every failure path ends
+# in one message saying so and nothing else.
+# --------------------------------------------------------------------------- #
+
+
+def coach_enabled() -> bool:
+    """Whether the mode buttons are drawn at all: only when the provider has a key."""
+    if settings.ai_provider == ANTHROPIC:
+        return bool(settings.anthropic_api_key)
+    return bool(settings.openai_api_key)
+
+
+def coach_memory_path() -> str:
+    return os.path.join(os.environ.get("STATE_DIRECTORY", "."), COACH_MEMORY_FILE_NAME)
+
+
+def coach_threads_path() -> str:
+    return os.path.join(os.environ.get("STATE_DIRECTORY", "."), COACH_THREADS_FILE_NAME)
+
+
+def _memory_store() -> MemoryStore:
+    return MemoryStore(coach_memory_path())
+
+
+# The conversations, read from their file once and kept in step on every write.
+# Keyed by the path they were read from, so that pointing STATE_DIRECTORY
+# somewhere else — which is what a test does — reads that directory rather than
+# handing back the previous one's threads.
+_thread_cache: tuple[str, coach_threads.Threads] | None = None
+
+
+def _load_threads() -> coach_threads.Threads:
+    global _thread_cache
+    path = coach_threads_path()
+    if _thread_cache is None or _thread_cache[0] != path:
+        _thread_cache = (path, coach_threads.ThreadStore(path).load())
+    return _thread_cache[1]
+
+
+def _save_threads(items: coach_threads.Threads) -> None:
+    global _thread_cache
+    path = coach_threads_path()
+    coach_threads.ThreadStore(path).save(items)
+    _thread_cache = (path, items)
+
+
+def _knows_coach_message(chat_id: int, message_id: int) -> bool:
+    """Whether that message is one of the coach's — live conversation or pruned one.
+
+    This decides routing, so it is deliberately total: a file that cannot be read
+    means "not a coach message", and the reply falls through to the flow it would
+    have reached before this feature existed. A broken conversation file must not
+    be able to swallow a voice message that was meant to become a diary entry.
+    """
+    try:
+        items = _load_threads()
+    except Exception:
+        logger.warning("Could not read the coach conversations", exc_info=True)
+        return False
+
+    address = coach_threads.key(chat_id, message_id)
+    return (
+        coach_threads.find(items, address) is not None
+        or coach_threads.was_forgotten(items, address)
+    )
+
+
+class CoachReplyFilter(filters.MessageFilter):
+    """Matches a message replying to something the coach said, and nothing else.
+
+    A filter rather than a check inside the handler, because a handler cannot
+    decline an update once it has been given one. Replying to the preview, or to
+    any other message, has to go on reaching the handler it always did.
+    """
+
+    def filter(self, message: Message) -> bool:
+        reply = message.reply_to_message
+        if reply is None or message.chat is None:
+            return False
+        return _knows_coach_message(message.chat.id, reply.message_id)
+
+
+def _pack(pieces: list[str], joiner: str, limit: int) -> list[str]:
+    """Greedily refills `pieces` into as few groups of at most `limit` as it can."""
+    packed: list[str] = []
+    current = ""
+    for piece in pieces:
+        candidate = f"{current}{joiner}{piece}" if current else piece
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            packed.append(current)
+        current = piece
+    if current:
+        packed.append(current)
+    return packed
+
+
+def _chunks(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Splits a long answer into messages, preferring the seams a reader would pick.
+
+    Paragraphs first, then lines, then — only for a single line longer than a whole
+    message, which no coach answer should ever be — mid-word. Cutting mid-sentence is
+    what the naive fixed-width split does to every answer that overflows, and it reads
+    like a bug even when the text is all there.
+    """
+    if len(text) <= limit:
+        return [text] if text else []
+
+    chunks: list[str] = []
+    for block in _pack(text.split("\n\n"), "\n\n", limit):
+        if len(block) <= limit:
+            chunks.append(block)
+            continue
+        for line in _pack(block.split("\n"), "\n", limit):
+            if len(line) <= limit:
+                chunks.append(line)
+            else:
+                chunks.extend(line[at : at + limit] for at in range(0, len(line), limit))
+    return chunks
+
+
+async def _send_plain(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> Message:
+    """Sends a coach message: plain text, never a parse mode.
+
+    The coach is told to write no markdown, but what reaches here is a model's
+    output about the owner's own day and it is not worth one unbalanced asterisk
+    to render it nicely. Plain text cannot fail to parse.
+
+    `allow_sending_without_reply` so that a reply target which has since been
+    deleted costs the reply threading and not the answer.
+    """
+    reply_parameters = (
+        ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+        if reply_to is not None
+        else None
+    )
+    return await bot.send_message(chat_id=chat_id, text=text, reply_parameters=reply_parameters)
+
+
+async def _edit_plain(bot: Bot, chat_id: int, message_id: int, text: str) -> None:
+    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+
+
+async def _run_coach(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int,
+    mode: coach_prompts.Mode,
+    new_turns: list[coach_threads.Turn],
+    thread: coach_threads.Thread | None = None,
+) -> None:
+    """One turn of the coach, from the waiting message to the recorded conversation.
+
+    The same function for the first press and for the fifth reply: the only
+    difference is whether there is already a thread to carry the earlier turns and
+    to extend afterwards. That is what makes a rule the model writes down in its
+    very first answer work exactly like one written in a long conversation.
+
+    A call at high effort takes many seconds, so the waiting message goes out
+    first and then becomes the answer. It is also the one message every failure
+    path below edits, so there is never more than one new message for a turn that
+    produced nothing.
+    """
+    notice = await _send_plain(
+        context.bot, chat_id, COACH_THINKING.format(label=mode.label), reply_to=reply_to
+    )
+
+    previous = list(thread.turns) if thread is not None else []
+    try:
+        stored = _memory_store().load()
+        answer = await coach.answer(
+            mode=mode,
+            rules=stored.rules,
+            turns=[*previous, *new_turns],
+            model=settings.coach_model,
+        )
+    except Exception:
+        logger.exception("The coach call failed")
+        await _edit_plain(context.bot, chat_id, notice.message_id, COACH_FAILED)
+        return
+
+    # Written before the answer is delivered: a rule the owner has just asked for
+    # is worth more than the ordering, and a delivery that fails half-way must not
+    # also lose it. `changed` is None for a reply with no rules block at all,
+    # which is almost every reply, and then nothing is written.
+    if answer.changed is not None:
+        try:
+            _memory_store().save(replace(stored, rules=answer.rules))
+        except Exception:
+            logger.exception("Could not write the coach's rules")
+
+    if not answer.text:
+        logger.warning("The coach answered with no visible text")
+        await _edit_plain(context.bot, chat_id, notice.message_id, COACH_EMPTY)
+        return
+
+    # Every message of the answer becomes a door back into this conversation, so
+    # replying to any part of a long one continues it.
+    sent = [notice.message_id]
+    try:
+        parts = _chunks(answer.text)
+        await _edit_plain(context.bot, chat_id, notice.message_id, parts[0])
+        for part in parts[1:]:
+            follow = await _send_plain(context.bot, chat_id, part, reply_to=notice.message_id)
+            sent.append(follow.message_id)
+    except Exception:
+        # Recorded anyway, below: the owner has some of the answer in front of him
+        # and a reply to it has to reach the conversation it belongs to.
+        logger.warning("Could not deliver the whole coach answer", exc_info=True)
+
+    exchange = [*new_turns, coach_threads.Turn(role="assistant", text=answer.text)]
+    keys = [coach_threads.key(chat_id, message_id) for message_id in sent]
+    try:
+        items = _load_threads()
+        if thread is None:
+            items, _ = coach_threads.start(items, mode=mode.key, turns=exchange, keys=keys)
+        else:
+            items, _ = coach_threads.extend(items, thread.id, turns=exchange, keys=keys)
+        _save_threads(items)
+    except Exception:
+        # The answer is already on screen. Losing the thread costs the next reply
+        # its context, and that is worth a log line, not a message.
+        logger.exception("Could not record the coach conversation")
+
+
+async def coach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A mode button on the preview. Opens a conversation about the draft.
+
+    Returns to PREVIEW whatever happens: the draft is untouched by design, and a
+    coach call that failed must leave the keyboard exactly where the owner left it.
+    """
+    pending = context.user_data.get("pending")
+    if pending is None:
+        return await _draft_missing(update, context)
+
+    query = update.callback_query
+    mode = coach_prompts.mode_for(query.data.split(":", 1)[1])
+    if mode is None:
+        # Only reachable from a button this bot did not draw, or from one drawn by
+        # a version that had a mode this one does not.
+        logger.warning("Ignoring a coach callback for an unknown mode: %r", query.data)
+        await query.answer()
+        return PREVIEW
+
+    # Read and set with no await in between, so two presses cannot both get past
+    # here whatever the application's update concurrency is set to. A model call
+    # takes many seconds and an impatient second press is the normal case, not
+    # the exceptional one.
+    if context.user_data.get("coach_in_flight"):
+        await query.answer(COACH_IN_FLIGHT)
+        return PREVIEW
+    context.user_data["coach_in_flight"] = True
+
+    await query.answer()
+    try:
+        await _run_coach(
+            context,
+            chat_id=update.effective_chat.id,
+            reply_to=query.message.message_id,
+            mode=mode,
+            new_turns=[
+                coach_threads.Turn(
+                    role="user",
+                    text=coach_prompts.entry_message(pending["title"], pending["text"]),
+                )
+            ],
+        )
+    finally:
+        context.user_data["coach_in_flight"] = False
+    return PREVIEW
+
+
+async def coach_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A reply to something the coach said, by text or by voice.
+
+    This handler is registered ahead of the conversation so that it, and not the
+    voice entry point, is the one handler in its group that takes the update.
+    That is the whole mechanism behind "a voice reply must not become a diary
+    entry": there is no path from here to a draft, rather than a draft that is
+    built and then cleaned up.
+
+    Returns None, not a conversation state: a coach reply is not part of the
+    preview flow and must not move it. An open edit prompt stays open.
+    """
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    address = coach_threads.key(chat_id, message.reply_to_message.message_id)
+
+    thread = coach_threads.find(_load_threads(), address)
+    if thread is None:
+        # The filter let it through, so this was the coach's message and its
+        # conversation has been pruned. Say so rather than answer without it.
+        await message.reply_text(COACH_FORGOTTEN)
+        return
+
+    mode = coach_prompts.mode_for(thread.mode) or coach_prompts.MODES[0]
+
+    if context.user_data.get("coach_in_flight"):
+        await message.reply_text(COACH_IN_FLIGHT)
+        return
+    context.user_data["coach_in_flight"] = True
+
+    try:
+        said = message.text
+        if said is None:
+            said = await _voice_to_text(context, message)
+            if said is None:
+                # Already reported by the transcription step. Nothing further
+                # happens — and, in particular, no draft is created.
+                return
+        await _run_coach(
+            context,
+            chat_id=chat_id,
+            reply_to=message.message_id,
+            mode=mode,
+            new_turns=[coach_threads.Turn(role="user", text=said)],
+            thread=thread,
+        )
+    finally:
+        context.user_data["coach_in_flight"] = False
+
+
+async def handle_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The standing instructions the coach has written down, with the ids it uses.
+
+    The same numbering the model sees, so that "забудь правило 2" addresses the
+    rule the owner is looking at.
+    """
+    try:
+        rules = _memory_store().load().rules.facts
+    except Exception:
+        logger.exception("Could not read the coach's rules")
+        await update.effective_message.reply_text(RULES_UNAVAILABLE)
+        return
+
+    if not rules:
+        await reply_html(update.effective_message, RULES_EMPTY)
+        return
+
+    lines = [render(RULES_TITLE, count=str(len(rules)))]
+    lines += [render("{line}", line=coach_prompts.rule_line(fact)) for fact in rules]
+    await reply_html(update.effective_message, "\n".join(lines))
+
+
 async def handle_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Generating weekly report...")
     try:
@@ -925,8 +1354,11 @@ def build_application() -> Application:
         CommandHandler("help", handle_help),
         CommandHandler("weekly", handle_weekly),
         CommandHandler("keywords", handle_keywords),
+        CommandHandler("rules", handle_rules),
     ]
     cancel_handler = CommandHandler("cancel", handle_cancel)
+
+    coach_pattern = "^coach:(" + "|".join(mode.key for mode in coach_prompts.MODES) + ")$"
 
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.VOICE & user_filter, handle_voice)],
@@ -941,6 +1373,7 @@ def build_application() -> Application:
                 CallbackQueryHandler(date_open_callback, pattern="^date_open$"),
                 CallbackQueryHandler(date_back_callback, pattern="^date_back$"),
                 CallbackQueryHandler(date_chosen_callback, pattern=r"^date:\d{4}-\d{2}-\d{2}$"),
+                CallbackQueryHandler(coach_callback, pattern=coach_pattern),
                 *command_handlers,
             ],
             EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, receive_new_title), *command_handlers],
@@ -959,6 +1392,19 @@ def build_application() -> Application:
         persistent=True,
     )
 
+    # Registered before the conversation, and that ordering is the feature. Only
+    # one handler in a group takes an update, so a reply to something the coach
+    # said never reaches the conversation's voice entry point — which is how a
+    # voice reply inside a thread is stopped from becoming a diary entry. Doing it
+    # the other way round, with a check inside handle_voice, means a draft that is
+    # built and then withdrawn, and one path through that where it is not.
+    app.add_handler(
+        MessageHandler(
+            (filters.VOICE | (filters.TEXT & ~filters.COMMAND)) & user_filter & CoachReplyFilter(),
+            coach_reply,
+        )
+    )
+
     app.add_handler(conv_handler)
     for handler in [*command_handlers, cancel_handler]:
         app.add_handler(handler)
@@ -970,7 +1416,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(
         _draft_missing,
         pattern=r"^(save|toggle_highlight|edit_title|edit_text|edit_tags|cancel"
-                r"|date_open|date_back|date:\d{4}-\d{2}-\d{2})$",
+                r"|date_open|date_back|date:\d{4}-\d{2}-\d{2}|coach:[a-z]+)$",
     ))
 
     app.add_error_handler(handle_error)

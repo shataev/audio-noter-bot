@@ -24,6 +24,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 import bot
+from services.ai import Completion
 
 # --------------------------------------------------------------------------- #
 # A stub Telegram, standing in for the Bot API.
@@ -54,11 +55,14 @@ def _check_parse(text, parse_mode):
 
 
 class Sent:
-    def __init__(self, message_id, text, parse_mode, reply_markup):
+    def __init__(self, message_id, text, parse_mode, reply_markup, reply_to=None):
         self.message_id = message_id
         self.text = text
         self.parse_mode = parse_mode
         self.reply_markup = reply_markup
+        # Which message this one replies to, so a test can check that the coach's
+        # answer hangs off the preview rather than arriving loose in the chat.
+        self.reply_to = reply_to
 
 
 class FakeChat:
@@ -81,9 +85,9 @@ class FakeBot:
         self._next_id += 1
         return self._next_id
 
-    def _record(self, text, parse_mode, reply_markup):
+    def _record(self, text, parse_mode, reply_markup, reply_to=None):
         _check_parse(text, parse_mode)
-        message = Sent(self._new_id(), text, parse_mode, reply_markup)
+        message = Sent(self._new_id(), text, parse_mode, reply_markup, reply_to)
         self.sent.append(message)
         return message
 
@@ -93,8 +97,11 @@ class FakeBot:
                 return message
         raise AssertionError(f"no message {message_id}")
 
-    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
-        return self._record(text, parse_mode, reply_markup)
+    async def send_message(
+        self, chat_id, text, parse_mode=None, reply_markup=None, reply_parameters=None, **kwargs
+    ):
+        reply_to = reply_parameters.message_id if reply_parameters is not None else None
+        return self._record(text, parse_mode, reply_markup, reply_to)
 
     async def edit_message_text(
         self, chat_id, message_id, text, parse_mode=None, reply_markup=None, **kwargs
@@ -123,12 +130,15 @@ class FakeBot:
 
 
 class FakeMessage:
-    def __init__(self, fake_bot, message_id=1, text=None, voice=None):
+    def __init__(self, fake_bot, message_id=1, text=None, voice=None, reply_to_message=None):
         self._bot = fake_bot
         self.message_id = message_id
         self.text = text
         self.voice = voice
         self.chat = FakeChat(fake_bot.chat_id)
+        # A reply to one of the coach's messages is the only way into a
+        # conversation, so the double has to be able to be one.
+        self.reply_to_message = reply_to_message
 
     async def reply_text(self, text, parse_mode=None, reply_markup=None, **kwargs):
         sent = self._bot._record(text, parse_mode, reply_markup)
@@ -1297,3 +1307,755 @@ async def test_a_malformed_date_callback_changes_nothing(tmp_path, monkeypatch, 
 
     assert context.user_data["pending"]["date"] == before
     assert ["save"] in _keyboard_rows(fake_bot, buttons_id)
+
+
+# --------------------------------------------------------------------------- #
+# The coach: a second opinion on the draft, and a conversation on top of it.
+#
+# The model is replaced at the one place it reaches the network — the chat
+# client — so everything between the button press and the message on screen is
+# the real code: the prompt, the marker split, the rules edit, the chunking and
+# the conversation file.
+#
+# The invariant every one of these is really about is that the coach cannot cost
+# the owner an unsaved entry. It is asserted directly wherever there is a draft
+# in the test, because it outranks the whole feature.
+# --------------------------------------------------------------------------- #
+
+COACH_ANSWER = "Ты третий раз за неделю пишешь одно и то же и каждый раз ждёшь другого конца."
+
+
+class FakeCoachChat:
+    """Stands in for the chat client at the one point it would reach the network."""
+
+    def __init__(self, text=COACH_ANSWER, fail=False, gate=None):
+        self.text = text
+        self.fail = fail
+        self.gate = gate
+        self.calls = []
+
+    async def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.gate is not None:
+            self.gate.started.set()
+            await self.gate.release.wait()
+        if self.fail:
+            raise RuntimeError("the provider said no")
+        return Completion(text=self.text, finish_reason="stop")
+
+
+class Gate:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+
+@pytest.fixture
+def coach_state(tmp_path, monkeypatch):
+    """Points the coach's two files at a temp directory and drops any cached threads."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    monkeypatch.setattr(bot, "_thread_cache", None)
+    return tmp_path
+
+
+def stub_coach(monkeypatch, **kwargs):
+    chat = FakeCoachChat(**kwargs)
+    monkeypatch.setattr(bot.coach, "_client", chat)
+    return chat
+
+
+def coach_messages(fake_bot, since):
+    """Everything sent after `since`, which is where the preview ends."""
+    return [message for message in fake_bot.sent if message.message_id > since]
+
+
+def _reply_update(fake_bot, *, to, text=None, voice=None, message_id=300):
+    replied_to = FakeMessage(fake_bot, message_id=to)
+    return FakeUpdate(
+        fake_bot,
+        message=FakeMessage(
+            fake_bot, message_id=message_id, text=text, voice=voice, reply_to_message=replied_to
+        ),
+    )
+
+
+async def _press_coach(fake_bot, context, buttons_id, mode="roast"):
+    return await bot.coach_callback(callback_update(fake_bot, f"coach:{mode}", buttons_id), context)
+
+
+# --------------------------------------------------------------------------- #
+# The buttons
+# --------------------------------------------------------------------------- #
+
+
+def test_the_coach_buttons_sit_below_save_and_above_cancel():
+    rows = [
+        [button.callback_data for button in row] for row in bot._preview_keyboard().inline_keyboard
+    ]
+
+    assert rows.index(["save"]) + 1 == rows.index(
+        ["coach:roast", "coach:breakdown", "coach:support"]
+    )
+    assert rows[-1] == ["cancel"]
+
+
+def test_the_three_modes_are_offered_by_name():
+    labels = [button.text for row in bot._preview_keyboard().inline_keyboard for button in row]
+
+    assert "🔥 Разъёб" in labels
+    assert "🧭 Разбор" in labels
+    assert "🫂 Поддержка" in labels
+
+
+def test_no_coach_buttons_when_the_provider_has_no_key(monkeypatch):
+    """A button whose every press can only fail is worse than no button."""
+    monkeypatch.setattr(bot.settings, "ai_provider", bot.ANTHROPIC)
+    monkeypatch.setattr(bot.settings, "anthropic_api_key", "")
+
+    rows = [
+        [button.callback_data for button in row] for row in bot._preview_keyboard().inline_keyboard
+    ]
+
+    assert not any(any(data.startswith("coach:") for data in row) for row in rows)
+    assert ["save"] in rows and rows[-1] == ["cancel"]
+
+
+def test_the_anthropic_key_is_what_enables_the_coach_on_anthropic(monkeypatch):
+    monkeypatch.setattr(bot.settings, "ai_provider", bot.ANTHROPIC)
+    monkeypatch.setattr(bot.settings, "anthropic_api_key", "test-anthropic")
+
+    assert bot.coach_enabled()
+
+
+# --------------------------------------------------------------------------- #
+# Pressing one
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_press_answers_in_a_new_message_and_leaves_the_draft_alone(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The coach is a second opinion, not an editor: the draft is untouched."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    before = dict(context.user_data["pending"])
+    stub_coach(monkeypatch)
+
+    state = await _press_coach(fake_bot, context, buttons_id)
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"] == before
+    assert fake_bot.find(buttons_id).text == "Actions:", "the preview itself is untouched"
+    assert COACH_ANSWER in [message.text for message in coach_messages(fake_bot, buttons_id)]
+
+
+@pytest.mark.asyncio
+async def test_the_answer_hangs_off_the_preview(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    answer = next(m for m in fake_bot.sent if m.text == COACH_ANSWER)
+    assert answer.reply_to == buttons_id
+
+
+@pytest.mark.asyncio
+async def test_the_entry_is_what_the_coach_is_asked_about(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context, title="Заголовок")
+    chat = stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    (sent,) = chat.calls[0]["messages"]
+    assert "Заголовок" in sent.content
+    assert "тело" in sent.content
+    assert chat.calls[0]["effort"] == "high"
+    assert chat.calls[0]["model"] == bot.settings.coach_model
+
+
+@pytest.mark.asyncio
+async def test_the_mode_pressed_is_the_persona_used(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    monkeypatch.setenv("COACH_PROMPT_SUPPORT", "ПОДДЕРЖКА")
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id, mode="support")
+
+    assert "ПОДДЕРЖКА" in chat.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_something_says_it_is_thinking_before_the_answer_arrives(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A high-effort call takes many seconds; silence for that long reads as broken."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    gate = Gate()
+    stub_coach(monkeypatch, gate=gate)
+
+    press = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
+    await gate.started.wait()
+    waiting = coach_messages(fake_bot, buttons_id)
+
+    assert len(waiting) == 1
+    assert "🔥 Разъёб" in waiting[0].text
+
+    gate.release.set()
+    await press
+    # The waiting message becomes the answer rather than being left above it.
+    assert fake_bot.find(waiting[0].message_id).text == COACH_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_a_second_press_while_one_is_in_flight_is_a_no_op(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Read and set with no await between, so both presses cannot get past the guard."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    gate = Gate()
+    chat = stub_coach(monkeypatch, gate=gate)
+
+    first = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
+    await gate.started.wait()
+    second = await _press_coach(fake_bot, context, buttons_id)
+    gate.release.set()
+    await first
+
+    assert len(chat.calls) == 1, "the second press must not be a second request"
+    assert second == bot.PREVIEW
+    assert bot.COACH_IN_FLIGHT in fake_bot.answered
+
+
+@pytest.mark.asyncio
+async def test_the_coach_is_free_again_once_the_answer_is_in(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+    await _press_coach(fake_bot, context, buttons_id, mode="breakdown")
+
+    assert len(chat.calls) == 2
+    assert not context.user_data.get("coach_in_flight")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_costs_one_line_and_nothing_else(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The invariant that outranks the feature: the draft is exactly as it was."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    before = dict(context.user_data["pending"])
+    stub_coach(monkeypatch, fail=True)
+
+    state = await _press_coach(fake_bot, context, buttons_id)
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"] == before
+    assert [m.text for m in coach_messages(fake_bot, buttons_id)] == [bot.COACH_FAILED]
+    # And the entry can still be saved, which is the thing that actually matters.
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+    assert no_network == [("Заголовок", "тело", ["sport"], bot.diary_today())]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_leaves_the_keyboard_usable(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, fail=True)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert ["save"] in _keyboard_rows(fake_bot, buttons_id)
+    assert not context.user_data.get("coach_in_flight"), "a failure must not wedge the guard"
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_no_text_says_so_rather_than_sending_nothing(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text="")
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert [m.text for m in coach_messages(fake_bot, buttons_id)] == [bot.COACH_EMPTY]
+
+
+@pytest.mark.asyncio
+async def test_a_press_on_a_draft_that_is_gone_does_not_raise(fake_bot, context, coach_state):
+    """The state the bot comes back in after a restart: live buttons, no user_data."""
+    buttons = await fake_bot.send_message(1, "Actions:", reply_markup=bot._preview_keyboard())
+
+    state = await bot.coach_callback(
+        callback_update(fake_bot, "coach:roast", buttons.message_id), context
+    )
+
+    assert state == bot.ConversationHandler.END
+    assert fake_bot.find(buttons.message_id).text == bot.DRAFT_GONE
+
+
+@pytest.mark.asyncio
+async def test_a_press_for_a_mode_this_version_does_not_have_is_ignored(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+
+    state = await _press_coach(fake_bot, context, buttons_id, mode="therapist")
+
+    assert state == bot.PREVIEW
+    assert chat.calls == []
+    assert context.user_data["pending"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# The marker never reaches the chat
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+        COACH_ANSWER + '\n```json\n<<<RULES>>>{"ops": []}\n```',
+        COACH_ANSWER + "\n<<<RULES>>>",
+        COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": ',
+        COACH_ANSWER + '\n<<<RULES>>>{"ops": []}\n<<<RULES>>>{"ops": []}',
+    ],
+)
+async def test_the_owner_never_sees_the_marker(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, reply
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text=reply)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    delivered = " ".join(m.text for m in coach_messages(fake_bot, buttons_id))
+    assert "<<<RULES>>>" not in delivered
+    assert "```" not in delivered
+    assert delivered == COACH_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_a_rule_written_in_the_first_answer_is_stored(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The first rule the bot ever learns arrives in the first conversation."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER
+        + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "не начинать с приветствия"}]}',
+    )
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    stored = bot._memory_store().load().rules.facts
+    assert [(fact.id, fact.text, fact.kind) for fact in stored] == [
+        ("1", "не начинать с приветствия", "rule")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_with_no_marker_writes_nothing(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The common case. It must not rewrite the file, let alone its contents."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert not (coach_state / bot.COACH_MEMORY_FILE_NAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_stored_rule_reaches_the_next_prompt_with_its_id(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+
+    chat = stub_coach(monkeypatch)
+    await _press_coach(fake_bot, context, buttons_id, mode="breakdown")
+
+    assert "[1] короче" in chat.calls[0]["system"]
+
+
+# --------------------------------------------------------------------------- #
+# Replying to the coach
+# --------------------------------------------------------------------------- #
+
+
+async def _start_conversation(tmp_path, monkeypatch, fake_bot, context):
+    """Opens a draft, presses a mode, and returns the id of the coach's message."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+    await _press_coach(fake_bot, context, buttons_id)
+    return next(m for m in fake_bot.sent if m.text == COACH_ANSWER).message_id
+
+
+@pytest.mark.asyncio
+async def test_a_text_reply_continues_the_conversation(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    chat = stub_coach(monkeypatch, text="Потому что ты ждёшь разрешения.")
+
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+
+    assert [(m.role, m.content) for m in chat.calls[0]["messages"]][1:] == [
+        ("assistant", COACH_ANSWER),
+        ("user", "почему?"),
+    ]
+    assert fake_bot.sent[-1].text == "Потому что ты ждёшь разрешения."
+
+
+@pytest.mark.asyncio
+async def test_a_voice_reply_is_transcribed_into_the_conversation_and_makes_no_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The single most annoying bug this feature can have."""
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    # The draft is gone — saved, or cancelled — and the conversation outlives it.
+    bot._clear_draft(context)
+    monkeypatch.setattr(bot, "save_entry", _never_called)
+    chat = stub_coach(monkeypatch, text="Потому что ты ждёшь разрешения.")
+
+    async def fake_transcribe(path, keywords=None):
+        return "а почему именно так"
+
+    monkeypatch.setattr(bot, "transcribe", fake_transcribe)
+    fake_bot.files["voice-2"] = FakeFile()
+
+    await bot.coach_reply(
+        _reply_update(fake_bot, to=answer_id, voice=FakeVoice("voice-2")), context
+    )
+
+    assert context.user_data.get("pending") is None, "a voice reply must never open a draft"
+    assert chat.calls[0]["messages"][-1].content == "а почему именно так"
+    assert fake_bot.sent[-1].text == "Потому что ты ждёшь разрешения."
+
+
+async def _never_called(*args, **kwargs):
+    raise AssertionError("nothing in a coach conversation may reach Notion")
+
+
+@pytest.mark.asyncio
+async def test_a_voice_reply_that_cannot_be_transcribed_still_makes_no_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    bot._clear_draft(context)
+    monkeypatch.setattr(bot, "save_entry", _never_called)
+    chat = stub_coach(monkeypatch)
+
+    async def failing_transcribe(path, keywords=None):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(bot, "transcribe", failing_transcribe)
+    fake_bot.files["voice-2"] = FakeFile()
+
+    await bot.coach_reply(
+        _reply_update(fake_bot, to=answer_id, voice=FakeVoice("voice-2")), context
+    )
+
+    assert context.user_data.get("pending") is None
+    assert chat.calls == []
+    assert fake_bot.sent[-1].text == bot.TRANSCRIBE_FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_reply_does_not_disturb_an_open_edit(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A coach reply is not part of the preview flow and must not move it."""
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    buttons_id = context.user_data["buttons_msg_id"]
+    await bot.edit_title_callback(callback_update(fake_bot, "edit_title", buttons_id), context)
+    stub_coach(monkeypatch, text="Ещё раз то же самое.")
+
+    returned = await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+
+    assert returned is None
+    assert context.user_data["editing_state"] == bot.EDIT_TITLE
+    assert context.user_data["pending"]["title"] == "Заголовок"
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_survives_a_restart(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """`make deploy` restarts the bot on every push, mid-conversation or not."""
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+
+    # A fresh process: nothing in memory, only the file on disk.
+    monkeypatch.setattr(bot, "_thread_cache", None)
+    context.user_data.clear()
+    chat = stub_coach(monkeypatch, text="Потому что ты ждёшь разрешения.")
+
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+
+    assert [m.content for m in chat.calls[0]["messages"]][1:] == [COACH_ANSWER, "почему?"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_to_a_conversation_that_was_pruned_is_answered_honestly(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Silently starting a blank conversation would answer confidently and wrongly."""
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    aged = bot.coach_threads.prune(
+        bot._load_threads(), now=datetime.now(timezone.utc) + timedelta(days=99)
+    )
+    bot._save_threads(aged)
+    chat = stub_coach(monkeypatch)
+
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+
+    assert fake_bot.sent[-1].text == bot.COACH_FORGOTTEN
+    assert chat.calls == [], "no model call without the conversation it belongs to"
+
+
+@pytest.mark.asyncio
+async def test_a_second_reply_while_one_is_in_flight_is_a_no_op(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    gate = Gate()
+    chat = stub_coach(monkeypatch, gate=gate)
+
+    first = asyncio.create_task(
+        bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+    )
+    await gate.started.wait()
+    await bot.coach_reply(
+        _reply_update(fake_bot, to=answer_id, text="ну?", message_id=301), context
+    )
+    gate.release.set()
+    await first
+
+    assert len(chat.calls) == 1
+    assert bot.COACH_IN_FLIGHT in [m.text for m in fake_bot.sent]
+
+
+# --------------------------------------------------------------------------- #
+# Routing: what the coach claims, and what it must not
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_filter_claims_a_reply_to_the_coach(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    update = _reply_update(fake_bot, to=answer_id, voice=FakeVoice("voice-2"))
+
+    assert bot.CoachReplyFilter().filter(update.effective_message)
+
+
+@pytest.mark.asyncio
+async def test_the_filter_leaves_an_ordinary_voice_message_alone(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Dictating a new entry is the bot's whole job; it must not be swallowed."""
+    await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+
+    assert not bot.CoachReplyFilter().filter(voice_update(fake_bot).effective_message)
+
+
+@pytest.mark.asyncio
+async def test_the_filter_leaves_a_reply_to_the_preview_alone(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    buttons_id = context.user_data["buttons_msg_id"]
+
+    update = _reply_update(fake_bot, to=buttons_id, voice=FakeVoice("voice-2"))
+
+    assert not bot.CoachReplyFilter().filter(update.effective_message)
+
+
+def test_an_unreadable_conversation_file_does_not_swallow_a_voice_message(
+    tmp_path, monkeypatch, fake_bot, coach_state
+):
+    """Routing has to be total: a broken file means "not the coach's", not an exception."""
+    (coach_state / bot.COACH_THREADS_FILE_NAME).write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(bot, "_thread_cache", None)
+
+    update = _reply_update(fake_bot, to=999, voice=FakeVoice("voice-2"))
+
+    assert bot.CoachReplyFilter().filter(update.effective_message) is False
+
+
+def test_the_coach_reply_handler_is_tried_before_the_conversation(tmp_path, monkeypatch):
+    """Only one handler per group runs, and this ordering is what stops a draft."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    app = bot.build_application()
+
+    handlers = app.handlers[0]
+    conv_index = next(i for i, h in enumerate(handlers) if isinstance(h, bot.ConversationHandler))
+    reply_index = next(i for i, h in enumerate(handlers) if h.callback is bot.coach_reply)
+
+    assert reply_index < conv_index
+
+
+def test_the_coach_buttons_are_handled_inside_the_preview(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    app = bot.build_application()
+    conv = _conversation_handler(app)
+
+    callbacks = [h.callback for h in conv.states[bot.PREVIEW]]
+
+    assert bot.coach_callback in callbacks
+
+
+def test_a_stale_coach_press_is_caught_by_the_fallback_handler(tmp_path, monkeypatch):
+    """A preview left by an older process must not raise out of an unrouted callback."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    app = bot.build_application()
+
+    stale = next(
+        h
+        for h in app.handlers[0]
+        if isinstance(h, bot.CallbackQueryHandler) and h.callback is bot._draft_missing
+    )
+
+    assert stale.pattern.match("coach:roast")
+
+
+def test_the_coach_files_go_where_the_service_may_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+
+    assert bot.coach_memory_path() == str(tmp_path / bot.COACH_MEMORY_FILE_NAME)
+    assert bot.coach_threads_path() == str(tmp_path / bot.COACH_THREADS_FILE_NAME)
+
+
+# --------------------------------------------------------------------------- #
+# Long answers
+# --------------------------------------------------------------------------- #
+
+
+def test_a_short_answer_is_one_message():
+    assert bot._chunks("одно предложение") == ["одно предложение"]
+
+
+def test_a_long_answer_is_split_at_a_paragraph_break():
+    first = "а" * 3000
+    second = "б" * 3000
+
+    assert bot._chunks(f"{first}\n\n{second}") == [first, second]
+
+
+def test_paragraphs_that_fit_together_travel_together():
+    parts = bot._chunks("\n\n".join(["абзац"] * 50))
+
+    assert len(parts) == 1
+
+
+def test_a_paragraph_longer_than_a_message_is_split_at_a_line_break():
+    parts = bot._chunks("а" * 3000 + "\n" + "б" * 3000)
+
+    assert len(parts) == 2
+    assert all(len(part) <= bot.TELEGRAM_TEXT_LIMIT for part in parts)
+
+
+def test_a_single_unbroken_line_is_split_rather_than_rejected():
+    """No coach answer should be one 10,000-character line, and it must not be lost."""
+    parts = bot._chunks("я" * 10_000)
+
+    assert len(parts) == 3
+    assert "".join(parts) == "я" * 10_000
+
+
+def test_nothing_is_ever_over_the_telegram_limit():
+    parts = bot._chunks(("абзац " * 200 + "\n\n") * 20)
+
+    assert parts
+    assert all(len(part) <= bot.TELEGRAM_TEXT_LIMIT for part in parts)
+
+
+@pytest.mark.asyncio
+async def test_every_message_of_a_long_answer_leads_back_into_the_conversation(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Replying to the second half of an answer has to continue the same thread."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    long_answer = "а" * 3000 + "\n\n" + "б" * 3000
+    stub_coach(monkeypatch, text=long_answer)
+    await _press_coach(fake_bot, context, buttons_id)
+
+    parts = [m for m in coach_messages(fake_bot, buttons_id)]
+    items = bot._load_threads()
+    found = [
+        bot.coach_threads.find(items, bot.coach_threads.key(fake_bot.chat_id, m.message_id))
+        for m in parts
+    ]
+
+    assert len(parts) == 2
+    assert found[0] is not None and found[0] == found[1]
+
+
+# --------------------------------------------------------------------------- #
+# /rules
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_rules_says_how_to_start_when_there_are_none(fake_bot, context, coach_state):
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    assert fake_bot.sent[-1].text == bot.RULES_EMPTY
+
+
+@pytest.mark.asyncio
+async def test_rules_prints_the_list_with_the_ids_the_model_uses(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": ['
+        '{"action": "create", "text": "не начинать с приветствия"},'
+        '{"action": "create", "text": "обращаться на «ты»"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    printed = fake_bot.sent[-1].text
+    assert "[1] не начинать с приветствия" in printed
+    assert "[2] обращаться на «ты»" in printed
+
+
+@pytest.mark.asyncio
+async def test_rules_survives_a_file_it_cannot_read(fake_bot, context, coach_state):
+    (coach_state / bot.COACH_MEMORY_FILE_NAME).write_text("{not json", encoding="utf-8")
+
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    assert fake_bot.sent[-1].text == bot.RULES_UNAVAILABLE
+
+
+def test_rules_is_reachable_from_inside_the_preview(tmp_path, monkeypatch):
+    """Like /keywords: the coach is at its most annoying while a draft is open."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    conv = _conversation_handler(bot.build_application())
+
+    assert bot.handle_rules in [h.callback for h in conv.states[bot.PREVIEW]]
