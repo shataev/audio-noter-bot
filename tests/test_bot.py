@@ -281,6 +281,18 @@ def callback_update(fake_bot, data, message_id):
     )
 
 
+def as_dictated(text):
+    """The same words as they arrive from the transcriber: no punctuation, no capitals.
+
+    The stubbed pair have to be a plausible before-and-after, because the code
+    between them now compares the two: a formatted text materially shorter than
+    the transcription is refused and the transcription kept instead. A stub whose
+    "transcription" had nothing to do with its "formatted text" would put every
+    test in this file on the wrong side of that guard.
+    """
+    return "".join(c for c in text if c.isalnum() or c.isspace()).lower()
+
+
 async def stub_voice_pipeline(
     monkeypatch, tmp_path, fake_bot, title, text, tags, download_fails=False
 ):
@@ -292,7 +304,7 @@ async def stub_voice_pipeline(
 
     async def fake_transcribe(path, keywords=None):
         transcribed_with.append(list(keywords or []))
-        return "raw transcription"
+        return as_dictated(text)
 
     async def fake_format(transcription):
         return title, text, tags
@@ -3151,3 +3163,207 @@ async def test_a_fact_reworded_on_the_page_is_the_same_fact_after_a_correction(
         (reworded.id, "Совсем другими словами.")
     ]
     assert pages.texts("profile-page") == ["Совсем другими словами."]
+
+
+# --------------------------------------------------------------------------- #
+# Reported live — "транскрибция снова урезала и отформатировала мое сообщение"
+#
+# The formatter is forbidden to remove anything and does not hold to it on a long
+# entry. What is tested here is not the model: it is that the loss cannot be
+# silent. A shortened reply is refused, the draft keeps the transcription, and the
+# preview says which of the two is on screen.
+#
+# The second half of every one of these is the case that must stay quiet. A guard
+# that fires on an ordinary well-punctuated reply would replace a clean entry with
+# an unpunctuated one every time, which is a worse bot than the one with the bug.
+# --------------------------------------------------------------------------- #
+
+DICTATED = (
+    "ну вот сегодня я это самое сходил на пробежку было тяжело первые два "
+    "километра потом как-то разбежался и стало нормально в конце даже ускорился"
+)
+PUNCTUATED = (
+    "Ну вот, сегодня я, это самое, сходил на пробежку.\n\n"
+    "Было тяжело первые два километра, потом как-то разбежался и стало нормально. "
+    "В конце даже ускорился!"
+)
+COMPRESSED = "Сходил на пробежку. Первые два километра дались тяжело, потом стало легче."
+
+
+async def _voice_formatted_as(monkeypatch, tmp_path, fake_bot, context, *, dictated, formatted):
+    """One voice message, with both halves of the pipeline pinned by the test."""
+    monkeypatch.setattr(bot.tempfile, "tempdir", str(tmp_path))
+    fake_bot.files["voice-1"] = FakeFile()
+
+    async def fake_transcribe(path, keywords=None):
+        return dictated
+
+    async def fake_format(transcription):
+        return "Заголовок", formatted, ["sport"]
+
+    monkeypatch.setattr(bot, "transcribe", fake_transcribe)
+    monkeypatch.setattr(bot, "format_entry", fake_format)
+    return await bot.handle_voice(voice_update(fake_bot), context)
+
+
+def _notices(fake_bot):
+    return [m for m in fake_bot.sent if m.text == bot.UNFORMATTED_NOTICE]
+
+
+@pytest.mark.asyncio
+async def test_a_shortened_entry_leaves_the_draft_holding_the_transcription(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The reported defect. The words are the entry; the punctuation is not."""
+    state = await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert COMPRESSED not in preview_bodies(fake_bot)
+    assert fake_bot.find(context.user_data["text_msg_id"]).text == DICTATED
+
+
+@pytest.mark.asyncio
+async def test_it_says_so_once_and_the_buttons_stay_last(tmp_path, monkeypatch, fake_bot, context):
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    (notice,) = _notices(fake_bot)
+    assert notice.message_id == context.user_data["unformatted_msg_id"]
+    assert context.user_data["tags_msg_id"] < notice.message_id
+    assert notice.message_id < context.user_data["buttons_msg_id"]
+    assert fake_bot.sent[-1].message_id == context.user_data["buttons_msg_id"]
+
+
+@pytest.mark.asyncio
+async def test_the_title_and_tags_are_still_the_formatters(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Only the text is refused. The title is invented by definition, and the
+    tags are the words the author himself named — neither is what came back short."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    assert context.user_data["pending"]["title"] == "Заголовок"
+    assert context.user_data["pending"]["tags"] == ["sport"]
+
+
+@pytest.mark.asyncio
+async def test_punctuation_and_paragraphs_are_used_as_they_are_and_say_nothing(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The ordinary case, which is the one the guard must never touch."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+    )
+
+    assert context.user_data["pending"]["text"] == PUNCTUATED
+    assert _notices(fake_bot) == []
+    assert context.user_data["unformatted_msg_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_same_words_with_commas_added_are_not_shorter(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """A naive length comparison would call this reply longer, and a naive
+    word-count one would call a merged word a loss. Letters and digits only."""
+    dictated = "короче я пошел"
+    await _voice_formatted_as(
+        monkeypatch,
+        tmp_path,
+        fake_bot,
+        context,
+        dictated=dictated,
+        formatted="Короче, я пошёл...",
+    )
+
+    assert context.user_data["pending"]["text"] == "Короче, я пошёл..."
+    assert _notices(fake_bot) == []
+
+
+@pytest.mark.asyncio
+async def test_exactly_a_tenth_lost_is_still_used(tmp_path, monkeypatch, fake_bot, context):
+    """The boundary from the safe side, end to end."""
+    dictated = "а" * 1000
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=dictated, formatted="а" * 900
+    )
+
+    assert context.user_data["pending"]["text"] == "а" * 900
+    assert _notices(fake_bot) == []
+
+
+@pytest.mark.asyncio
+async def test_one_character_past_the_tenth_is_refused(tmp_path, monkeypatch, fake_bot, context):
+    """And from the other side, so the threshold is pinned rather than approximated."""
+    dictated = "а" * 1000
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=dictated, formatted="а" * 899
+    )
+
+    assert context.user_data["pending"]["text"] == dictated
+    assert len(_notices(fake_bot)) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_shortfall_is_logged_as_numbers_and_not_as_the_entry(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """The journal on the server is readable by the deploy account.
+
+    `handle_voice` already logs the transcription once, which is its own problem
+    and not this one's — so the test is that the guard added no second copy, not
+    that the word appears nowhere.
+    """
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+        )
+
+    carrying = [r for r in caplog.records if "пробежку" in r.getMessage()]
+    assert len(carrying) == 1, "only the transcription line that was already there"
+    assert carrying[0].getMessage().startswith("Transcription:")
+
+    (warned,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    said = warned.getMessage()
+    kept = bot.measure_kept(DICTATED, COMPRESSED)
+    assert f"{kept.kept} of {kept.spoken}" in said, "lengths, which is what a diagnosis needs"
+    assert f"{kept.ratio:.2f}" in said
+    assert "пробежку" not in said
+    assert COMPRESSED not in said
+
+
+@pytest.mark.asyncio
+async def test_cancelling_takes_the_notice_with_the_preview(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """It is part of the preview, so it goes when the preview goes."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+    notice_id = context.user_data["unformatted_msg_id"]
+
+    await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert notice_id in fake_bot.deleted
+
+
+@pytest.mark.asyncio
+async def test_the_words_kept_are_the_ones_that_reach_notion(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
+    """The whole point of the guard: Save writes what the author actually said."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    await bot.save_callback(
+        callback_update(fake_bot, "save", context.user_data["buttons_msg_id"]), context
+    )
+
+    assert no_network[0][1] == DICTATED

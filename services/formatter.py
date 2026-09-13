@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 
 from config import settings
 from services.ai import Message, create_chat_client
@@ -37,6 +38,66 @@ SYSTEM_PROMPT = """Ты помогаешь вести личный дневни�
   если не называл)
 
 Отвечай ТОЛЬКО валидным JSON, без markdown-блоков и пояснений."""
+
+# --------------------------------------------------------------------------- #
+# Did the model keep its side of the bargain?
+#
+# The prompt above forbids removing anything, and on a long dictation the cheap
+# model does not reliably hold to that: it compresses. The caller needs to be
+# able to tell, because an entry that reaches the diary shortened is the one
+# failure the author cannot see — there is no copy of the transcription anywhere
+# he can reach, so the words are simply gone.
+# --------------------------------------------------------------------------- #
+
+# Below this share of the dictated characters, the model rewrote rather than
+# punctuated. A tenth is the width of the gap between the two: fixing misheard
+# words moves the count by a percent or two and in both directions — "щас" for
+# "сейчас" lengthens it — while a paragraph quietly dropped from a long entry
+# takes far more than a tenth with it. Wide enough not to fire on ordinary work,
+# which matters most: a guard that fires on a good reply is worse than no guard.
+MIN_KEPT = 0.9
+
+
+def _spoken(text: str) -> str:
+    """Just the letters and digits: what the author said, with nothing else.
+
+    The formatter is allowed to add punctuation, capitals and paragraph breaks,
+    so comparing raw lengths would call a well-punctuated reply longer than the
+    dictation it came from and a terse one shorter, both for reasons that are
+    exactly what the model was asked to do. Stripping everything it may change
+    leaves only what it may not touch.
+    """
+    return "".join(character for character in text if character.isalnum())
+
+
+@dataclass(frozen=True)
+class Kept:
+    """How much of a dictation survived being formatted."""
+
+    spoken: int
+    kept: int
+
+    @property
+    def ratio(self) -> float:
+        """1.0 when nothing was lost. Above it when the model spelled something out."""
+        if self.spoken == 0:
+            return 1.0
+        return self.kept / self.spoken
+
+    @property
+    def too_little(self) -> bool:
+        """True when the reply is short enough that it cannot be the same words."""
+        return self.ratio < MIN_KEPT
+
+
+def measure_kept(transcription: str, formatted: str) -> Kept:
+    """Compare a formatted entry against the transcription it was made from.
+
+    An empty transcription has nothing to lose and comes back whole, so a voice
+    message that transcribed to nothing cannot trip the guard.
+    """
+    return Kept(spoken=len(_spoken(transcription)), kept=len(_spoken(formatted)))
+
 
 # The reply has to carry the whole entry back, near enough word for word, so the
 # budget follows the input instead of sitting at a constant that silently

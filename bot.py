@@ -41,7 +41,7 @@ from services.coach import rebuild as coach_rebuild
 from services.coach import threads as coach_threads
 from services.coach import weekly as coach_weekly
 from services.coach.store import MemoryStore
-from services.formatter import format_entry
+from services.formatter import MIN_KEPT, format_entry, measure_kept
 from services.memory_sync import MemorySync
 from services.notion import day_label, diary_today, get_week_pages, save_entry
 from services.summary import (
@@ -86,6 +86,9 @@ DRAFT_KEYS = (
     "title_msg_id",
     "text_msg_id",
     "tags_msg_id",
+    # The line that says the draft is holding the raw transcription, when it is.
+    # Part of the preview, so it goes when the preview goes.
+    "unformatted_msg_id",
     "buttons_msg_id",
     "edit_prompt_msg_id",
     "editing_state",
@@ -178,6 +181,14 @@ TRANSCRIBE_FAILED = "I couldn't transcribe that voice message. Send it again and
 FORMAT_FAILED = "I transcribed it but couldn't turn it into an entry. Send the voice message again."
 PREVIEW_FAILED = "I couldn't show the preview for that entry. Send the voice message again."
 NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to try again."
+
+# Not a failure: nothing broke and the draft is fine. It says which of the two
+# texts is on screen, because they are worth different things — the words are
+# the entry, the punctuation is a convenience — and because the author is the
+# only one who can decide whether to tidy it up before saving.
+UNFORMATTED_NOTICE = (
+    "The cleanup came back short, so this is your own words, unformatted."
+)
 
 # How far back the date picker goes. A week covers "I forgot to write this up on
 # Sunday"; anything older is rare enough to be worth editing in Notion directly,
@@ -561,10 +572,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await message.reply_text(FORMAT_FAILED)
         return on_failure
 
+    # The formatter is forbidden to remove anything and does not reliably hold to
+    # it on a long entry. When the reply comes back materially shorter it is not a
+    # cleaned-up version of what was said, so it is not used: the draft keeps the
+    # transcription, which has no punctuation but has every word. Losing them is
+    # the worst thing this bot can do, and it would happen with nothing on screen
+    # to show for it — there is no copy of the transcription anywhere else.
+    kept = measure_kept(transcription, text)
+    unformatted = kept.too_little
+    if unformatted:
+        # Lengths and the ratio, never the text. What a diagnosis needs is how
+        # much came back, and the journal on the server is readable by the deploy
+        # account, so a diary entry has no business in it.
+        logger.warning(
+            "The formatter returned %d of %d spoken characters (%.2f), below %.2f: "
+            "keeping the raw transcription",
+            kept.kept,
+            kept.spoken,
+            kept.ratio,
+            MIN_KEPT,
+        )
+        text = transcription
+
     try:
         title_msg = await reply_html(message, _title_body(title))
         text_msg = await message.reply_text(text)
         tags_msg = await reply_html(message, _tags_line(tags))
+        # Under the entry and above the buttons: the buttons stay the last message,
+        # which is what the author's thumb and every callback in here expect.
+        unformatted_msg = await message.reply_text(UNFORMATTED_NOTICE) if unformatted else None
         buttons_msg = await message.reply_text(
             "Actions:", reply_markup=_preview_keyboard(highlighted=False, day=diary_today())
         )
@@ -591,6 +627,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["title_msg_id"] = title_msg.message_id
     context.user_data["text_msg_id"] = text_msg.message_id
     context.user_data["tags_msg_id"] = tags_msg.message_id
+    context.user_data["unformatted_msg_id"] = (
+        unformatted_msg.message_id if unformatted_msg is not None else None
+    )
     context.user_data["buttons_msg_id"] = buttons_msg.message_id
 
     return PREVIEW
@@ -886,6 +925,7 @@ async def _discard_draft(context: ContextTypes.DEFAULT_TYPE, chat_id: int, draft
         draft["title_msg_id"],
         draft["text_msg_id"],
         draft["tags_msg_id"],
+        draft["unformatted_msg_id"],
         draft["edit_prompt_msg_id"],
     ])
     return await _retire_preview(context.bot, chat_id, draft, DRAFT_CANCELLED)

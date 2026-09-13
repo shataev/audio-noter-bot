@@ -155,3 +155,89 @@ async def test_the_formatter_is_told_not_to_rewrite(monkeypatch):
     assert "НЕ переписывая" in prompt
     assert "слова-паразиты" in prompt, "filler is named as something to keep, not strip"
     assert "Запрещено" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# The prompt above is not enough on its own: `gpt-4o-mini` compresses a long
+# dictation however firmly it is told not to. `measure_kept` is what lets the
+# caller notice, and everything about it turns on the two mistakes it must not
+# make — calling a well-punctuated reply short, and calling a rewritten one whole.
+# --------------------------------------------------------------------------- #
+
+DICTATED = (
+    "ну вот сегодня я это самое сходил на пробежку было тяжело первые "
+    "два километра потом как-то разбежался и стало нормально"
+)
+
+
+def test_punctuation_and_paragraphs_are_not_a_shortfall():
+    """Everything the formatter is allowed to add has to count for nothing."""
+    formatted = (
+        "Ну вот, сегодня я, это самое, сходил на пробежку.\n\n"
+        "Было тяжело первые два километра — потом как-то разбежался, и стало нормально!"
+    )
+
+    kept = formatter.measure_kept(DICTATED, formatted)
+
+    assert kept.ratio == 1.0, "the same words, so nothing was lost"
+    assert not kept.too_little
+
+
+def test_a_word_swapped_for_a_longer_one_is_not_a_shortfall():
+    """Fixing a misheard word is allowed, and it moves the count either way."""
+    kept = formatter.measure_kept("щас пойду", "Сейчас пойду.")
+
+    assert kept.ratio > 1.0
+    assert not kept.too_little
+
+
+def test_an_entry_that_came_back_compressed_is_a_shortfall():
+    """The reported defect: the model summarises instead of punctuating."""
+    kept = formatter.measure_kept(DICTATED, "Сходил на пробежку. Первые два километра тяжело.")
+
+    assert kept.too_little
+    assert kept.ratio < 0.9
+
+
+def test_the_threshold_is_a_tenth_of_the_characters():
+    """The boundary itself, from both sides.
+
+    A guard that fires in ordinary use is worse than no guard, so exactly a tenth
+    lost is still allowed through; it is the next character that is not.
+    """
+    dictated = "а" * 1000
+
+    assert not formatter.measure_kept(dictated, "а" * 900).too_little
+    assert formatter.measure_kept(dictated, "а" * 899).too_little
+
+
+def test_a_transcription_of_nothing_has_nothing_to_lose():
+    """A voice message that transcribed to silence must not trip the guard."""
+    kept = formatter.measure_kept("", "")
+
+    assert kept.spoken == 0
+    assert kept.ratio == 1.0
+    assert not kept.too_little
+
+
+def test_an_empty_reply_loses_everything():
+    """The extreme of the same defect, and the one a naive check would miss."""
+    kept = formatter.measure_kept(DICTATED, "")
+
+    assert kept.kept == 0
+    assert kept.ratio == 0.0
+    assert kept.too_little
+
+
+def test_punctuation_cannot_disguise_a_loss():
+    """The reason the comparison strips what the formatter is allowed to add.
+
+    A reply that dropped a sixth of the words and punctuated what was left comes
+    out almost exactly as long as the dictation it was made from. Compared raw it
+    looks untouched; compared on letters and digits it is what it is.
+    """
+    dictated = "слово " * 50
+    formatted = "Слово, " * 42
+
+    assert len(formatted) / len(dictated) > 0.9, "raw, this reply looks whole"
+    assert formatter.measure_kept(dictated, formatted).too_little
