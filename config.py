@@ -32,6 +32,59 @@ def _load_env_file() -> None:
 _load_env_file()
 
 
+# Which API the chat models are called through: "openai" (the default) or
+# "anthropic". Transcription is deliberately not part of this choice — there is
+# no Anthropic equivalent of the audio endpoint, so it stays on OpenAI whatever
+# this is set to, and OPENAI_API_KEY is required in every configuration.
+OPENAI = "openai"
+ANTHROPIC = "anthropic"
+
+_provider = os.getenv("AI_PROVIDER", OPENAI).strip().lower()
+if _provider not in (OPENAI, ANTHROPIC):
+    raise ValueError(f"AI_PROVIDER must be {OPENAI!r} or {ANTHROPIC!r}, got {_provider!r}")
+
+
+# One model per role rather than one model for everything: formatting and
+# summarising are cheap, mechanical jobs that gpt-4o-mini does well, and paying
+# a reasoning model to do them buys nothing. The roles that need to think are
+# expensive on purpose.
+_MODEL_DEFAULTS = {
+    OPENAI: {
+        # Reasoning-grade, and one of the models that accepts a reasoning
+        # effort — see the table in services/ai.py, which will not send the
+        # parameter to a model that would reject it.
+        "coach": "gpt-5",
+        "formatter": "gpt-4o-mini",
+        "summary": "gpt-4o-mini",
+    },
+    ANTHROPIC: {
+        # Anthropic ids are complete as written: no date suffix, ever.
+        "coach": "claude-opus-5",
+        "formatter": "claude-opus-5",
+        "summary": "claude-opus-5",
+    },
+}
+
+
+def _model_for(role: str, variable: str) -> str:
+    """The model for one role: an explicit setting first, the provider's default after."""
+    return os.getenv(variable) or _MODEL_DEFAULTS[_provider][role]
+
+
+def _provider_key(variable: str) -> str:
+    """A credential that only one provider needs, with a message that says which.
+
+    The bare KeyError the required settings raise is a fine message for a
+    variable everyone needs. It is a confusing one for a key that is suddenly
+    required because AI_PROVIDER changed, on a box that has never spoken to
+    Anthropic in its life.
+    """
+    try:
+        return os.environ[variable]
+    except KeyError:
+        raise RuntimeError(f"{variable} is required when AI_PROVIDER={_provider}") from None
+
+
 class _Settings:
     telegram_token: str = os.environ["TELEGRAM_TOKEN"]
     openai_api_key: str = os.environ["OPENAI_API_KEY"]
@@ -46,12 +99,26 @@ class _Settings:
     # date. 0 restores plain calendar days.
     diary_day_start_hour: int = int(os.getenv("DIARY_DAY_START_HOUR", "4"))
 
-    # OpenAI models.
-    # gpt-transcribe rather than whisper-1, which has not been updated since
-    # 2022 and is measurably worse outside English at the same price per minute.
+    # The chat provider, and the key it needs. OpenAI's key is required above
+    # whatever the provider is, because transcription never leaves OpenAI.
+    ai_provider: str = _provider
+    anthropic_api_key: str = (
+        _provider_key("ANTHROPIC_API_KEY")
+        if _provider == ANTHROPIC
+        else os.getenv("ANTHROPIC_API_KEY", "")
+    )
+
+    # Models, one per role.
+    # Transcription is always an OpenAI model: gpt-transcribe rather than
+    # whisper-1, which has not been updated since 2022 and is measurably worse
+    # outside English at the same price per minute.
     transcription_model: str = os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe")
-    formatter_model: str = os.getenv("FORMATTER_MODEL", "gpt-4o-mini")
-    summary_model: str = os.getenv("SUMMARY_MODEL", "gpt-4o-mini")
+    formatter_model: str = _model_for("formatter", "FORMATTER_MODEL")
+    summary_model: str = _model_for("summary", "SUMMARY_MODEL")
+    # Read by nobody yet. The coach feature lands over the next few branches and
+    # should not have to come back here to be configured.
+    coach_model: str = _model_for("coach", "COACH_MODEL")
+    profile_model: str = os.getenv("PROFILE_MODEL") or summary_model
 
     # Transcription. An empty value (or "auto") lets the model detect the
     # language, which is the default: dictation is not reliably monolingual, and

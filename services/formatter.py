@@ -1,10 +1,12 @@
 import json
 
-import openai
-
 from config import settings
+from services.ai import Message, create_chat_client
 
-client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
+chat = create_chat_client()
+# The SDK object underneath it — the one that actually puts the request on the
+# wire — under the name this module has always kept its transport by.
+client = chat.sdk
 
 SYSTEM_PROMPT = """Ты помогаешь вести личный дневник.
 Тебе дают сырую транскрипцию голосового сообщения.
@@ -51,14 +53,19 @@ def _output_budget(transcription: str) -> int:
 
 
 async def format_entry(transcription: str) -> tuple[str, str, list[str]]:
-    response = await client.chat.completions.create(
+    completion = await chat.complete(
         model=settings.formatter_model,
-        max_completion_tokens=_output_budget(transcription),
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": transcription},
-        ],
+        system=SYSTEM_PROMPT,
+        messages=[Message(role="user", content=transcription)],
+        max_output_tokens=_output_budget(transcription),
+        # No reasoning. Punctuating dictation is mechanical work — the same
+        # argument that keeps this role on a cheap model — and on a provider
+        # where thinking is spent out of the budget above, it would be taken
+        # from the room the reply needs to carry the whole entry back.
+        effort=None,
+        # The shape is three fixed fields, but the prompt describes them and a
+        # schema here would be a second description to keep in step with it.
+        require_json=True,
     )
-    data = json.loads(response.choices[0].message.content)
+    data = json.loads(completion.text)
     return data["title"], data["text"], data.get("tags", [])

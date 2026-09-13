@@ -143,12 +143,39 @@ cp .env.example .env
 | Variable             | Description                                                        |
 |----------------------|--------------------------------------------------------------------|
 | `TELEGRAM_TOKEN`     | Bot token from [@BotFather](https://t.me/BotFather)               |
-| `OPENAI_API_KEY`     | OpenAI API key (used for transcription + GPT-4o-mini)              |
+| `OPENAI_API_KEY`     | OpenAI API key. Required whatever `AI_PROVIDER` is: transcription is always OpenAI |
 | `NOTION_TOKEN`       | Internal integration secret from notion.so/profile/integrations    |
 | `NOTION_DATABASE_ID` | ID from the database URL: `notion.so/workspace/{ID}?v=...`        |
 | `ALLOWED_USER_ID`    | Your Telegram user ID — get it from [@userinfobot](https://t.me/userinfobot) |
 | `TIMEZONE`           | Your timezone, e.g. `Asia/Bangkok`, `Europe/Moscow`                |
 | `DIARY_DAY_START_HOUR` | When a diary day ends. Default `4`; `0` for calendar days |
+
+### Choosing the chat provider
+
+The entry formatter and the two recaps go through one chat client, and
+`AI_PROVIDER` picks the API behind it: `openai` (the default) or `anthropic`.
+
+Transcription is not part of that choice. There is no Anthropic equivalent of
+the audio endpoint, so it stays on OpenAI whatever the setting says — which is
+why `OPENAI_API_KEY` is required in every configuration, and
+`ANTHROPIC_API_KEY` only when `AI_PROVIDER=anthropic`. Missing then, the bot
+refuses to start and names both the variable and the provider that asked for it.
+
+`anthropic` also needs the `anthropic` package, which `requirements.txt`
+installs. It is imported only when that provider is selected, so a server still
+running an older install keeps working on OpenAI rather than failing at startup.
+
+Each role has its own model, so the mechanical work stays cheap and only the
+work that has to think costs anything. Leave a variable unset to get the default
+for the provider in use:
+
+| Variable             | OpenAI default   | Anthropic default | Used for                          |
+|----------------------|------------------|-------------------|-----------------------------------|
+| `TRANSCRIPTION_MODEL`| `gpt-transcribe` | `gpt-transcribe`  | Voice message → text, always OpenAI |
+| `FORMATTER_MODEL`    | `gpt-4o-mini`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
+| `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
+| `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | Not read yet — reserved for the coach |
+| `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Not read yet — reserved for the coach |
 
 ### Connecting Notion integration to your database
 

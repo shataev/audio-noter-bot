@@ -3,5 +3,9 @@
 # Telegram or OpenAI SDK without anyone choosing it. Bump these deliberately, in a commit.
 python-telegram-bot[job-queue]==22.8
 openai==3.13.0
+# Only imported when AI_PROVIDER=anthropic, and imported inside the branch that
+# needs it rather than at module scope: a server whose install predates this
+# line keeps running on OpenAI instead of failing at startup.
+anthropic==1.5.0
 httpx==0.28.1
 python-dotenv==1.2.3
