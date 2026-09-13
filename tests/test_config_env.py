@@ -134,6 +134,7 @@ def _env(**overrides):
         "ANTHROPIC_API_KEY",
         "FORMATTER_MODEL",
         "SUMMARY_MODEL",
+        "PROFILE_MODEL",
         "FORMATTER_FULL_TEXT_LIMIT",
     ):
         env.pop(name, None)
@@ -215,20 +216,22 @@ def test_the_chat_models_default_to_claude_under_the_anthropic_provider(tmp_path
     assert result.stdout.strip() == "('claude-opus-5', 'claude-opus-5', 'claude-opus-5')"
 
 
-def test_the_openai_defaults_pay_for_the_formatter_and_not_the_summary(tmp_path):
-    """The formatter's job is mechanical in shape but the constraint is the job.
+def test_the_openai_defaults_pay_for_the_formatter_and_for_the_summary(tmp_path):
+    """The formatter's job is mechanical in shape but the constraint is the job:
+    gpt-4o-mini does not hold "do not rewrite this" on a dictated entry.
 
-    gpt-4o-mini does not hold "do not rewrite this" on a dictated entry — it
-    compresses, and the author loses words. Summarising has no such constraint
-    and stays on the cheap model. The deployed environment sets neither variable,
-    so these defaults are what actually run.
+    The summary has no such constraint, and is raised for the opposite reason —
+    it is the least frequent model call in the project, two jobs and some
+    thirty-four calls a month, and the owner reads the evening one every day.
+    The deployed environment sets neither variable, so these defaults are what
+    actually run.
     """
     result = _import_and_print(
         "(config.settings.formatter_model, config.settings.summary_model)", _env(), tmp_path
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "('gpt-6-astra', 'gpt-4o-mini')"
+    assert result.stdout.strip() == "('gpt-6-astra', 'gpt-6-astra')"
 
 
 def test_the_full_text_limit_has_a_default_and_can_be_overridden(tmp_path):
@@ -259,12 +262,38 @@ def test_an_explicit_model_wins_over_the_provider_default(tmp_path):
     assert result.stdout.strip() == "gpt-4o"
 
 
-def test_the_profile_model_follows_the_summary_model(tmp_path):
-    """Nobody reads it yet; the point is that the coach branches need not edit
-    config.py to pick it up."""
+def test_the_profile_model_does_not_follow_the_summary_model(tmp_path):
+    """It used to, and the two were never the same job.
+
+    The profile pass runs once per saved entry; the summary runs twice a day.
+    While both defaults happened to be gpt-4o-mini the inheritance cost nothing
+    and read as a convenience — but raising the one the owner reads every
+    evening would have silently raised the per-entry one with it, which is a
+    different decision with a different bill. They are separate roles now.
+    """
     result = _import_and_print(
         "config.settings.profile_model", _env(SUMMARY_MODEL="gpt-4o"), tmp_path
     )
 
     assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gpt-4o-mini"
+
+
+def test_the_profile_model_can_still_be_set_on_its_own(tmp_path):
+    result = _import_and_print(
+        "config.settings.profile_model", _env(PROFILE_MODEL="gpt-4o"), tmp_path
+    )
+
+    assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "gpt-4o"
+
+
+def test_the_profile_model_defaults_to_claude_under_the_anthropic_provider(tmp_path):
+    """Splitting the two roles must not leave an OpenAI id in an Anthropic
+    configuration: that is what pinning the old value by hand would have done."""
+    env = _env(AI_PROVIDER="anthropic", ANTHROPIC_API_KEY="test-anthropic")
+
+    result = _import_and_print("config.settings.profile_model", env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "claude-opus-5"

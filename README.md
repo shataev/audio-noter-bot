@@ -38,6 +38,7 @@ After the voice message is processed, the bot sends four messages in sequence:
 [ ✎ Title ]  [ ✎ Text ]  [ ✎ Tags ]
 [           📅 Today             ]
 [      Mark as Highlight ⭐       ]
+[    ✨ Formatted · show raw     ]
 [            ✓ Save              ]
 [           ✕ Cancel             ]
 ```
@@ -86,6 +87,28 @@ dictating at 23:58 and saving at 00:01 does not move the entry to the next day.
 evening when you write up something you forgot on Sunday. The chosen day is
 marked with a dot; **← Back** closes the picker without changing anything.
 Anything older than a week is rare enough to be worth editing in Notion itself.
+
+### Your own words
+
+The formatter is allowed to fix recognition errors, punctuation and paragraphs,
+and forbidden to remove or rephrase anything. It does not always obey, and the
+two guards below catch the worst of it — but both of them are the bot deciding,
+and you are the one who knows what you said.
+
+**✨ Formatted · show raw** swaps the text for the transcription exactly as it
+came out of the transcriber, and **🎙 Raw · show formatted** swaps it back. The
+label names the text that is on screen, so you can tell the two apart without
+reading them. Whichever one is on screen when you press **✓ Save** is what
+reaches Notion — there is no hidden preference and nothing to set.
+
+Only the text moves. The title is invented by the model in either case, the tags
+are the words you named yourself, and the date was decided when the draft was
+made; none of the three is what the formatter was trusted with.
+
+There is no button when there is nothing to swap to — a long entry is never
+formatted in the first place, so its text is already your own. And if you edit
+the text by hand, the edit is kept on the side you made it on: toggling away and
+back returns your edit, not the version it replaced.
 
 ### Highlights
 
@@ -359,9 +382,16 @@ for the provider in use:
 |----------------------|------------------|-------------------|-----------------------------------|
 | `TRANSCRIPTION_MODEL`| `gpt-transcribe` | `gpt-transcribe`  | Voice message → text, always OpenAI |
 | `FORMATTER_MODEL`    | `gpt-6-astra`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
-| `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
+| `SUMMARY_MODEL`      | `gpt-6-astra`    | `claude-opus-5`   | Daily summary and weekly report   |
 | `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | The coach, at high effort         |
-| `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Learning about you from a saved entry, at low effort |
+| `PROFILE_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Learning about you from a saved entry, at low effort |
+
+The two recaps are the least frequent model call here — one at 21:00 every day
+and one on Sunday, some thirty-four a month between them, against one per entry
+for the formatter and one per entry for the profile — and the daily one is read
+every evening. That makes it the cheapest quality in the project to buy, which
+is why it is not on the cheap model despite having no correctness constraint of
+its own.
 
 The formatter is the one mechanical-looking role that does not run on the cheap
 model. Its instruction is "punctuate this and change nothing else", and holding

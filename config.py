@@ -44,9 +44,9 @@ if _provider not in (OPENAI, ANTHROPIC):
     raise ValueError(f"AI_PROVIDER must be {OPENAI!r} or {ANTHROPIC!r}, got {_provider!r}")
 
 
-# One model per role rather than one model for everything: summarising is a
-# cheap, mechanical job that gpt-4o-mini does well, and paying a reasoning model
-# to do it buys nothing. The roles that need to think are expensive on purpose.
+# One model per role rather than one model for everything: what each role is
+# worth depends on what it costs and on how often it runs, and those differ by
+# two orders of magnitude across this file.
 #
 # Formatting used to be in the cheap group and is not any more. It is mechanical
 # in shape — punctuate this, do not rewrite it — but the constraint is the whole
@@ -55,6 +55,13 @@ if _provider not in (OPENAI, ANTHROPIC):
 # correctness cost, not a quality one, so the role pays for a model that holds
 # the line. The two-path split in services/formatter.py and the shortfall guard
 # beside it still apply — a better model rewrites less often, not never.
+#
+# Summarising is not a correctness problem — nothing is lost if the evening
+# recap is flat. It is a quality one, and it is the cheapest quality in the
+# project to buy: the two jobs in services/summary.py are the daily recap and
+# the Sunday report, some thirty-four calls a month between them, against one
+# per entry for the formatter and one per entry for the profile. It is also the
+# one the author reads every single day.
 _MODEL_DEFAULTS = {
     OPENAI: {
         # Reasoning-grade, and one of the models that accepts a reasoning
@@ -62,13 +69,20 @@ _MODEL_DEFAULTS = {
         # parameter to a model that would reject it.
         "coach": "gpt-5",
         "formatter": "gpt-6-astra",
-        "summary": "gpt-4o-mini",
+        "summary": "gpt-6-astra",
+        # Extracting what an entry taught from an entry that has already been
+        # written is merge work, and it runs once per saved entry. It reads the
+        # value the summary role used to hold, and it holds it here now rather
+        # than inheriting it: the two roles were never the same job, and the
+        # only reason they shared a default was that neither had an opinion.
+        "profile": "gpt-4o-mini",
     },
     ANTHROPIC: {
         # Anthropic ids are complete as written: no date suffix, ever.
         "coach": "claude-opus-5",
         "formatter": "claude-opus-5",
         "summary": "claude-opus-5",
+        "profile": "claude-opus-5",
     },
 }
 
@@ -167,7 +181,7 @@ class _Settings:
     # Read by nobody yet. The coach feature lands over the next few branches and
     # should not have to come back here to be configured.
     coach_model: str = _model_for("coach", "COACH_MODEL")
-    profile_model: str = os.getenv("PROFILE_MODEL") or summary_model
+    profile_model: str = _model_for("profile", "PROFILE_MODEL")
 
     # Transcription. An empty value (or "auto") lets the model detect the
     # language, which is the default: dictation is not reliably monolingual, and

@@ -112,14 +112,16 @@ async def test_the_weekly_report_model_comes_from_configuration(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_summary_model_defaults_to_the_one_that_was_hardcoded(monkeypatch):
+async def test_the_summary_model_defaults_to_the_configured_one(monkeypatch):
+    """SUMMARY_MODEL is not set in the deployed environment, so the default in
+    config.py is what actually runs the recap the owner reads every evening."""
     _stub_day(monkeypatch, DAY_BLOCKS)
     calls, create = _recorder("Итог дня.")
     monkeypatch.setattr(summary.openai_client.chat.completions, "create", create, raising=False)
 
     await summary.generate_daily_summary()
 
-    assert calls[0]["model"] == "gpt-4o-mini"
+    assert calls[0]["model"] == settings.summary_model == "gpt-6-astra"
 
 
 @pytest.mark.asyncio

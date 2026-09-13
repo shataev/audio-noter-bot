@@ -162,6 +162,9 @@ HELP_TEXT = """<b>How to use Noter</b>
 <b>📅 Date</b> — file the entry under an earlier day; the picker offers the last week
 <b>/cancel</b> — throw the current draft away, same as the ✕ Cancel button
 
+<b>Your own words</b>
+<b>✨ Formatted · show raw</b> swaps the text for the transcription exactly as it was spoken, and swaps back. Whichever is on screen when you press Save is what gets written. The title, the tags and the date do not move. There is no button when the entry was too long to be formatted at all — then the text is already yours.
+
 <b>Misheard words</b>
 <b>/keywords add Кэт, Спур</b> — tell the transcriber about names it keeps getting wrong. <b>/keywords</b> on its own shows the list.
 
@@ -194,6 +197,19 @@ NOTION_FAILED = "I couldn't reach Notion, so nothing was saved. Press Save to tr
 UNFORMATTED_NOTICE = (
     "The cleanup came back short, so this is your own words, unformatted."
 )
+
+# The one button that swaps the draft's text between what the formatter made of
+# the entry and what was actually said. Both labels name the text that is on
+# screen first and what pressing does second: the author has to be able to tell
+# which of the two he is looking at without reading it, and the shape of the
+# text is not a reliable tell — a well-behaved formatted entry differs from the
+# transcription only by punctuation.
+SHOWING_FORMATTED_LABEL = "✨ Formatted · show raw"
+SHOWING_RAW_LABEL = "🎙 Raw · show formatted"
+# Only reachable from a keyboard that was drawn when there were two texts and is
+# pressed when there are not — a hand edit can collapse the two into one. Nothing
+# is changed and nothing is claimed to have been.
+NOTHING_TO_SWAP = "There is only one version of this text."
 
 # How far back the date picker goes. A week covers "I forgot to write this up on
 # Sunday"; anything older is rare enough to be worth editing in Notion directly,
@@ -461,7 +477,25 @@ def _date_picker_keyboard(chosen: date) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _preview_keyboard(highlighted: bool = False, day: date | None = None) -> InlineKeyboardMarkup:
+def _has_both_texts(pending: dict) -> bool:
+    """Whether this draft holds two different texts to choose between.
+
+    Equal is the answer for an entry that took the formatter's long path: there
+    the transcription goes through untouched, so the two are the same string and
+    there is nothing to swap to. Equal is also the answer once a hand edit has
+    made them the same, which is the only other way it happens.
+    """
+    raw = pending.get("raw")
+    formatted = pending.get("formatted")
+    return raw is not None and formatted is not None and raw != formatted
+
+
+def _preview_keyboard(
+    highlighted: bool = False,
+    day: date | None = None,
+    both_texts: bool = False,
+    showing_raw: bool = False,
+) -> InlineKeyboardMarkup:
     highlight_btn = (
         InlineKeyboardButton("⭐ Highlighted", callback_data="toggle_highlight")
         if highlighted else
@@ -475,8 +509,22 @@ def _preview_keyboard(highlighted: bool = False, day: date | None = None) -> Inl
         ],
         [InlineKeyboardButton(_date_button_label(day or diary_today()), callback_data="date_open")],
         [highlight_btn],
-        [InlineKeyboardButton("✓ Save", callback_data="save")],
     ]
+
+    # Above Save, because it changes what Save will write, and below the edit row
+    # because it is a choice between two texts that already exist rather than a
+    # fourth thing to edit. Drawn only when there are two of them: an entry that
+    # was never formatted has nothing to swap to, and a button that does nothing
+    # is worse than no button — the same rule the coach row is drawn by.
+    if both_texts:
+        rows.append([
+            InlineKeyboardButton(
+                SHOWING_RAW_LABEL if showing_raw else SHOWING_FORMATTED_LABEL,
+                callback_data="toggle_raw",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton("✓ Save", callback_data="save")])
 
     # The coach sits below Save and above Cancel. Below Save because saving is
     # what this keyboard is for and a second opinion is optional; above Cancel
@@ -495,6 +543,24 @@ def _preview_keyboard(highlighted: bool = False, day: date | None = None) -> Inl
     # so it does not sit a thumb's width from the button pressed every time.
     rows.append([InlineKeyboardButton("✕ Cancel", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _preview_markup(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    """The preview keyboard as the open draft says it should look.
+
+    Every redraw goes through here rather than reaching for ``_preview_keyboard``
+    with two of its four arguments. The keyboard now carries a second piece of
+    draft state, and a redraw that passed only the first — which is what editing
+    the tags, picking a date and failing to save all used to do — would put the
+    text toggle silently back on the formatted side.
+    """
+    pending = context.user_data.get("pending") or {}
+    return _preview_keyboard(
+        highlighted=pending.get("title", "").startswith("⭐ "),
+        day=_draft_day(context),
+        both_texts=_has_both_texts(pending),
+        showing_raw=bool(pending.get("showing_raw")),
+    )
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -601,6 +667,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # transcription, which has no punctuation but has every word. Losing them is
     # the worst thing this bot can do, and it would happen with nothing on screen
     # to show for it — there is no copy of the transcription anywhere else.
+    # Kept whatever the guard decides, and kept under its own name, because the
+    # draft holds both texts from here on and the owner chooses between them. On
+    # the long path this is the transcription itself — the formatter hands it
+    # back byte for byte — which is what says there is nothing to choose.
+    formatted = text
+
     kept = measure_kept(transcription, text)
     unformatted = kept.too_little
     # Lengths and the ratio, never the text — the same rule as the line above, and
@@ -634,7 +706,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         # which is what the author's thumb and every callback in here expect.
         unformatted_msg = await message.reply_text(UNFORMATTED_NOTICE) if unformatted else None
         buttons_msg = await message.reply_text(
-            "Actions:", reply_markup=_preview_keyboard(highlighted=False, day=diary_today())
+            "Actions:",
+            reply_markup=_preview_keyboard(
+                highlighted=False,
+                day=diary_today(),
+                both_texts=formatted != transcription,
+                showing_raw=unformatted,
+            ),
         )
     except Exception:
         logger.exception("Error sending the preview")
@@ -655,6 +733,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # at 23:58 and pressing Save at 00:01 must not file the entry under tomorrow.
     context.user_data["pending"] = {
         "title": title, "text": text, "tags": tags, "date": diary_today().isoformat(),
+        # Both texts, and inside the draft rather than in a dict beside it: the
+        # draft is what is pickled, and `make deploy` restarts the bot on every
+        # push. A transcription that only lived in memory would be gone after a
+        # deploy that happened to land mid-preview, and there is no second copy
+        # of it anywhere — not in Notion, not in the chat, not in the log.
+        #
+        # `text` is one of these two and is the only one Save reads. Which, is
+        # what `showing_raw` records: whatever is on screen is what gets written.
+        "raw": transcription,
+        "formatted": formatted,
+        "showing_raw": unformatted,
     }
     context.user_data["title_msg_id"] = title_msg.message_id
     context.user_data["text_msg_id"] = text_msg.message_id
@@ -703,9 +792,7 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         try:
             await query.edit_message_text(
                 NOTION_FAILED,
-                reply_markup=_preview_keyboard(
-                    highlighted=pending["title"].startswith("⭐ "), day=_draft_day(context)
-                ),
+                reply_markup=_preview_markup(context),
             )
         except Exception:
             logger.warning("Could not restore the preview keyboard after a failed save", exc_info=True)
@@ -746,7 +833,6 @@ async def toggle_highlight_callback(update: Update, context: ContextTypes.DEFAUL
     else:
         pending["title"] = f"⭐ {pending['title']}"
 
-    highlighted = not highlighted
     chat_id = update.effective_chat.id
     await edit_html(
         context.bot,
@@ -757,7 +843,55 @@ async def toggle_highlight_callback(update: Update, context: ContextTypes.DEFAUL
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(highlighted=highlighted, day=_draft_day(context)),
+        reply_markup=_preview_markup(context),
+    )
+    return PREVIEW
+
+
+async def toggle_raw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Swaps the draft's text for the other one it holds, and swaps it back.
+
+    Only the text. The title is invented by definition, the tags are the words
+    the author himself named, and the date was decided when the draft was made —
+    none of the three is what the formatter was trusted with, so none of them
+    moves. What is on screen when Save is pressed is what reaches Notion, which
+    is the whole point: the bot already has two guards that choose for him, and
+    this is the one that does not.
+    """
+    pending = context.user_data.get("pending")
+    if pending is None:
+        return await _draft_missing(update, context)
+
+    query = update.callback_query
+    if not _has_both_texts(pending):
+        await query.answer(NOTHING_TO_SWAP)
+        return PREVIEW
+
+    await query.answer()
+    showing_raw = not pending.get("showing_raw")
+    pending["showing_raw"] = showing_raw
+    pending["text"] = pending["raw"] if showing_raw else pending["formatted"]
+
+    chat_id = update.effective_chat.id
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=context.user_data["text_msg_id"],
+        text=pending["text"],
+    )
+
+    # The notice said why the draft opened on the raw side. It is in the present
+    # tense and it is now sitting above whichever text the author chose, so once
+    # he has answered it himself it goes: the button says which text is on screen
+    # from here on, and it says it correctly on both sides.
+    await _delete_messages(
+        context.bot, chat_id, [context.user_data.get("unformatted_msg_id")]
+    )
+    context.user_data["unformatted_msg_id"] = None
+
+    await context.bot.edit_message_reply_markup(
+        chat_id=chat_id,
+        message_id=context.user_data["buttons_msg_id"],
+        reply_markup=_preview_markup(context),
     )
     return PREVIEW
 
@@ -793,9 +927,7 @@ async def date_chosen_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer()
     await query.edit_message_reply_markup(
-        reply_markup=_preview_keyboard(
-            highlighted=context.user_data["pending"]["title"].startswith("⭐ "), day=day
-        )
+        reply_markup=_preview_markup(context)
     )
     return PREVIEW
 
@@ -808,10 +940,7 @@ async def date_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(
-        reply_markup=_preview_keyboard(
-            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
-            day=_draft_day(context),
-        )
+        reply_markup=_preview_markup(context)
     )
     return PREVIEW
 
@@ -859,10 +988,7 @@ async def receive_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(
-            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
-            day=_draft_day(context),
-        ),
+        reply_markup=_preview_markup(context),
     )
     # Popped, so /cancel does not later try to delete a prompt that is already gone,
     # and so an interrupted recording is not sent back to an edit that is finished.
@@ -879,21 +1005,28 @@ async def receive_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await _draft_missing(update, context)
 
     user_msg = update.effective_message
-    context.user_data["pending"]["text"] = user_msg.text.strip()
+    pending = context.user_data["pending"]
+    pending["text"] = user_msg.text.strip()
+
+    # A hand edit belongs to the text it was made on, so it is written back to
+    # that side as well. Toggling away and back then returns the edit rather than
+    # the version it replaced — the edit is never silently discarded — and the
+    # other side is still the other side, exactly as it came out of the pipeline.
+    # Guarded, so that editing an entry that was never formatted cannot conjure a
+    # second text out of the first and put a button on the preview.
+    if _has_both_texts(pending):
+        pending["raw" if pending.get("showing_raw") else "formatted"] = pending["text"]
 
     chat_id = update.effective_chat.id
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=context.user_data["text_msg_id"],
-        text=context.user_data["pending"]["text"],
+        text=pending["text"],
     )
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(
-            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
-            day=_draft_day(context),
-        ),
+        reply_markup=_preview_markup(context),
     )
     # Popped, so /cancel does not later try to delete a prompt that is already gone,
     # and so an interrupted recording is not sent back to an edit that is finished.
@@ -936,10 +1069,7 @@ async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await context.bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=context.user_data["buttons_msg_id"],
-        reply_markup=_preview_keyboard(
-            highlighted=context.user_data["pending"]["title"].startswith("⭐ "),
-            day=_draft_day(context),
-        ),
+        reply_markup=_preview_markup(context),
     )
     # Popped, so /cancel does not later try to delete a prompt that is already gone,
     # and so an interrupted recording is not sent back to an edit that is finished.
@@ -2403,6 +2533,7 @@ def build_application() -> Application:
             PREVIEW: [
                 CallbackQueryHandler(save_callback, pattern="^save$"),
                 CallbackQueryHandler(toggle_highlight_callback, pattern="^toggle_highlight$"),
+                CallbackQueryHandler(toggle_raw_callback, pattern="^toggle_raw$"),
                 CallbackQueryHandler(edit_title_callback, pattern="^edit_title$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(edit_tags_callback, pattern="^edit_tags$"),
@@ -2474,7 +2605,7 @@ def build_application() -> Application:
     # never steals a callback from a live draft.
     app.add_handler(CallbackQueryHandler(
         _draft_missing,
-        pattern=r"^(save|toggle_highlight|edit_title|edit_text|edit_tags|cancel"
+        pattern=r"^(save|toggle_highlight|toggle_raw|edit_title|edit_text|edit_tags|cancel"
                 r"|date_open|date_back|date:\d{4}-\d{2}-\d{2}|coach:[a-z]+)$",
     ))
 

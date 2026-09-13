@@ -134,7 +134,7 @@ async def test_the_daily_summary_sees_the_whole_day(monkeypatch):
     result = await summary.generate_daily_summary()
 
     assert result == "Итог дня."
-    assert calls[0]["model"] == "gpt-4o-mini", "the default is the model that was hardcoded"
+    assert calls[0]["model"] == summary.settings.summary_model, "the configured summary model"
     sent = calls[0]["messages"][1]["content"]
     assert "Текст записи номер 1" in sent
     assert "Текст записи номер 40" in sent, "the tail of the day reached the model"
