@@ -7,6 +7,12 @@ chat = create_chat_client()
 # wire — under the name this module has always kept its transport by.
 openai_client = chat.sdk
 
+# Neither recap reasons. They restate a day, or a week, that is already written
+# down, which is the same argument that keeps them on a cheap model; and on a
+# provider where thinking is spent out of the same budget as the answer, leaving
+# it on would take tokens from a summary that is sent to the user as it is.
+NO_REASONING = None
+
 SUMMARY_PROMPT = """You are helping the user reflect on their day.
 Below are the diary entries they recorded throughout the day.
 Write a concise, warm daily summary in Russian (2-4 sentences):
@@ -63,6 +69,7 @@ async def generate_weekly_report() -> str | None:
         system=WEEKLY_PROMPT,
         messages=[Message(role="user", content=full_text)],
         max_output_tokens=1024,
+        effort=NO_REASONING,
     )
     return completion.text
 
@@ -82,5 +89,6 @@ async def generate_daily_summary() -> str | None:
         system=SUMMARY_PROMPT,
         messages=[Message(role="user", content=page_text)],
         max_output_tokens=512,
+        effort=NO_REASONING,
     )
     return completion.text

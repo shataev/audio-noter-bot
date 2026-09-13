@@ -14,6 +14,13 @@ divergences to be smuggled through an OpenAI-shaped parameter. That is how
 that nobody sees until it is running in production. So the translation is
 explicit, in one function per provider, whose whole job is that translation.
 
+One asymmetry is worth knowing before reading the two translations. On
+Anthropic, thinking tokens are output tokens: they are spent out of the same
+`max_tokens` ceiling as the answer itself. A request that thinks on a budget
+sized for the reply can return no text block at all — not an error, just an
+empty answer — so a role that has no use for reasoning has to say so, and gets
+thinking switched off rather than left on with its budget quietly halved.
+
 Transcription is not here. There is no Anthropic equivalent of the audio
 endpoint, so `services/whisper.py` keeps its own OpenAI client and the provider
 setting cannot reach it.
@@ -25,6 +32,9 @@ import openai
 
 from config import ANTHROPIC, OPENAI, settings
 
+# How hard a model may think, or None for a role that does not reason at all.
+# Anthropic also accepts "xhigh" and "max"; they are left out until something
+# asks for them — but see the thinking translation below before adding one.
 EFFORTS = ("low", "medium", "high")
 
 # The models that accept an effort. OpenAI rejects `reasoning_effort` outright on
@@ -69,9 +79,9 @@ class Completion:
     usage: Usage | None = None
 
 
-def _check_effort(effort: str) -> None:
-    if effort not in EFFORTS:
-        raise ValueError(f"effort must be one of {EFFORTS}, got {effort!r}")
+def _check_effort(effort: str | None) -> None:
+    if effort is not None and effort not in EFFORTS:
+        raise ValueError(f"effort must be None or one of {EFFORTS}, got {effort!r}")
 
 
 def _openai_takes_effort(model: str) -> bool:
@@ -104,7 +114,7 @@ class ChatClient:
         system: str,
         messages: list[Message],
         max_output_tokens: int,
-        effort: str = "medium",
+        effort: str | None = "medium",
         json_schema: dict | None = None,
         require_json: bool = False,
     ) -> Completion:
@@ -112,7 +122,10 @@ class ChatClient:
 
         `effort` is this project's abstraction, not a passthrough: how hard the
         model should think, in terms both providers can be asked in. It is
-        dropped rather than translated for a model that cannot reason.
+        dropped rather than translated for a model that cannot reason, and None
+        says the role does not reason at all — a mechanical job that would be
+        paying for thinking it has no use for, out of a budget it needs for the
+        answer.
 
         `json_schema` is the strong form of a machine-readable answer — the
         schema is enforced by the provider. `require_json` is the weak form, for
@@ -135,7 +148,7 @@ class OpenAIChatClient(ChatClient):
         system: str,
         messages: list[Message],
         max_output_tokens: int,
-        effort: str = "medium",
+        effort: str | None = "medium",
         json_schema: dict | None = None,
         require_json: bool = False,
     ) -> Completion:
@@ -151,7 +164,13 @@ class OpenAIChatClient(ChatClient):
             "max_completion_tokens": max_output_tokens,
         }
 
-        if _openai_takes_effort(model):
+        # Nothing to send for a role that does not reason, and nothing to send
+        # to a model that cannot. There is no one value that means "do not
+        # reason" across the OpenAI models — "none" and "minimal" are each
+        # accepted by some and rejected by others — so this omits the parameter
+        # rather than guess at a 400. The roles that ask for no effort are
+        # configured onto models that do not reason in the first place.
+        if effort is not None and _openai_takes_effort(model):
             kwargs["reasoning_effort"] = effort
 
         if json_schema is not None:
@@ -210,16 +229,27 @@ class AnthropicChatClient(ChatClient):
         system: str,
         messages: list[Message],
         max_output_tokens: int,
-        effort: str = "medium",
+        effort: str | None = "medium",
         json_schema: dict | None = None,
         require_json: bool = False,
     ) -> Completion:
         _check_effort(effort)
 
-        # Adaptive thinking: the model decides when to think, and the effort says
-        # how hard. This is the whole of the effort mapping here — there is no
-        # token budget to set, and setting one is an error.
-        output_config: dict = {"effort": effort}
+        # Adaptive thinking: the model decides when to think, and the effort
+        # says how hard. This is the whole of the effort mapping here — there is
+        # no token budget to set, and setting one is an error.
+        #
+        # No effort means no thinking, and that has to be said rather than left
+        # to the default: thinking is spent out of max_tokens, so leaving it on
+        # for a role that does not need it takes the budget away from the answer
+        # and can return a reply with no text in it at all. Switching it off is
+        # only accepted alongside an effort of "high" or below, which EFFORTS
+        # guarantees — read this before widening that tuple to "xhigh" or "max".
+        thinking: dict = {"type": "adaptive"} if effort is not None else {"type": "disabled"}
+
+        output_config: dict = {}
+        if effort is not None:
+            output_config["effort"] = effort
 
         if json_schema is not None:
             output_config["format"] = {"type": "json_schema", "schema": json_schema}
@@ -228,14 +258,18 @@ class AnthropicChatClient(ChatClient):
             # place the prompt does the work.
             system = f"{system}\n\n{_JSON_INSTRUCTION}"
 
-        response = await self.sdk.messages.create(
-            model=model,
-            system=system,
-            messages=[{"role": m.role, "content": m.content} for m in messages],
-            max_tokens=max_output_tokens,
-            thinking={"type": "adaptive"},
-            output_config=output_config,
-        )
+        kwargs: dict = {
+            "model": model,
+            "system": system,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "max_tokens": max_output_tokens,
+            "thinking": thinking,
+        }
+        # Asked for neither an effort nor a format, there is nothing to configure.
+        if output_config:
+            kwargs["output_config"] = output_config
+
+        response = await self.sdk.messages.create(**kwargs)
 
         return Completion(
             text=_anthropic_text(response),

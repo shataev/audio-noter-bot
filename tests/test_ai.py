@@ -131,6 +131,46 @@ async def test_effort_reaches_anthropic_as_adaptive_thinking():
 
 
 @pytest.mark.asyncio
+async def test_no_effort_switches_anthropic_thinking_off():
+    """Thinking is spent out of max_tokens, so leaving it on is not free.
+
+    A budget sized for the reply, spent mostly on reasoning, comes back with no
+    text block in it at all — not an error, an empty answer. A role that has no
+    use for reasoning has to switch it off rather than leave it to the default.
+    """
+    client, calls = _anthropic_client()
+
+    await client.complete(model="claude-opus-5", effort=None, **ASK)
+
+    sent = calls[0]
+    assert sent["thinking"] == {"type": "disabled"}
+    assert "output_config" not in sent, "no effort and no format is nothing to configure"
+
+
+@pytest.mark.asyncio
+async def test_no_effort_sends_no_reasoning_effort_even_to_a_model_that_reasons():
+    """There is no one value meaning "do not reason" across the OpenAI models,
+    so the parameter is omitted rather than guessed at."""
+    client, calls = _openai_client()
+
+    await client.complete(model="gpt-5", effort=None, **ASK)
+
+    assert "reasoning_effort" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_a_schema_survives_thinking_being_switched_off():
+    """The two travel in the same parameter on Anthropic; one must not lose the other."""
+    client, calls = _anthropic_client()
+
+    await client.complete(model="claude-opus-5", effort=None, json_schema=ENTRY_SCHEMA, **ASK)
+
+    sent = calls[0]
+    assert sent["thinking"] == {"type": "disabled"}
+    assert sent["output_config"] == {"format": {"type": "json_schema", "schema": ENTRY_SCHEMA}}
+
+
+@pytest.mark.asyncio
 async def test_the_anthropic_model_id_is_sent_exactly_as_configured():
     """Anthropic ids are complete as written and never carry a date suffix."""
     client, calls = _anthropic_client()
@@ -306,6 +346,23 @@ async def test_a_reply_without_usage_is_still_a_completion():
     assert completion.finish_reason is None
 
 
+def _stub_notion_day(monkeypatch, summary):
+    """The Notion reads summary.py imported, so no transport is needed."""
+
+    async def today_page():
+        return {"id": "page-1", "properties": {"title": {"title": [{"plain_text": "9 мая"}]}}}
+
+    async def week_pages():
+        return [await today_page()]
+
+    async def page_blocks(page_id):
+        return [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "Текст"}]}}]
+
+    monkeypatch.setattr(summary, "get_today_page", today_page)
+    monkeypatch.setattr(summary, "get_week_pages", week_pages)
+    monkeypatch.setattr(summary, "get_page_blocks", page_blocks)
+
+
 @pytest.mark.asyncio
 async def test_the_formatter_still_asks_for_a_json_object(monkeypatch):
     """Moving it behind the client must not quietly drop the JSON mode.
@@ -324,6 +381,40 @@ async def test_the_formatter_still_asks_for_a_json_object(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_formatter_does_not_pay_for_thinking(monkeypatch):
+    """Punctuating dictation is mechanical, and the budget is the entry's.
+
+    The formatter's budget is computed to carry the whole entry back word for
+    word; thinking taken out of it is text that never arrives, and the caller
+    hands what does arrive to json.loads.
+    """
+    from services import formatter
+
+    client, calls = _anthropic_client(_anthropic_reply('{"title": "З", "text": "Т"}'))
+    monkeypatch.setattr(formatter, "chat", client)
+
+    await formatter.format_entry("сырая расшифровка")
+
+    assert calls[0]["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_the_recaps_do_not_pay_for_thinking(monkeypatch):
+    """A recap that spent its budget thinking comes back empty, and an empty
+    daily summary is sent to the user as the message it is."""
+    from services import summary
+
+    client, calls = _anthropic_client()
+    monkeypatch.setattr(summary, "chat", client)
+    _stub_notion_day(monkeypatch, summary)
+
+    assert await summary.generate_daily_summary() == "Ответ"
+    assert await summary.generate_weekly_report() == "Ответ"
+
+    assert [call["thinking"] for call in calls] == [{"type": "disabled"}] * 2
+
+
+@pytest.mark.asyncio
 async def test_the_recaps_ask_for_no_format_at_all(monkeypatch):
     """They were prose before this and have to stay prose: the daily summary is
     sent to the user as the message it is."""
@@ -331,15 +422,7 @@ async def test_the_recaps_ask_for_no_format_at_all(monkeypatch):
 
     client, calls = _openai_client()
     monkeypatch.setattr(summary, "chat", client)
-
-    async def today_page():
-        return {"id": "page-1", "properties": {"title": {"title": [{"plain_text": "9 мая"}]}}}
-
-    async def page_blocks(page_id):
-        return [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "Текст"}]}}]
-
-    monkeypatch.setattr(summary, "get_today_page", today_page)
-    monkeypatch.setattr(summary, "get_page_blocks", page_blocks)
+    _stub_notion_day(monkeypatch, summary)
 
     assert await summary.generate_daily_summary() == "Ответ"
     assert "response_format" not in calls[0]

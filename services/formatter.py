@@ -58,6 +58,11 @@ async def format_entry(transcription: str) -> tuple[str, str, list[str]]:
         system=SYSTEM_PROMPT,
         messages=[Message(role="user", content=transcription)],
         max_output_tokens=_output_budget(transcription),
+        # No reasoning. Punctuating dictation is mechanical work — the same
+        # argument that keeps this role on a cheap model — and on a provider
+        # where thinking is spent out of the budget above, it would be taken
+        # from the room the reply needs to carry the whole entry back.
+        effort=None,
         # The shape is three fixed fields, but the prompt describes them and a
         # schema here would be a second description to keep in step with it.
         require_json=True,
