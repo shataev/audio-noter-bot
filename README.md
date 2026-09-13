@@ -382,9 +382,16 @@ for the provider in use:
 |----------------------|------------------|-------------------|-----------------------------------|
 | `TRANSCRIPTION_MODEL`| `gpt-transcribe` | `gpt-transcribe`  | Voice message → text, always OpenAI |
 | `FORMATTER_MODEL`    | `gpt-6-astra`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
-| `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
+| `SUMMARY_MODEL`      | `gpt-6-astra`    | `claude-opus-5`   | Daily summary and weekly report   |
 | `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | The coach, at high effort         |
-| `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Learning about you from a saved entry, at low effort |
+| `PROFILE_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Learning about you from a saved entry, at low effort |
+
+The two recaps are the least frequent model call here — one at 21:00 every day
+and one on Sunday, some thirty-four a month between them, against one per entry
+for the formatter and one per entry for the profile — and the daily one is read
+every evening. That makes it the cheapest quality in the project to buy, which
+is why it is not on the cheap model despite having no correctness constraint of
+its own.
 
 The formatter is the one mechanical-looking role that does not run on the cheap
 model. Its instruction is "punctuate this and change nothing else", and holding
