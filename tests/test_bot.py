@@ -1984,6 +1984,39 @@ def test_a_single_unbroken_line_is_split_rather_than_rejected():
     assert "".join(parts) == "я" * 10_000
 
 
+def test_a_chunk_may_fill_the_limit_exactly():
+    """The boundary from below: 2047 + "\n\n" + 2047 is 4096, which fits in one message."""
+    limit = bot.TELEGRAM_TEXT_LIMIT
+    half = (limit - 2) // 2
+
+    parts = bot._chunks("\n\n".join(["а" * half, "б" * half]))
+
+    assert len(parts) == 1
+    assert len(parts[0]) == limit
+
+
+def test_one_character_over_the_limit_still_splits_at_the_paragraph():
+    """The boundary from above, asserted on *where* it splits rather than how many.
+
+    Sized so the two paragraphs together come to exactly limit + 1. Counting the
+    chunks cannot see an off-by-one here: the final fixed-width fallback catches
+    the oversized block and still returns two pieces under the limit. What it
+    returns is a paragraph cut mid-word at 4096 instead of at the break between
+    them, so the paragraph boundary is the thing to assert. Feeding this
+    comfortably-sized paragraphs — which is what this test used to do — never came
+    within a thousand characters of the boundary and could see neither.
+    """
+    limit = bot.TELEGRAM_TEXT_LIMIT
+    first = "а" * ((limit - 2) // 2)
+    second = "б" * ((limit - 2) // 2 + 1)
+
+    parts = bot._chunks(f"{first}\n\n{second}")
+
+    assert len(f"{first}\n\n{second}") == limit + 1, "the fixture must sit one over"
+    assert parts == [first, second], "split at the paragraph break, not at an offset"
+    assert all(len(part) <= limit for part in parts)
+
+
 def test_nothing_is_ever_over_the_telegram_limit():
     parts = bot._chunks(("абзац " * 200 + "\n\n") * 20)
 
@@ -2123,3 +2156,169 @@ async def test_an_in_flight_flag_left_by_a_dead_process_does_not_wedge_the_coach
     assert not context.user_data.get("coach_in_flight")
     assert len(chat.calls) == 1, "the buttons must work again, not be permanently deaf"
     assert COACH_ANSWER in [m.text for m in coach_messages(fake_bot, buttons_id)]
+
+
+# --------------------------------------------------------------------------- #
+# Holes a review found: right code, nothing holding it there
+# --------------------------------------------------------------------------- #
+
+
+class YieldingCallbackQuery(FakeCallbackQuery):
+    """A callback whose answer() actually yields, so two presses can interleave."""
+
+    async def answer(self, text=None, **kwargs):
+        await asyncio.sleep(0)
+        await super().answer(text, **kwargs)
+
+
+def yielding_callback_update(fake_bot, data, message_id):
+    message = FakeMessage(fake_bot, message_id)
+    return FakeUpdate(
+        fake_bot, message=message, callback_query=YieldingCallbackQuery(fake_bot, data, message)
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_genuinely_overlapping_presses_make_one_request(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The guard is read and set with no await between it, and this is what says so.
+
+    Driving the two presses one after another cannot see the difference: the first
+    has already finished by the time the second starts, so the flag is set either
+    way. These two run under gather with a real yield inside query.answer, so moving
+    the flag set after that await lets both past and produces two model calls.
+    """
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+
+    await asyncio.gather(
+        bot.coach_callback(yielding_callback_update(fake_bot, "coach:roast", buttons_id), context),
+        bot.coach_callback(yielding_callback_update(fake_bot, "coach:roast", buttons_id), context),
+    )
+
+    assert len(chat.calls) == 1, "two overlapping presses must not be two requests"
+    assert bot.COACH_IN_FLIGHT in fake_bot.answered
+
+
+@pytest.mark.asyncio
+async def test_the_coach_speaks_in_plain_text(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """No parse mode on anything the coach sends.
+
+    The model is told to write no markdown, but this is its prose about the
+    owner's own day and one unbalanced asterisk or a stray `<` would have Telegram
+    reject the whole message. Plain text cannot fail to parse, so the absence of a
+    parse mode is the guarantee, and it is asserted rather than assumed.
+    """
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text="а" * 3000 + "\n\n" + "б" * 3000)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    delivered = coach_messages(fake_bot, buttons_id)
+    assert delivered
+    assert all(message.parse_mode is None for message in delivered)
+
+
+@pytest.mark.asyncio
+async def test_a_rule_the_model_deletes_leaves_the_store(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """«забудь правило 2» has to survive the round trip to disk.
+
+    apply_ops removing it in memory is not enough: if the write is skipped the
+    rule is back in the next prompt and back in /rules, with nothing anywhere to
+    tell the owner his instruction was ignored. Narrowing the write guard to
+    "only when something was created" is the plausible slip, and it is silent.
+    """
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": ['
+        '{"action": "create", "text": "не начинать с приветствия"},'
+        '{"action": "create", "text": "обращаться на «ты»"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+    assert len(bot._memory_store().load().rules.facts) == 2
+
+    stub_coach(
+        monkeypatch, text="Забыл." + '\n<<<RULES>>>{"ops": [{"action": "delete", "id": "2"}]}'
+    )
+    await _press_coach(fake_bot, context, buttons_id, mode="breakdown")
+
+    # Reloaded from disk, not from anything held in memory.
+    stored = bot._memory_store().load().rules.facts
+    assert [(fact.id, fact.text) for fact in stored] == [("1", "не начинать с приветствия")]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_rule_stops_reaching_the_prompt(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The consequence the owner actually cares about, one turn later."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+
+    stub_coach(
+        monkeypatch, text="Забыл." + '\n<<<RULES>>>{"ops": [{"action": "delete", "id": "1"}]}'
+    )
+    await _press_coach(fake_bot, context, buttons_id, mode="support")
+
+    chat = stub_coach(monkeypatch)
+    await _press_coach(fake_bot, context, buttons_id, mode="breakdown")
+
+    assert "короче" not in chat.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_rules_survives_a_rule_with_html_in_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A rule is the owner's own phrasing, and angle brackets are ordinary in it.
+
+    /rules interpolates rule text into an HTML message. Unescaped, a rule like
+    «не пиши <думаю> в начале» — exactly the sort of thing this feature exists to
+    record — makes Telegram reject the whole message, and /rules stays broken
+    until that rule is deleted, which can only be done through /rules.
+    """
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER
+        + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "не пиши <думаю> в начале"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+
+    # The fake bot rejects an unparseable body exactly as the API would, so an
+    # unescaped `<` raises out of this call rather than failing an assertion.
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    printed = fake_bot.sent[-1].text
+    assert "&lt;думаю&gt;" in printed
+    assert "<думаю>" not in printed
+
+
+def test_the_conversations_are_read_from_the_directory_in_force(tmp_path, monkeypatch):
+    """The cache is keyed by path, so pointing STATE_DIRECTORY elsewhere re-reads."""
+    monkeypatch.setattr(bot, "_thread_cache", None)
+    first, second = tmp_path / "one", tmp_path / "two"
+
+    monkeypatch.setenv("STATE_DIRECTORY", str(first))
+    items, _ = bot.coach_threads.start(
+        bot._load_threads(),
+        mode="roast",
+        turns=[bot.coach_threads.Turn(role="user", text="запись")],
+        keys=[bot.coach_threads.key(1, 101)],
+    )
+    bot._save_threads(items)
+
+    monkeypatch.setenv("STATE_DIRECTORY", str(second))
+
+    assert bot._load_threads().threads == (), "a different directory is a different file"
+    assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, 101)) is None
