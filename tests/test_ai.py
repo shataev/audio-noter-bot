@@ -306,6 +306,45 @@ async def test_a_reply_without_usage_is_still_a_completion():
     assert completion.finish_reason is None
 
 
+@pytest.mark.asyncio
+async def test_the_formatter_still_asks_for_a_json_object(monkeypatch):
+    """Moving it behind the client must not quietly drop the JSON mode.
+
+    The formatter parses what comes back with json.loads, so a reply wrapped in
+    a markdown fence is a lost entry rather than a worse one.
+    """
+    from services import formatter
+
+    client, calls = _openai_client(_openai_reply('{"title": "З", "text": "Т"}'))
+    monkeypatch.setattr(formatter, "chat", client)
+
+    await formatter.format_entry("сырая расшифровка")
+
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_the_recaps_ask_for_no_format_at_all(monkeypatch):
+    """They were prose before this and have to stay prose: the daily summary is
+    sent to the user as the message it is."""
+    from services import summary
+
+    client, calls = _openai_client()
+    monkeypatch.setattr(summary, "chat", client)
+
+    async def today_page():
+        return {"id": "page-1", "properties": {"title": {"title": [{"plain_text": "9 мая"}]}}}
+
+    async def page_blocks(page_id):
+        return [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "Текст"}]}}]
+
+    monkeypatch.setattr(summary, "get_today_page", today_page)
+    monkeypatch.setattr(summary, "get_page_blocks", page_blocks)
+
+    assert await summary.generate_daily_summary() == "Ответ"
+    assert "response_format" not in calls[0]
+
+
 def test_the_provider_setting_picks_the_implementation(monkeypatch):
     monkeypatch.setattr(config.settings, "ai_provider", config.OPENAI)
     assert isinstance(ai.create_chat_client(), ai.OpenAIChatClient)
