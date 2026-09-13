@@ -273,6 +273,22 @@ def _entry_of(length: int) -> str:
     return (DICTATION * (length // len(DICTATION) + 1))[:length]
 
 
+# Something no fixture or log format could produce by accident, so finding it in
+# a log means it came out of the entry.
+DISTINCTIVE = "ну вот сегодня я сходил на пробежку "
+
+
+def _entry_of_exactly(length: int) -> str:
+    """That many characters, opening with something recognisable.
+
+    Exactly, because which path the entry takes is decided by its length: an
+    opening bolted onto a full-length body pushes a "short" case over the limit
+    and quietly tests the long path twice.
+    """
+    assert length >= len(DISTINCTIVE)
+    return (DISTINCTIVE + _entry_of(length))[:length]
+
+
 @pytest.mark.asyncio
 async def test_an_entry_at_the_limit_is_still_asked_to_be_formatted(monkeypatch):
     entry = _entry_of(LIMIT)
@@ -325,7 +341,7 @@ async def test_the_long_path_does_not_pay_for_a_copy_of_the_entry(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_reply_with_no_title_costs_a_heading_and_not_the_entry(monkeypatch):
-    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    entry = _entry_of_exactly(LIMIT + 1)
     calls, create = _recorder(json.dumps({"tags": []}))
     monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
 
@@ -341,7 +357,7 @@ async def test_a_reply_with_no_title_costs_a_heading_and_not_the_entry(monkeypat
 async def test_a_reply_that_is_not_readable_json_still_keeps_the_entry(monkeypatch):
     """Nothing the model returns can cost the owner the note on this path: the
     text was safe before the call was made."""
-    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    entry = _entry_of_exactly(LIMIT + 1)
     _, create = _recorder("не json вовсе")
     monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
 
@@ -354,7 +370,7 @@ async def test_a_reply_that_is_not_readable_json_still_keeps_the_entry(monkeypat
 
 @pytest.mark.asyncio
 async def test_a_blank_title_is_not_a_title(monkeypatch):
-    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
+    entry = _entry_of_exactly(LIMIT + 1)
     _, create = _recorder(json.dumps({"title": "   "}))
     monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
 
@@ -401,17 +417,53 @@ async def test_the_threshold_can_be_moved_without_a_deploy(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_long_path_logs_lengths_and_never_the_entry(caplog):
-    entry = "ну вот сегодня я сходил на пробежку " + _entry_of(LIMIT)
-    _, create = _recorder(json.dumps({"title": "З"}))
+async def test_a_model_that_returns_the_text_anyway_is_ignored(monkeypatch):
+    """The prompt forbids it, which is not the same as the model obeying.
 
-    with caplog.at_level(logging.DEBUG, logger="services.formatter"):
-        formatter.client.chat.completions.create = create
-        try:
-            await formatter.format_entry(entry)
-        finally:
-            del formatter.client.chat.completions.create
+    Whatever comes back in a "text" field on this path is a model's idea of the
+    entry rather than the entry, and it has already been told not to send one.
+    The transcription is what the draft gets, and that must not depend on the
+    reply happening to leave the field out.
+    """
+    entry = _entry_of(LIMIT + 1)
+    _, create = _recorder(json.dumps({"title": "З", "text": "Краткий пересказ записи."}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
 
-    assert "пробежку" not in caplog.text
-    assert str(len(entry)) in caplog.text
-    assert str(settings.formatter_full_text_limit) in caplog.text
+    _, text, _ = await formatter.format_entry(entry)
+
+    assert text == entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [LIMIT, LIMIT + 1], ids=["short path", "long path"])
+async def test_neither_path_ever_logs_the_entry(monkeypatch, caplog, length):
+    """Both paths, because the formatter holds the whole entry on both of them.
+
+    Same rule the coach package is held to, and the same shape of test: a
+    distinctive sentence, every handler listening, and the assertion that it is
+    nowhere in what was written. What is wanted in the log is the length, which
+    is what says whether the whole thing arrived.
+    """
+    entry = _entry_of_exactly(length)
+    _, create = _recorder(json.dumps({"title": "З", "text": "Текст."}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    with caplog.at_level(logging.DEBUG):
+        await formatter.format_entry(entry)
+
+    assert DISTINCTIVE not in caplog.text
+    assert entry not in caplog.text
+    assert str(len(entry)) in caplog.text, "the length is the part worth keeping"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [LIMIT, LIMIT + 1], ids=["short path", "long path"])
+async def test_the_parametrised_lengths_really_do_take_different_paths(monkeypatch, length):
+    """Guards the test above, which says nothing if both cases go the same way."""
+    calls, create = _recorder(json.dumps({"title": "З", "text": "Т"}))
+    monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
+
+    await formatter.format_entry(_entry_of_exactly(length))
+
+    expected = formatter.SYSTEM_PROMPT if length <= LIMIT else formatter.METADATA_PROMPT
+    assert calls[0]["messages"][0]["content"] == expected
