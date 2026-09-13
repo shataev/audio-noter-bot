@@ -42,7 +42,16 @@ EFFORTS = ("low", "medium", "high")
 # than hope: gpt-4o-mini formats a diary entry perfectly well and would fail the
 # request if it were sent one. Families rather than individual ids, because the
 # families are stable and the ids are not.
-_OPENAI_REASONING_FAMILIES = ("o1", "o3", "o4", "gpt-5")
+#
+# The two ways of being wrong here are not symmetrical, which is why this is a
+# list that gets added to rather than a guess. A family wrongly present fails
+# loudly: the first request to such a model is a 400 and nobody can miss it. A
+# family missing fails silently: the request succeeds, the effort is dropped on
+# the floor, and a role that pinned one — the profile extractor pins `low` to
+# keep reasoning from eating the completion budget — quietly gets the model's
+# default instead. So add a family once it reasons; do not try to be clever
+# about the ones that might.
+_OPENAI_REASONING_FAMILIES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
 
 # Belt-and-braces only. The format parameters below are the mechanism; this is a
 # sentence appended to the prompt for the one case that has no parameter —

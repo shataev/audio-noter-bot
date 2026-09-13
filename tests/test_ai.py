@@ -231,6 +231,38 @@ async def test_a_model_that_reasons_is_sent_the_effort(model):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6", "gpt-6-astra", "gpt-6.1", "GPT-6-Astra"])
+async def test_the_gpt_6_family_is_sent_the_effort(model):
+    """The coach roles are being configured onto gpt-6, and both of them mean it.
+
+    The coach asks for `high` because it is the one role paid to think. The
+    profile extractor pins `low` on purpose: an unpinned effort spends the
+    completion budget reasoning and truncates the JSON. A family missing from
+    the table drops either of those without a word.
+    """
+    client, calls = _openai_client()
+
+    await client.complete(model=model, effort="high", **ASK)
+
+    assert calls[0]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-60-something", "gpt-6x", "gpt-55", "o30"])
+async def test_a_family_matches_a_whole_name_and_not_a_bare_prefix(model):
+    """`gpt-60-something` is not a gpt-6 and never was.
+
+    A plain `startswith` would call every one of these a reasoning model and
+    turn each request into the 400 the table exists to avoid.
+    """
+    client, calls = _openai_client()
+
+    await client.complete(model=model, effort="high", **ASK)
+
+    assert "reasoning_effort" not in calls[0]
+
+
+@pytest.mark.asyncio
 async def test_the_system_prompt_is_the_first_message_on_openai():
     client, calls = _openai_client()
 
