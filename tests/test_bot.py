@@ -2059,3 +2059,12 @@ def test_rules_is_reachable_from_inside_the_preview(tmp_path, monkeypatch):
     conv = _conversation_handler(bot.build_application())
 
     assert bot.handle_rules in [h.callback for h in conv.states[bot.PREVIEW]]
+
+
+@pytest.mark.asyncio
+async def test_help_still_parses_now_that_the_coach_is_in_it(fake_bot, context):
+    """/help is one hand-written HTML blob; one stray & in it rejects the whole message."""
+    await bot.handle_help(text_update(fake_bot, "/help"), context)
+
+    assert "Разъёб" in fake_bot.sent[-1].text
+    assert "/rules" in fake_bot.sent[-1].text
