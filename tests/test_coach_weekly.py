@@ -24,6 +24,7 @@ from dataclasses import replace
 from datetime import date, time
 
 import pytest
+from notion_pages_fake import FakePages
 
 import bot
 from config import WEEKDAYS
@@ -489,3 +490,54 @@ def test_the_weekday_setting_is_named_not_numbered():
     assert WEEKDAYS[0] == "sunday"
     assert WEEKDAYS[bot.SUNDAY] == "sunday"
     assert len(WEEKDAYS) == 7
+
+
+# --------------------------------------------------------------------------- #
+# The weekly session and the Notion memory pages
+#
+# Added when `feat-coach-notion-memory` merged this branch. The profile the
+# session reasons about is the one the owner can edit on a Notion page, and this
+# message is an answer like any other: it reads the page first.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_profile_it_reasons_about_is_the_one_on_the_page(
+    weekly_state, context, fake_bot, monkeypatch
+):
+    pages = FakePages().install(monkeypatch)
+    # Seeded with the block id already recorded rather than pushed for it: a push
+    # would count as a sync and the throttled pull below would reuse it, which is
+    # the right production behaviour and would prove nothing here.
+    store = MemoryStore(os.path.join(weekly_state, bot.COACH_MEMORY_FILE_NAME))
+    mirrored = replace(fact("1", "what the bot wrote"), key="b1")
+    store.save(replace(store.load(), profile=profile_of(mirrored)))
+    pages.put("profile-page", ("b1", "what he corrected it to"))
+
+    stub_today(monkeypatch)
+    stub_week(monkeypatch, {"page-1": [("A", "a")]})
+    client = stub_client(monkeypatch)
+
+    await bot.send_coach_weekly(context)
+
+    shown = client.calls[0]["system"] + client.calls[0]["messages"][0].content
+    assert "what he corrected it to" in shown
+    assert "what the bot wrote" not in shown
+
+
+@pytest.mark.asyncio
+async def test_notion_being_down_does_not_cost_the_week_its_message(
+    weekly_state, context, fake_bot, monkeypatch
+):
+    pages = FakePages().install(monkeypatch)
+    pages.fails = RuntimeError("Notion said no")
+    store = MemoryStore(os.path.join(weekly_state, bot.COACH_MEMORY_FILE_NAME))
+    store.save(replace(store.load(), profile=profile_of(fact("1", "what the bot wrote"))))
+
+    stub_today(monkeypatch)
+    stub_week(monkeypatch, {"page-1": [("A", "a")]})
+    stub_client(monkeypatch)
+
+    await bot.send_coach_weekly(context)
+
+    assert [message.text for message in fake_bot.sent] == [ANSWER]

@@ -26,6 +26,7 @@ from dataclasses import replace
 from datetime import date
 
 import pytest
+from notion_pages_fake import FakePages
 
 import bot
 from services import summary
@@ -1099,3 +1100,71 @@ def test_the_filter_matches_only_a_reply_to_a_prompt_this_process_is_waiting_on(
     bot._memory_focus_prompts[(fake.chat_id, 55)] = None
     assert bot.MemoryFocusFilter().filter(matching) is True
     assert bot.MemoryFocusFilter().filter(FakeMessage(fake, 3, text="обычное сообщение")) is False
+
+
+# --------------------------------------------------------------------------- #
+# The rebuild and the two Notion memory pages
+#
+# Added when `feat-coach-notion-memory` merged this branch: both merged cleanly
+# and the product did not. The mirror adopts whatever the profile page says on
+# the next pull, so a rebuild that wrote the file and left the page alone would
+# have been undone in full the next time the coach answered — the most expensive
+# outcome either branch can produce, and one neither of them could have on its
+# own.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def pages(monkeypatch):
+    return FakePages().install(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_what_a_rebuild_produced_reaches_the_page(
+    memory_state, context, fake_bot, monkeypatch, pages
+):
+    """Or the next pull adopts the old page and the whole pass is thrown away."""
+    seed_profile(memory_state, fact("1", "known"))
+    stub_diary(monkeypatch, {"day-1": [("Заголовок", "тело")]})
+    stub_learn(monkeypatch, ["teach"])
+
+    confirmation = await open_memory(context, fake_bot, monkeypatch)
+    await press(context, fake_bot, confirmation, "memory:run")
+
+    assert pages.texts("profile-page") == ["known", "learned from Заголовок"]
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_that_broke_half_way_still_leaves_the_page_agreeing(
+    memory_state, context, fake_bot, monkeypatch, pages
+):
+    """Everything it learned before it stopped is on disk, so it is on the page."""
+    seed_profile(memory_state, fact("1", "known"))
+    stub_diary(monkeypatch, {"day-1": "unreadable"})
+    stub_learn(monkeypatch)
+
+    confirmation = await open_memory(context, fake_bot, monkeypatch)
+    await press(context, fake_bot, confirmation, "memory:run")
+
+    assert pages.texts("profile-page") == ["known"]
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_starts_from_the_page_rather_than_from_the_file(
+    memory_state, context, fake_bot, monkeypatch, pages
+):
+    """He reworded a fact in Notion, then asked for a rebuild. His wording stands."""
+    store = seed_profile(memory_state, fact("1", "known"))
+    await bot._memory_sync().push()
+    key = store.load().profile.facts[0].key
+    pages.put("profile-page", (key, "his own wording"))
+    stub_diary(monkeypatch, {"day-1": [("Заголовок", "тело")]})
+    stub_learn(monkeypatch, ["teach"])
+
+    confirmation = await open_memory(context, fake_bot, monkeypatch)
+    await press(context, fake_bot, confirmation, "memory:run")
+
+    assert [item.text for item in store_at(memory_state).load().profile.facts] == [
+        "his own wording",
+        "learned from Заголовок",
+    ]

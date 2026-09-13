@@ -180,6 +180,39 @@ entry offers the same facts again. The one thing that is never risked is a fact
 you corrected by hand: if the profile changed while an extraction was in flight,
 that extraction is dropped rather than written.
 
+### Reading it — and correcting it — in Notion
+
+Both lists are mirrored onto two ordinary pages beside the diary database:
+
+| Page | Holds |
+|---|---|
+| **Memory — Author profile** | What the bot has learned about you from your entries |
+| **Memory — Bot rules** | The standing instructions it follows |
+
+They are created the first time the coach runs, and each is a plain bulleted
+list. You can edit them, and **an edit you make by hand outranks whatever the bot
+stored**: reword a bullet, reorder them, add one, delete one, and the change is
+adopted before the next answer is written.
+
+A reworded bullet stays the same fact. Identity comes from the block id Notion
+gives every bullet, not from comparing text — so the fact keeps its number, the
+date it was first learned and the entries that taught it, and `/rules` goes on
+printing it under the id the model uses.
+
+**To reset a list, empty its page.** Deleting every bullet clears the list; the
+facts go to the tombstones in the memory file rather than to nothing.
+
+The file on the server stays the source of truth for *availability* and the page
+for *intent*. If Notion is down, slow, or has been moved out from under the
+integration, the bot answers from the file, says so in the log, and carries on:
+a read that did not succeed is never mistaken for a page you emptied. Pages are
+read at most once every few tens of seconds, so a conversation's follow-up turns
+do not each cost a round trip — `/rules` always reads afresh.
+
+The pages are put on whatever page the diary database sits on. If your database
+sits at the very top of the workspace there is no such page, and
+`NOTION_MEMORY_PARENT_PAGE_ID` names one instead.
+
 ### Rebuilding it from a diary that came first
 
 The profile only grows from entries saved after this feature shipped, so it knows
@@ -793,6 +826,7 @@ noter/
 │   ├── notion.py           # Notion API: create/update diary pages
 │   ├── summary.py          # Daily summary and weekly report generation
 │   ├── ai.py               # One chat interface, OpenAI or Anthropic behind it
+│   ├── memory_sync.py      # The memory, mirrored onto two Notion pages you can edit
 │   └── coach/
 │       ├── memory.py       # Id-addressed lists of facts the model edits
 │       ├── store.py        # The memory file: atomic writes, tolerant loads

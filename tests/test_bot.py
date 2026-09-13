@@ -21,12 +21,14 @@ from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree
 
 import pytest
+from notion_pages_fake import FakePages
 from telegram import CallbackQuery, Chat, Message, Update, User, Voice
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 import bot
 from services.ai import Completion
+from services.notion import NotionError
 
 # --------------------------------------------------------------------------- #
 # A stub Telegram, standing in for the Bot API.
@@ -1392,9 +1394,36 @@ class FakeCoachChat:
 
 
 class Gate:
+    """Holds a stubbed model call open so a test can look at the bot mid-flight.
+
+    ``wait_until_started`` has a deadline rather than being a bare
+    ``Event.wait()``, because the call it waits for is not guaranteed to happen:
+    anything that makes the handler give up before it reaches the model — a
+    memory read that raises, a draft that has gone — leaves a bare wait pending
+    for as long as the test runner allows.
+
+    A test that hangs is worse than a test that fails. It burns the whole CI job
+    timeout and reports "cancelled", which names nothing: the next person to
+    break this guarantee gets a red X with no failure in it. The deadline turns
+    that into one assertion that says what did not happen.
+    """
+
+    # Generous: these calls are stubs and return immediately once released, so
+    # anything approaching this is a call that is never coming.
+    START_TIMEOUT = 5.0
+
     def __init__(self):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+
+    async def wait_until_started(self):
+        try:
+            await asyncio.wait_for(self.started.wait(), self.START_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                f"the stubbed model call was not reached within {self.START_TIMEOUT}s: "
+                f"the handler gave up before it got there"
+            ) from None
 
 
 @pytest.fixture
@@ -1548,7 +1577,7 @@ async def test_something_says_it_is_thinking_before_the_answer_arrives(
     stub_coach(monkeypatch, gate=gate)
 
     press = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
-    await gate.started.wait()
+    await gate.wait_until_started()
     waiting = coach_messages(fake_bot, buttons_id)
 
     assert len(waiting) == 1
@@ -1570,7 +1599,7 @@ async def test_a_second_press_while_one_is_in_flight_is_a_no_op(
     chat = stub_coach(monkeypatch, gate=gate)
 
     first = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
-    await gate.started.wait()
+    await gate.wait_until_started()
     second = await _press_coach(fake_bot, context, buttons_id)
     gate.release.set()
     await first
@@ -1891,7 +1920,7 @@ async def test_a_second_reply_while_one_is_in_flight_is_a_no_op(
     first = asyncio.create_task(
         bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
     )
-    await gate.started.wait()
+    await gate.wait_until_started()
     await bot.coach_reply(
         _reply_update(fake_bot, to=answer_id, text="ну?", message_id=301), context
     )
@@ -2499,7 +2528,7 @@ async def test_a_pass_is_dropped_when_the_profile_moved_under_it(
     await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
 
     pass_task = asyncio.create_task(context.application.run_tasks())
-    await gate.started.wait()
+    await gate.wait_until_started()
 
     # The owner corrects something from a note further up the chat, by hand,
     # while the pass is still waiting on the model.
@@ -2533,7 +2562,7 @@ async def test_a_rules_write_does_not_take_the_profile_back_with_it(
     )
 
     press = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
-    await gate.started.wait()
+    await gate.wait_until_started()
 
     learned = await bot._apply_profile_op(creates(LEARNED_FACT))
     assert learned.created, "the profile pass really did write"
@@ -2893,3 +2922,232 @@ def test_the_conversations_are_read_from_the_directory_in_force(tmp_path, monkey
 
     assert bot._load_threads().threads == (), "a different directory is a different file"
     assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, 101)) is None
+
+
+# --------------------------------------------------------------------------- #
+# The two memory pages
+#
+# The wiring, not the mirror itself: that has its own tests in
+# tests/test_memory_sync.py. What is checked here is that the handlers ask before
+# they answer, write after they change something, and carry on when Notion will
+# not — which is the only one of the three that costs the owner anything if it
+# goes wrong.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def pages(monkeypatch):
+    return FakePages().install(monkeypatch)
+
+
+# Deliberately not one of the examples the committed prompt already gives — the
+# protocol section names «не начинай с приветствия» in full, and a test looking
+# for that string passes whether or not the rule was ever read.
+RULE_FROM_THE_PAGE = "никогда не упоминай понедельник"
+
+
+@pytest.mark.asyncio
+async def test_a_rule_written_on_the_page_by_hand_reaches_the_next_prompt(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """The point of the whole branch: he edits the page, the bot obeys it."""
+    pages.put("rules-page", ("r1", RULE_FROM_THE_PAGE))
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert f"[1] {RULE_FROM_THE_PAGE}" in chat.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_a_rule_the_answer_wrote_reaches_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert pages.texts("rules-page") == ["короче"]
+    assert bot._memory_store().load().rules.facts[0].key == "new-block-1", (
+        "the block id is recorded, or his first rewording of it arrives as a stranger"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_wrote_no_rule_does_not_write_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """Almost every answer. It reads, and that is all it should cost."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert pages.writes == 0
+
+
+@pytest.mark.asyncio
+async def test_the_coach_still_answers_when_notion_will_not(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """A page that cannot be read is worth a log line, never an answer."""
+    pages.fails = NotionError("Notion GET /blocks/rules-page/children failed")
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert coach_messages(fake_bot, buttons_id)[-1].text == COACH_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_a_rule_written_while_notion_is_down_is_still_stored(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """The file is the source of truth for availability. The page catches up later."""
+    pages.fails = NotionError("Notion GET /blocks/rules-page/children failed")
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert [f.text for f in bot._memory_store().load().rules.facts] == ["короче"]
+
+
+@pytest.mark.asyncio
+async def test_rules_prints_what_the_page_says(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+    key = bot._memory_store().load().rules.facts[0].key
+    pages.put("rules-page", (key, "отвечай короче"))
+
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    printed = fake_bot.sent[-1].text
+    assert "[1] отвечай короче" in printed, "his wording, under the id the model uses"
+
+
+@pytest.mark.asyncio
+async def test_rules_falls_back_to_the_file_when_notion_is_unreachable(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+    pages.fails = NotionError("Notion GET /blocks/rules-page/children failed")
+
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    assert "[1] короче" in fake_bot.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_what_a_saved_entry_taught_reaches_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT))
+
+    assert pages.texts("profile-page") == [LEARNED_FACT]
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_never_arrives_fails_the_test_instead_of_hanging(monkeypatch):
+    """The deadline on Gate, which is the only thing standing between a broken
+    guarantee and a CI job that reports "cancelled" with nothing in it.
+
+    Putting a raise into the memory sync's fallback found this: five tests here
+    wait for a stubbed model call that the handler had already given up before
+    reaching, and a bare Event.wait() waits for it forever.
+    """
+    monkeypatch.setattr(Gate, "START_TIMEOUT", 0.01)
+    gate = Gate()
+
+    with pytest.raises(AssertionError) as raised:
+        await gate.wait_until_started()
+
+    assert "gave up before it got there" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_the_profile_pass_reads_the_page_before_it_learns(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    """A background job must not be able to write a hand edit back out.
+
+    He rewords a fact on the page; then an entry is saved and the pass folds what
+    it taught into the profile. Without the pull, the pass would learn against the
+    list as it was, and the push that follows it would put his old wording back.
+    """
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT))
+    key = bot._memory_store().load().profile.facts[0].key
+    pages.put("profile-page", (key, "Его собственная формулировка."))
+
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates("Спит мало."))
+
+    assert profile_texts() == ["Его собственная формулировка.", "Спит мало."]
+    assert pages.texts("profile-page") == ["Его собственная формулировка.", "Спит мало."]
+
+
+@pytest.mark.asyncio
+async def test_a_fact_marked_wrong_leaves_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT)
+    )
+    note = notes(fake_bot, buttons_id)[-1]
+    fact_id = fact_buttons(note)[0].rsplit(":", 1)[-1]
+
+    await bot.fact_callback(
+        callback_update(fake_bot, f"fact:drop:{fact_id}", note.message_id), context
+    )
+
+    assert pages.texts("profile-page") == []
+
+
+@pytest.mark.asyncio
+async def test_a_fact_reworded_on_the_page_is_the_same_fact_after_a_correction(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    """He rewords one fact in Notion, then presses «неверно» on another.
+
+    The press reads the page before it changes anything, so his wording is
+    adopted and the push that follows writes it back rather than over it. The
+    dropped fact is addressed by the id the note showed — a reworded bullet that
+    had come back as a new fact would have left that id addressing nothing.
+    """
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT), creates("Спит мало.")
+    )
+    note = notes(fake_bot, buttons_id)[-1]
+    wrong_id = fact_buttons(note)[-1].rsplit(":", 1)[-1]
+    reworded, dropped = bot._memory_store().load().profile.facts
+    pages.put(
+        "profile-page", (reworded.key, "Совсем другими словами."), (dropped.key, dropped.text)
+    )
+
+    await bot.fact_callback(
+        callback_update(fake_bot, f"fact:drop:{wrong_id}", note.message_id), context
+    )
+
+    assert [(f.id, f.text) for f in bot._memory_store().load().profile.facts] == [
+        (reworded.id, "Совсем другими словами.")
+    ]
+    assert pages.texts("profile-page") == ["Совсем другими словами."]
