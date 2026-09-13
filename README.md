@@ -139,6 +139,46 @@ behaviour is changed by talking to it instead of by editing a file.
 
 `/rules` prints the current list, numbered with the same ids the model uses.
 
+### What it learns about you
+
+Every saved entry is also read a second time, in the background, against what the
+bot already knows about you — and what it learns is added to a profile that grows
+one entry at a time. Nothing is asked of you: there is no command, and the entry
+reaches Notion whether or not this succeeds.
+
+What it keeps is the durable half: traits and habitual reactions, values and
+fears, patterns that repeat, the people who matter, work and money and big goals,
+body and routine, skills, and the phase of life you are in. Not what you ate, not
+one day's mood. A single episode is noise; the pattern behind it is not.
+
+When an entry teaches it something, it says so under the saved preview:
+
+```
+🧠 Память обновлена
+About you:
++ [12] Откладывает трудные разговоры, пока они не решаются сами.
+− Не любит звонить по телефону.
+```
+
+A reworded fact shows as both lines. **An entry that taught it nothing says
+nothing** — which is most entries.
+
+Under the note, two buttons per fact:
+
+| Button | What it does |
+|---|---|
+| ✗ **неверно** | Forget that fact. It goes to the tombstones, not to nothing. |
+| ✎ **поправить** | Reply with better wording; the fact keeps its id and its history. |
+
+Both are addressed by id rather than by position, so a button pressed twice, or
+pressed on a fact that has since gone, says so and changes nothing.
+
+A failed extraction is always a no-op: an empty answer, a truncated one, a
+timeout, a provider outage — the profile is left exactly as it was and the next
+entry offers the same facts again. The one thing that is never risked is a fact
+you corrected by hand: if the profile changed while an extraction was in flight,
+that extraction is dropped rather than written.
+
 ### Making it yours
 
 The personas committed to this repository are neutral defaults, written to be
@@ -236,7 +276,7 @@ for the provider in use:
 | `FORMATTER_MODEL`    | `gpt-4o-mini`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
 | `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
 | `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | The coach, at high effort         |
-| `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Not read yet — reserved for the coach |
+| `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Learning about you from a saved entry, at low effort |
 
 ### Connecting Notion integration to your database
 
@@ -706,7 +746,8 @@ noter/
 │       ├── store.py        # The memory file: atomic writes, tolerant loads
 │       ├── prompts.py      # The three personas, and the self-editing rules
 │       ├── threads.py      # Conversations, in a file that outlives a deploy
-│       └── conversation.py # One coach turn: ask, answer, update the rules
+│       ├── conversation.py # One coach turn: ask, answer, update the rules
+│       └── profile.py     # What a saved entry taught it about its author
 ├── Makefile                # Dev and deploy commands
 ├── requirements.txt
 └── .env.example
