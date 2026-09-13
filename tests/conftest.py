@@ -8,9 +8,20 @@ module is imported.
 ``setdefault`` is used throughout: test modules that set the same variables
 themselves — so they can be run standalone — are unaffected, and a real value
 already in the environment always wins.
+
+The second half of the file keeps the suite offline. Nothing here talks to a real
+API, and it should not be able to start doing so by accident — which became
+possible when a coach answer started asking Notion for the memory pages before it
+answers. A test that has not mocked the transport then reaches it; what happens is
+not a failure, because the sync falls back to the file on purpose, it is a pile of
+connection attempts and retry sleeps, and on a machine with a route out it is a
+request to Notion carrying whatever token the environment happens to hold.
 """
 
 import os
+
+import httpx
+import pytest
 
 DUMMY_ENV = {
     "TELEGRAM_TOKEN": "test-token",
@@ -23,3 +34,43 @@ DUMMY_ENV = {
 
 for _name, _value in DUMMY_ENV.items():
     os.environ.setdefault(_name, _value)
+
+
+# Loopback is still allowed: one test in tests/test_notion_http.py deliberately
+# points the client at a local socket that never answers, to prove the read
+# timeout is enforced. Nothing that leaves this machine is.
+LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+_REAL_ASYNC_SEND = httpx.AsyncHTTPTransport.handle_async_request
+_REAL_SYNC_SEND = httpx.HTTPTransport.handle_request
+
+
+class NetworkUsedInATest(RuntimeError):
+    """A test reached a real socket. Mock at the boundary instead."""
+
+
+def _refuse(request):
+    raise NetworkUsedInATest(
+        f"a test tried to send a real request to {request.url}. Mock at the boundary — "
+        f"httpx.MockTransport, or patch the function that makes the call."
+    )
+
+
+def _guarded_async_send(self, request):
+    if request.url.host in LOOPBACK:
+        return _REAL_ASYNC_SEND(self, request)
+    return _refuse(request)
+
+
+def _guarded_sync_send(self, request):
+    if request.url.host in LOOPBACK:
+        return _REAL_SYNC_SEND(self, request)
+    return _refuse(request)
+
+
+@pytest.fixture(autouse=True)
+def _offline(monkeypatch):
+    """Replaces httpx's real transports. ``httpx.MockTransport`` does not use them,
+    so every test that already mocks at the boundary is unaffected."""
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _guarded_async_send)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _guarded_sync_send)
