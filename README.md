@@ -180,6 +180,26 @@ entry offers the same facts again. The one thing that is never risked is a fact
 you corrected by hand: if the profile changed while an extraction was in flight,
 that extraction is dropped rather than written.
 
+### Making it yours
+
+The personas committed to this repository are neutral defaults, written to be
+usable by someone who has just cloned it. The ones actually in use come from the
+environment, so they stay off GitHub:
+
+| Variable | Replaces |
+|---|---|
+| `COACH_PROMPT_ROAST` | the 🔥 Разъёб persona |
+| `COACH_PROMPT_BREAKDOWN` | the 🧭 Разбор persona |
+| `COACH_PROMPT_SUPPORT` | the 🫂 Поддержка persona |
+
+Each replaces its persona paragraph entirely. The shared rules about the shape of
+an answer — a few sentences, one paragraph, no markdown, no question at the end —
+and the protocol for editing the rules list are added whatever you write, so a
+custom persona only has to describe who is answering.
+
+Leave one unset to keep the committed default. `COACH_MODEL` picks the model;
+it wants a reasoning-grade one, and it is called at high effort.
+
 ### Rebuilding it from a diary that came first
 
 The profile only grows from entries saved after this feature shipped, so it knows
@@ -230,26 +250,6 @@ wrong it says nothing at all and puts the reason in the log.
 
 The default is midday Sunday, well clear of the 21:00 recaps, so that the week's
 report and the week's question are not read as one message.
-
-### Making it yours
-
-The personas committed to this repository are neutral defaults, written to be
-usable by someone who has just cloned it. The ones actually in use come from the
-environment, so they stay off GitHub:
-
-| Variable | Replaces |
-|---|---|
-| `COACH_PROMPT_ROAST` | the 🔥 Разъёб persona |
-| `COACH_PROMPT_BREAKDOWN` | the 🧭 Разбор persona |
-| `COACH_PROMPT_SUPPORT` | the 🫂 Поддержка persona |
-
-Each replaces its persona paragraph entirely. The shared rules about the shape of
-an answer — a few sentences, one paragraph, no markdown, no question at the end —
-and the protocol for editing the rules list are added whatever you write, so a
-custom persona only has to describe who is answering.
-
-Leave one unset to keep the committed default. `COACH_MODEL` picks the model;
-it wants a reasoning-grade one, and it is called at high effort.
 
 ## Daily summary
 

@@ -175,6 +175,11 @@ class _Settings:
     # The transcription endpoint rejects uploads above 25 MB.
     max_audio_mb: float = float(os.getenv("MAX_AUDIO_MB", "25"))
 
+    # Notion HTTP behaviour.
+    notion_timeout: float = float(os.getenv("NOTION_TIMEOUT_SECONDS", "30"))
+    notion_max_retries: int = int(os.getenv("NOTION_MAX_RETRIES", "3"))
+    notion_retry_base_delay: float = float(os.getenv("NOTION_RETRY_BASE_DELAY", "1"))
+
     # The coach's weekly session: once a week it reads the week and the profile
     # and writes first, unprompted. Off is a supported configuration — it is one
     # model call and one message a week that nobody asked for in the moment, and
@@ -185,11 +190,6 @@ class _Settings:
     coach_weekly_day: int = _weekday("COACH_WEEKLY_DAY", "sunday")
     coach_weekly_hour: int = _bounded_int("COACH_WEEKLY_HOUR", 12, 0, 23)
     coach_weekly_minute: int = _bounded_int("COACH_WEEKLY_MINUTE", 0, 0, 59)
-
-    # Notion HTTP behaviour.
-    notion_timeout: float = float(os.getenv("NOTION_TIMEOUT_SECONDS", "30"))
-    notion_max_retries: int = int(os.getenv("NOTION_MAX_RETRIES", "3"))
-    notion_retry_base_delay: float = float(os.getenv("NOTION_RETRY_BASE_DELAY", "1"))
 
     @property
     def day_start_hour(self) -> int:
