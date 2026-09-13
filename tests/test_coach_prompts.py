@@ -321,3 +321,23 @@ def test_the_owner_never_sees_the_marker_whatever_shape_it_arrived_in(answer):
     assert prompts.RULES_MARKER not in visible
     assert "```" not in visible
     assert visible == ANSWER
+
+
+def test_a_reply_wrapped_entirely_in_a_fence_loses_both_backticks():
+    """The trailing fence is the common case; a model can open one at the top too.
+
+    The fenced-block test above only ever exercises the closing fence, because a
+    fence opened before the marker leaves its backticks at the *end* of the
+    visible half. This is the other end of the same strip.
+    """
+    visible, ops = prompts.split_rules_update(f"```\n{ANSWER}\n```")
+
+    assert visible == ANSWER
+    assert "`" not in visible
+    assert ops is None
+
+
+def test_a_language_tagged_opening_fence_goes_too():
+    visible, _ = prompts.split_rules_update(f"```markdown\n{ANSWER}\n```")
+
+    assert visible == ANSWER
