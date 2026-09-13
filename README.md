@@ -358,7 +358,7 @@ for the provider in use:
 | Variable             | OpenAI default   | Anthropic default | Used for                          |
 |----------------------|------------------|-------------------|-----------------------------------|
 | `TRANSCRIPTION_MODEL`| `gpt-transcribe` | `gpt-transcribe`  | Voice message → text, always OpenAI |
-| `FORMATTER_MODEL`    | `gpt-4o-mini`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
+| `FORMATTER_MODEL`    | `gpt-6-astra`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
 | `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
 | `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | The coach, at high effort         |
 | `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Learning about you from a saved entry, at low effort |

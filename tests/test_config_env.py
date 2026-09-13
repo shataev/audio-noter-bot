@@ -209,14 +209,20 @@ def test_the_chat_models_default_to_claude_under_the_anthropic_provider(tmp_path
     assert result.stdout.strip() == "('claude-opus-5', 'claude-opus-5', 'claude-opus-5')"
 
 
-def test_the_chat_models_default_to_the_cheap_openai_ones(tmp_path):
-    """Formatting and summarising are mechanical; only the coach reasons."""
+def test_the_openai_defaults_pay_for_the_formatter_and_not_the_summary(tmp_path):
+    """The formatter's job is mechanical in shape but the constraint is the job.
+
+    gpt-4o-mini does not hold "do not rewrite this" on a dictated entry — it
+    compresses, and the author loses words. Summarising has no such constraint
+    and stays on the cheap model. The deployed environment sets neither variable,
+    so these defaults are what actually run.
+    """
     result = _import_and_print(
         "(config.settings.formatter_model, config.settings.summary_model)", _env(), tmp_path
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "('gpt-4o-mini', 'gpt-4o-mini')"
+    assert result.stdout.strip() == "('gpt-6-astra', 'gpt-4o-mini')"
 
 
 def test_an_explicit_model_wins_over_the_provider_default(tmp_path):

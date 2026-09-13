@@ -51,13 +51,18 @@ async def test_the_formatter_model_comes_from_configuration(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_formatter_model_defaults_to_the_one_that_was_hardcoded(monkeypatch):
+async def test_the_formatter_model_defaults_to_the_reasoning_grade_one(monkeypatch):
+    """The role moved off gpt-4o-mini, which did not hold the no-rewriting rule.
+
+    The deployed environment sets no FORMATTER_MODEL, so this default is what
+    actually runs on the server.
+    """
     calls, create = _recorder(json.dumps({"title": "З", "text": "Т"}))
     monkeypatch.setattr(formatter.client.chat.completions, "create", create, raising=False)
 
     await formatter.format_entry("сырая расшифровка")
 
-    assert calls[0]["model"] == "gpt-4o-mini"
+    assert calls[0]["model"] == "gpt-6-astra"
 
 
 def _stub_day(monkeypatch, blocks):
