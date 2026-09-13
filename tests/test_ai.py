@@ -23,6 +23,7 @@ os.environ.setdefault("NOTION_DATABASE_ID", "test-db")
 os.environ.setdefault("ALLOWED_USER_ID", "1")
 os.environ.setdefault("TIMEZONE", "Europe/Moscow")
 
+import logging
 import types
 
 import pytest
@@ -260,6 +261,44 @@ async def test_a_family_matches_a_whole_name_and_not_a_bare_prefix(model):
     await client.complete(model=model, effort="high", **ASK)
 
     assert "reasoning_effort" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_dropping_an_effort_says_so_in_the_log(caplog):
+    """The failure this fixes was silent, so the fix has to make a sound.
+
+    Named model included: "the profile stopped growing" is not something anyone
+    diagnoses without knowing which model was asked.
+    """
+    client, calls = _openai_client()
+
+    with caplog.at_level(logging.INFO, logger="services.ai"):
+        await client.complete(model="gpt-7-astra", effort="low", **ASK)
+
+    assert "reasoning_effort" not in calls[0]
+    lines = [record.getMessage() for record in caplog.records if record.name == "services.ai"]
+    assert len(lines) == 1
+    assert "gpt-7-astra" in lines[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [("gpt-4o-mini", None), ("gpt-5", "high")],
+)
+async def test_nothing_is_logged_unless_an_effort_is_actually_dropped(model, effort, caplog):
+    """Two ordinary paths, neither of them worth a line.
+
+    gpt-4o-mini formats every entry this bot saves and asks for no effort at
+    all; gpt-5 asks for one and gets it. A line for either would be the noise
+    that buries the line above.
+    """
+    client, _ = _openai_client()
+
+    with caplog.at_level(logging.INFO, logger="services.ai"):
+        await client.complete(model=model, effort=effort, **ASK)
+
+    assert [record for record in caplog.records if record.name == "services.ai"] == []
 
 
 @pytest.mark.asyncio
