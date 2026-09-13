@@ -26,6 +26,10 @@ never been written is empty for a reason that has nothing to do with intent — 
 The file stays the source of truth for *availability*: Notion being down, slow or
 strange costs a sync and nothing else, and every caller here carries on with what
 it read locally. The page is the source of truth for *intent*.
+
+Pulls are throttled, because a conversation's follow-up turns would otherwise ask
+Notion once a turn. A caller that is about to *change* a list forces the pull
+instead: a throttled copy is fine to answer from and not fine to write back over.
 """
 
 import asyncio
@@ -41,10 +45,13 @@ logger = logging.getLogger(__name__)
 
 # How long a pull is reused for. A coach conversation asks for the rules on every
 # follow-up turn, and a reply typed ten seconds after the last one does not need
-# Notion asked again — the owner cannot have edited the page and sent the reply in
-# between, and if he did, the turn after this one picks it up. Tens of seconds is
-# the whole fix: long enough to collapse a burst of turns into one read, short
-# enough that an edit made while thinking about the next question is in by then.
+# Notion asked again. Tens of seconds is the whole fix for that burst.
+#
+# It is only the right default where the caller is *reading*. A caller that is
+# about to rewrite a list and mirror it back passes force=True, because accepting
+# a copy from up to this long ago would let it write over an edit made by hand in
+# between — see the two forced pulls in bot.py. What that leaves unclosed is the
+# span of one model call, which is not something a window can help with.
 PULL_INTERVAL_SECONDS = 45.0
 
 # How long a *failed* sync is left alone for. Longer than the interval above by a

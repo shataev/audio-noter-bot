@@ -1440,7 +1440,12 @@ async def _learn_from_entry(
     this pass found will be offered again by the next entry.
     """
     try:
-        profile = (await _memory_sync().pull()).profile
+        # Forced rather than throttled. This pass is about to rewrite the list and
+        # mirror it back, so reading a copy from up to a window ago would let a
+        # background job put his own wording back on the page — and unlike a
+        # conversation's follow-up turns, saves are minutes apart, so there is no
+        # burst here for the window to collapse.
+        profile = (await _memory_sync().pull(force=True)).profile
     except Exception:
         logger.exception("Could not read the profile; this entry teaches nothing")
         return
@@ -1540,7 +1545,9 @@ async def _apply_profile_op(op: dict) -> coach_memory.ApplyResult | None:
     that fact different words.
     """
     try:
-        await _memory_sync().pull()
+        # Forced, for the same reason the pass above is: a press is about to
+        # change the list, and a press is a human action, not a burst.
+        await _memory_sync().pull(force=True)
         async with _store_lock():
             stored = _memory_store().load()
             applied = coach_memory.apply_ops(

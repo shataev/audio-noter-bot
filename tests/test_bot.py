@@ -2913,18 +2913,24 @@ def pages(monkeypatch):
     return FakePages().install(monkeypatch)
 
 
+# Deliberately not one of the examples the committed prompt already gives — the
+# protocol section names «не начинай с приветствия» in full, and a test looking
+# for that string passes whether or not the rule was ever read.
+RULE_FROM_THE_PAGE = "никогда не упоминай понедельник"
+
+
 @pytest.mark.asyncio
 async def test_a_rule_written_on_the_page_by_hand_reaches_the_next_prompt(
     tmp_path, monkeypatch, fake_bot, context, coach_state, pages
 ):
     """The point of the whole branch: he edits the page, the bot obeys it."""
-    pages.put("rules-page", ("r1", "не начинай с приветствия"))
+    pages.put("rules-page", ("r1", RULE_FROM_THE_PAGE))
     buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
     chat = stub_coach(monkeypatch)
 
     await _press_coach(fake_bot, context, buttons_id)
 
-    assert "не начинай с приветствия" in chat.calls[0]["system"]
+    assert f"[1] {RULE_FROM_THE_PAGE}" in chat.calls[0]["system"]
 
 
 @pytest.mark.asyncio
@@ -3035,6 +3041,26 @@ async def test_what_a_saved_entry_taught_reaches_the_page(
 
 
 @pytest.mark.asyncio
+async def test_the_profile_pass_reads_the_page_before_it_learns(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    """A background job must not be able to write a hand edit back out.
+
+    He rewords a fact on the page; then an entry is saved and the pass folds what
+    it taught into the profile. Without the pull, the pass would learn against the
+    list as it was, and the push that follows it would put his old wording back.
+    """
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT))
+    key = bot._memory_store().load().profile.facts[0].key
+    pages.put("profile-page", (key, "Его собственная формулировка."))
+
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates("Спит мало."))
+
+    assert profile_texts() == ["Его собственная формулировка.", "Спит мало."]
+    assert pages.texts("profile-page") == ["Его собственная формулировка.", "Спит мало."]
+
+
+@pytest.mark.asyncio
 async def test_a_fact_marked_wrong_leaves_the_page(
     tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
 ):
@@ -3055,22 +3081,28 @@ async def test_a_fact_marked_wrong_leaves_the_page(
 async def test_a_fact_reworded_on_the_page_is_the_same_fact_after_a_correction(
     tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
 ):
-    """He rewords it in Notion, then presses «неверно» on the note in the chat.
+    """He rewords one fact in Notion, then presses «неверно» on another.
 
-    The button carries the id the note showed. If the reworded bullet had come
-    back as a new fact, that id would address nothing and the press would say so.
+    The press reads the page before it changes anything, so his wording is
+    adopted and the push that follows writes it back rather than over it. The
+    dropped fact is addressed by the id the note showed — a reworded bullet that
+    had come back as a new fact would have left that id addressing nothing.
     """
     buttons_id, _ = await _save_and_learn(
-        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT)
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT), creates("Спит мало.")
     )
     note = notes(fake_bot, buttons_id)[-1]
-    fact_id = fact_buttons(note)[0].rsplit(":", 1)[-1]
-    key = bot._memory_store().load().profile.facts[0].key
-    pages.put("profile-page", (key, "Совсем другими словами."))
-
-    await bot.fact_callback(
-        callback_update(fake_bot, f"fact:drop:{fact_id}", note.message_id), context
+    wrong_id = fact_buttons(note)[-1].rsplit(":", 1)[-1]
+    reworded, dropped = bot._memory_store().load().profile.facts
+    pages.put(
+        "profile-page", (reworded.key, "Совсем другими словами."), (dropped.key, dropped.text)
     )
 
-    assert bot._memory_store().load().profile.facts == ()
-    assert pages.texts("profile-page") == []
+    await bot.fact_callback(
+        callback_update(fake_bot, f"fact:drop:{wrong_id}", note.message_id), context
+    )
+
+    assert [(f.id, f.text) for f in bot._memory_store().load().profile.facts] == [
+        (reworded.id, "Совсем другими словами.")
+    ]
+    assert pages.texts("profile-page") == ["Совсем другими словами."]

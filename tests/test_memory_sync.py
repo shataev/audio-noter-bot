@@ -496,8 +496,14 @@ async def test_a_list_far_longer_than_one_page_of_blocks_survives_a_round_trip(s
 
 @pytest.mark.asyncio
 async def test_a_fact_with_no_key_to_record_keeps_the_one_it_had(store, pages, clock, monkeypatch):
-    """An append whose answer did not name every block it made is not a reason to forget."""
-    store.save(StoreData(profile=listed(fact("1", "первое", key="b1"), fact("2", "второе"))))
+    """An append whose answer did not name every block it made is not a reason to forget.
+
+    The second fact already knows which block it is. Fewer ids coming back than
+    lines going out says nothing about that block, so it keeps the one it has.
+    """
+    store.save(
+        StoreData(profile=listed(fact("1", "первое", key="b1"), fact("2", "второе", key="b2")))
+    )
 
     async def short(page_id, texts):
         return ["b1"]
@@ -505,7 +511,7 @@ async def test_a_fact_with_no_key_to_record_keeps_the_one_it_had(store, pages, c
     monkeypatch.setattr(notion, "write_bullets", short)
     data = await make_sync(store, clock).push()
 
-    assert [f.key for f in data.profile.facts] == ["b1", None]
+    assert [f.key for f in data.profile.facts] == ["b1", "b2"]
 
 
 def test_replacing_a_key_leaves_everything_else_alone():

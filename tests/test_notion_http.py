@@ -249,3 +249,43 @@ async def test_a_stalled_connection_fails_within_the_configured_timeout(monkeypa
     assert elapsed < 2, f"the 0.5s timeout was not enforced; the call took {elapsed:.1f}s"
     assert isinstance(raised.value, RuntimeError), "callers catching RuntimeError still see it"
     assert "ReadTimeout" in str(raised.value)
+
+
+# --------------------------------------------------------------------------- #
+# The suite's own guard against reaching a real socket
+#
+# tests/conftest.py replaces httpx's two real transports, because a coach answer
+# now asks Notion for the memory pages before it answers and a test that has not
+# mocked the boundary would otherwise send a request carrying whatever token the
+# environment holds. The guard is load-bearing, so it is tested rather than
+# trusted — including the loopback exception, which the timeout test above needs.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_would_leave_this_machine_is_refused():
+    from conftest import NetworkUsedInATest
+
+    async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport()) as client:
+        with pytest.raises(NetworkUsedInATest):
+            await client.get("https://api.notion.com/v1/users")
+
+
+@pytest.mark.asyncio
+async def test_loopback_is_still_allowed():
+    """One test in this file needs a local socket that accepts and says nothing."""
+
+    async def never_answer(reader, writer):
+        writer.close()
+
+    server = await asyncio.start_server(never_answer, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport()) as client:
+            with pytest.raises(httpx.HTTPError) as raised:
+                await client.get(f"http://127.0.0.1:{port}/")
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert "NetworkUsedInATest" not in type(raised.value).__name__
