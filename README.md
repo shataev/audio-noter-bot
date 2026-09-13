@@ -38,6 +38,7 @@ After the voice message is processed, the bot sends four messages in sequence:
 [ ✎ Title ]  [ ✎ Text ]  [ ✎ Tags ]
 [           📅 Today             ]
 [      Mark as Highlight ⭐       ]
+[    ✨ Formatted · show raw     ]
 [            ✓ Save              ]
 [           ✕ Cancel             ]
 ```
@@ -86,6 +87,28 @@ dictating at 23:58 and saving at 00:01 does not move the entry to the next day.
 evening when you write up something you forgot on Sunday. The chosen day is
 marked with a dot; **← Back** closes the picker without changing anything.
 Anything older than a week is rare enough to be worth editing in Notion itself.
+
+### Your own words
+
+The formatter is allowed to fix recognition errors, punctuation and paragraphs,
+and forbidden to remove or rephrase anything. It does not always obey, and the
+two guards below catch the worst of it — but both of them are the bot deciding,
+and you are the one who knows what you said.
+
+**✨ Formatted · show raw** swaps the text for the transcription exactly as it
+came out of the transcriber, and **🎙 Raw · show formatted** swaps it back. The
+label names the text that is on screen, so you can tell the two apart without
+reading them. Whichever one is on screen when you press **✓ Save** is what
+reaches Notion — there is no hidden preference and nothing to set.
+
+Only the text moves. The title is invented by the model in either case, the tags
+are the words you named yourself, and the date was decided when the draft was
+made; none of the three is what the formatter was trusted with.
+
+There is no button when there is nothing to swap to — a long entry is never
+formatted in the first place, so its text is already your own. And if you edit
+the text by hand, the edit is kept on the side you made it on: toggling away and
+back returns your edit, not the version it replaced.
 
 ### Highlights
 

@@ -3747,3 +3747,477 @@ async def test_the_conversation_of_an_earlier_draft_is_not_the_next_ones_to_end(
 
 async def _saved_quietly(title, text, tags, day=None):
     return True
+
+
+# --------------------------------------------------------------------------- #
+# One button that gives the author his own words back
+#
+# The formatter is forbidden to remove or rephrase anything and does not always
+# obey. Two guards already exist for that and both of them are the bot deciding:
+# a long entry is never formatted, and a short one that came back materially
+# shorter is refused. This is the one that is not — the raw transcription is one
+# press away whether or not a guard fired, and whatever is on screen when Save is
+# pressed is what reaches Notion.
+#
+# What must not move is everything else. The title is invented by the model in
+# either case, the tags are the words the author named himself, and the date was
+# fixed when the draft was made: none of the three is what the formatter was
+# trusted with, so none of them is what this button touches.
+# --------------------------------------------------------------------------- #
+
+
+def _toggle_label(fake_bot, buttons_id):
+    """The label on the text toggle, or None when the keyboard draws no toggle."""
+    markup = fake_bot.find(buttons_id).reply_markup
+    for row in markup.inline_keyboard:
+        for button in row:
+            if button.callback_data == "toggle_raw":
+                return button.text
+    return None
+
+
+async def _press_raw(fake_bot, context):
+    return await bot.toggle_raw_callback(
+        callback_update(fake_bot, "toggle_raw", context.user_data["buttons_msg_id"]), context
+    )
+
+
+def _on_screen(fake_bot, context):
+    return fake_bot.find(context.user_data["text_msg_id"]).text
+
+
+async def _formatted_draft(tmp_path, monkeypatch, fake_bot, context):
+    """The ordinary case: the formatter behaved, so the draft opens on its text."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+    )
+    return context.user_data["buttons_msg_id"]
+
+
+async def _guarded_draft(tmp_path, monkeypatch, fake_bot, context):
+    """The guard fired, so the draft opens holding the transcription instead."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+    return context.user_data["buttons_msg_id"]
+
+
+async def _unformatted_draft(tmp_path, monkeypatch, fake_bot, context):
+    """The long path: the formatter is asked for a title and tags and hands the
+    transcription back byte for byte, so there is only ever one text."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=DICTATED
+    )
+    return context.user_data["buttons_msg_id"]
+
+
+# ---- the button, and where it sits ---------------------------------------- #
+
+
+def test_the_toggle_sits_above_save_and_is_one_button_not_two():
+    rows = [
+        [button.callback_data for button in row]
+        for row in bot._preview_keyboard(both_texts=True).inline_keyboard
+    ]
+
+    assert rows.count(["toggle_raw"]) == 1
+    assert rows.index(["toggle_raw"]) + 1 == rows.index(["save"])
+
+
+def test_the_label_names_the_text_that_is_on_screen():
+    """Without it the author cannot tell the two apart at a glance: a formatter
+    that behaved differs from the transcription only by punctuation."""
+    formatted = bot._preview_keyboard(both_texts=True, showing_raw=False)
+    raw = bot._preview_keyboard(both_texts=True, showing_raw=True)
+
+    labels = [b.text for row in formatted.inline_keyboard for b in row]
+    assert bot.SHOWING_FORMATTED_LABEL in labels
+    assert bot.SHOWING_RAW_LABEL not in labels
+
+    labels = [b.text for row in raw.inline_keyboard for b in row]
+    assert bot.SHOWING_RAW_LABEL in labels
+    assert bot.SHOWING_FORMATTED_LABEL not in labels
+
+
+@pytest.mark.asyncio
+async def test_a_formatted_draft_opens_on_the_formatted_side_and_offers_the_raw_one(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    assert context.user_data["pending"]["text"] == PUNCTUATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_FORMATTED_LABEL
+
+
+# ---- pressing it ----------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_pressing_it_puts_the_transcription_on_screen(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    state = await _press_raw(fake_bot, context)
+
+    assert state == bot.PREVIEW
+    assert _on_screen(fake_bot, context) == DICTATED
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_RAW_LABEL
+
+
+@pytest.mark.asyncio
+async def test_pressing_it_again_swaps_back(tmp_path, monkeypatch, fake_bot, context):
+    """One button that toggles, not two that each do half of it."""
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    await _press_raw(fake_bot, context)
+    await _press_raw(fake_bot, context)
+
+    assert _on_screen(fake_bot, context) == PUNCTUATED
+    assert context.user_data["pending"]["text"] == PUNCTUATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_FORMATTED_LABEL
+
+
+@pytest.mark.asyncio
+async def test_only_the_text_moves(tmp_path, monkeypatch, fake_bot, context):
+    """The title is invented either way, the tags are the author's own words, and
+    the date was fixed when the draft was made. None of them is the formatter's
+    to have got wrong, so none of them is this button's to put right."""
+    await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    before = {
+        k: v for k, v in context.user_data["pending"].items() if k in ("title", "tags", "date")
+    }
+    title_on_screen = fake_bot.find(context.user_data["title_msg_id"]).text
+    tags_on_screen = fake_bot.find(context.user_data["tags_msg_id"]).text
+
+    await _press_raw(fake_bot, context)
+
+    after = {
+        k: v for k, v in context.user_data["pending"].items() if k in ("title", "tags", "date")
+    }
+    assert after == before
+    assert fake_bot.find(context.user_data["title_msg_id"]).text == title_on_screen
+    assert fake_bot.find(context.user_data["tags_msg_id"]).text == tags_on_screen
+
+
+@pytest.mark.asyncio
+async def test_the_highlight_star_survives_the_swap(tmp_path, monkeypatch, fake_bot, context):
+    """The two toggles share a keyboard and neither may reset the other."""
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await bot.toggle_highlight_callback(
+        callback_update(fake_bot, "toggle_highlight", buttons_id), context
+    )
+
+    await _press_raw(fake_bot, context)
+
+    assert context.user_data["pending"]["title"].startswith("⭐ ")
+    labels = [b.text for row in fake_bot.find(buttons_id).reply_markup.inline_keyboard for b in row]
+    assert "⭐ Highlighted" in labels
+    assert bot.SHOWING_RAW_LABEL in labels
+
+
+@pytest.mark.asyncio
+async def test_the_choice_survives_a_redraw_from_another_button(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Every other button rebuilds the whole keyboard. One that rebuilt it from
+    the highlight alone would quietly move the label back to the formatted side
+    while the transcription was still the text on screen."""
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _press_raw(fake_bot, context)
+
+    await bot.edit_tags_callback(callback_update(fake_bot, "edit_tags", buttons_id), context)
+    await bot.receive_new_tags(text_update(fake_bot, "sport, health"), context)
+
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_RAW_LABEL
+
+
+@pytest.mark.asyncio
+async def test_closing_the_date_picker_does_not_move_the_choice(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _press_raw(fake_bot, context)
+
+    await bot.date_open_callback(callback_update(fake_bot, "date_open", buttons_id), context)
+    await bot.date_back_callback(callback_update(fake_bot, "date_back", buttons_id), context)
+
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_RAW_LABEL
+
+
+# ---- what Save writes ------------------------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_save_writes_the_transcription_when_that_is_what_is_on_screen(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _press_raw(fake_bot, context)
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert no_network[0][1] == DICTATED
+
+
+@pytest.mark.asyncio
+async def test_save_writes_the_formatted_text_when_it_has_been_swapped_back(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
+    """The other side of the same rule. There is no hidden preference: the button
+    is the whole of the setting, and the last press is what counts."""
+    buttons_id = await _guarded_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _press_raw(fake_bot, context)
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert no_network[0][1] == COMPRESSED
+
+
+@pytest.mark.asyncio
+async def test_a_failed_save_puts_the_keyboard_back_on_the_side_it_was_on(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Notion is down, the draft stays, and Save can be pressed again — against
+    the same text the author chose, not the one the bot preferred."""
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _press_raw(fake_bot, context)
+
+    async def refuses(title, text, tags, day=None):
+        raise NotionError("nope")
+
+    monkeypatch.setattr(bot, "save_entry", refuses)
+    state = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_RAW_LABEL
+
+
+# ---- across a restart ------------------------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_the_transcription_survives_a_restart_mid_draft(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """`make deploy` restarts the bot on every push, and the draft is pickled.
+    A transcription held in memory beside the draft rather than inside it would
+    be gone after a deploy that landed on an open preview, and there is no second
+    copy of it anywhere — not in Notion, not in the chat, not in the log."""
+    import pickle
+
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    # A fresh process: only what PicklePersistence wrote to the file comes back.
+    revived = FakeContext(fake_bot)
+    revived.user_data = pickle.loads(pickle.dumps(context.user_data))
+
+    state = await _press_raw(fake_bot, revived)
+
+    assert state == bot.PREVIEW
+    assert revived.user_data["pending"]["text"] == DICTATED
+    assert _on_screen(fake_bot, revived) == DICTATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_RAW_LABEL
+
+
+@pytest.mark.asyncio
+async def test_a_toggle_for_a_draft_that_is_gone_does_not_raise(fake_bot, context):
+    """The state the bot comes back in when the file did not survive: live
+    buttons, no user_data."""
+    buttons = await fake_bot.send_message(
+        1, "Actions:", reply_markup=bot._preview_keyboard(both_texts=True)
+    )
+
+    state = await bot.toggle_raw_callback(
+        callback_update(fake_bot, "toggle_raw", buttons.message_id), context
+    )
+
+    assert state == bot.ConversationHandler.END
+    assert fake_bot.find(buttons.message_id).text == bot.DRAFT_GONE
+    assert fake_bot.find(buttons.message_id).reply_markup is None
+
+
+# ---- an entry that was never formatted ------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_no_button_when_there_is_nothing_to_swap_to(tmp_path, monkeypatch, fake_bot, context):
+    """Above the length limit the formatter is asked for a title and tags only
+    and hands the transcription back untouched. The text is already the author's,
+    and a button that did nothing would be worse than no button."""
+    buttons_id = await _unformatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert _toggle_label(fake_bot, buttons_id) is None
+
+
+@pytest.mark.asyncio
+async def test_a_press_with_nothing_to_swap_to_changes_nothing(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Reachable from a keyboard drawn before a hand edit collapsed the two texts
+    into one. It says so and leaves the draft alone."""
+    await _unformatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    state = await _press_raw(fake_bot, context)
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert fake_bot.answered[-1] == bot.NOTHING_TO_SWAP
+
+
+# ---- when the guard already chose ------------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_a_guarded_draft_opens_on_the_raw_side_and_offers_the_formatted_one(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The author must be able to see what the formatter made of it even when the
+    bot refused it: he is allowed to disagree with the guard."""
+    buttons_id = await _guarded_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_RAW_LABEL
+
+    await _press_raw(fake_bot, context)
+
+    assert _on_screen(fake_bot, context) == COMPRESSED
+    assert context.user_data["pending"]["text"] == COMPRESSED
+    assert _toggle_label(fake_bot, buttons_id) == bot.SHOWING_FORMATTED_LABEL
+
+
+@pytest.mark.asyncio
+async def test_the_notice_goes_once_the_author_has_answered_it_himself(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """It is in the present tense and says the text on screen is unformatted.
+    Leaving it above the formatted text would make the preview contradict itself;
+    from here on the button is what says which of the two is on screen."""
+    await _guarded_draft(tmp_path, monkeypatch, fake_bot, context)
+    notice_id = context.user_data["unformatted_msg_id"]
+
+    await _press_raw(fake_bot, context)
+
+    assert notice_id in fake_bot.deleted
+    assert context.user_data["unformatted_msg_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_cancelling_after_the_notice_went_does_not_delete_it_twice(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Cancel deletes every message of the preview by id, and the notice's is now
+    None. A None in that list is skipped, not sent to the API as a message id."""
+    buttons_id = await _guarded_draft(tmp_path, monkeypatch, fake_bot, context)
+    notice_id = context.user_data["unformatted_msg_id"]
+    await _press_raw(fake_bot, context)
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert fake_bot.deleted.count(notice_id) == 1
+    assert None not in fake_bot.deleted
+
+
+# ---- hand edits ------------------------------------------------------------ #
+
+EDITED = "Правленый рукой текст, ни на что не похожий."
+
+
+async def _edit_text_by_hand(fake_bot, context, buttons_id, new_text):
+    await bot.edit_text_callback(callback_update(fake_bot, "edit_text", buttons_id), context)
+    return await bot.receive_new_text(text_update(fake_bot, new_text), context)
+
+
+@pytest.mark.asyncio
+async def test_a_hand_edit_is_not_discarded_by_a_toggle(tmp_path, monkeypatch, fake_bot, context):
+    """The decision: an edit belongs to the side it was made on. Swapping away
+    shows the other text, and swapping back returns the edit rather than the
+    version it replaced. Nothing the author typed is ever thrown away."""
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _edit_text_by_hand(fake_bot, context, buttons_id, EDITED)
+
+    await _press_raw(fake_bot, context)
+    assert context.user_data["pending"]["text"] == DICTATED
+
+    await _press_raw(fake_bot, context)
+    assert context.user_data["pending"]["text"] == EDITED
+    assert _on_screen(fake_bot, context) == EDITED
+
+
+@pytest.mark.asyncio
+async def test_an_edit_made_on_the_raw_side_stays_on_the_raw_side(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The same rule from the other end: correcting a word the transcriber got
+    wrong must not be undone by looking at the formatted version."""
+    buttons_id = await _guarded_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _edit_text_by_hand(fake_bot, context, buttons_id, EDITED)
+
+    await _press_raw(fake_bot, context)
+    assert context.user_data["pending"]["text"] == COMPRESSED
+
+    await _press_raw(fake_bot, context)
+    assert context.user_data["pending"]["text"] == EDITED
+
+
+@pytest.mark.asyncio
+async def test_a_hand_edit_saves_as_itself(tmp_path, monkeypatch, fake_bot, context, no_network):
+    """Whatever is on screen is what reaches Notion, typed text included."""
+    buttons_id = await _formatted_draft(tmp_path, monkeypatch, fake_bot, context)
+    await _edit_text_by_hand(fake_bot, context, buttons_id, EDITED)
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert no_network[0][1] == EDITED
+
+
+@pytest.mark.asyncio
+async def test_editing_an_entry_that_was_never_formatted_conjures_no_button(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """There was one text before the edit and there is one text after it. Writing
+    the edit into one of the two halves would leave the transcription looking
+    like a second version and put a button on a preview that must not have one."""
+    buttons_id = await _unformatted_draft(tmp_path, monkeypatch, fake_bot, context)
+
+    await _edit_text_by_hand(fake_bot, context, buttons_id, EDITED)
+
+    assert context.user_data["pending"]["text"] == EDITED
+    assert _toggle_label(fake_bot, buttons_id) is None
+
+
+# ---- wired up on both sides ------------------------------------------------ #
+
+
+def test_the_toggle_is_handled_inside_the_preview(tmp_path, monkeypatch):
+    """A drawn button that nothing routes is worse than the one it replaced: the
+    press is answered by nobody and Telegram leaves it spinning."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    conv = _conversation_handler(bot.build_application())
+
+    handler = next(
+        h
+        for h in conv.states[bot.PREVIEW]
+        if getattr(h, "callback", None) is bot.toggle_raw_callback
+    )
+
+    assert handler.pattern.match("toggle_raw")
+    assert not handler.pattern.match("toggle_highlight")
+
+
+def test_a_stale_toggle_press_is_caught_by_the_fallback_handler(tmp_path, monkeypatch):
+    """A preview left in the chat by an older process still draws the button."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    app = bot.build_application()
+
+    stale = next(
+        h
+        for h in app.handlers[0]
+        if isinstance(h, bot.CallbackQueryHandler) and h.callback is bot._draft_missing
+    )
+
+    assert stale.pattern.match("toggle_raw")
