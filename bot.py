@@ -39,6 +39,7 @@ from services.coach import prompts as coach_prompts
 from services.coach import threads as coach_threads
 from services.coach.store import MemoryStore
 from services.formatter import format_entry
+from services.memory_sync import MemorySync
 from services.notion import day_label, diary_today, save_entry
 from services.summary import generate_daily_summary, generate_weekly_report
 from services.whisper import merge_keywords, transcribe
@@ -986,6 +987,38 @@ def _store_lock() -> asyncio.Lock:
     return lock
 
 
+# The mirror onto the two Notion pages the owner reads and edits. Per loop and
+# per path for the same two reasons the lock above is — it holds that lock, and a
+# test that points STATE_DIRECTORY somewhere else wants its own — and kept rather
+# than rebuilt because the page ids it found and the moment it last read them are
+# the whole of the throttle.
+_syncs: "weakref.WeakKeyDictionary[object, tuple[str, MemorySync]]" = weakref.WeakKeyDictionary()
+
+
+def _memory_sync() -> MemorySync:
+    loop = asyncio.get_running_loop()
+    cached = _syncs.get(loop)
+    path = coach_memory_path()
+    if cached is None or cached[0] != path:
+        cached = (path, MemorySync(_memory_store(), lock=_store_lock()))
+        _syncs[loop] = cached
+    return cached[1]
+
+
+async def _mirror_memory() -> None:
+    """Put the stored lists on their pages. Never the reason a caller fails.
+
+    Every call site has already done the thing that mattered — the rule is
+    written, the profile is saved, the entry is in Notion — and a mirror that did
+    not run costs the owner a page that is a few minutes behind, which the next
+    change or the next pull corrects.
+    """
+    try:
+        await _memory_sync().push()
+    except Exception:
+        logger.warning("Could not mirror the coach's memory onto Notion", exc_info=True)
+
+
 # The conversations, read from their file once and kept in step on every write.
 # Keyed by the path they were read from, so that pointing STATE_DIRECTORY
 # somewhere else — which is what a test does — reads that directory rather than
@@ -1146,7 +1179,10 @@ async def _run_coach(
 
     previous = list(thread.turns) if thread is not None else []
     try:
-        stored = _memory_store().load()
+        # The rules as the owner last left them, which may be as he left them on
+        # the Notion page rather than as the bot wrote them. Throttled, so the
+        # fifth reply in a conversation does not ask Notion again.
+        stored = await _memory_sync().pull()
         answer = await coach.answer(
             mode=mode,
             rules=stored.rules,
@@ -1172,6 +1208,10 @@ async def _run_coach(
                 _memory_store().save(replace(_memory_store().load(), rules=answer.rules))
         except Exception:
             logger.exception("Could not write the coach's rules")
+        else:
+            # Outside the lock: the mirror takes the same one, and an asyncio
+            # lock is not reentrant.
+            await _mirror_memory()
 
     if not answer.text:
         logger.warning("The coach answered with no visible text")
@@ -1311,7 +1351,10 @@ async def handle_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     rule the owner is looking at.
     """
     try:
-        rules = _memory_store().load().rules.facts
+        # Forced rather than throttled: this command is the owner asking what the
+        # bot believes right now, and he may have edited the page a moment ago.
+        # A read that fails falls back to the file inside `pull`.
+        rules = (await _memory_sync().pull(force=True)).rules.facts
     except Exception:
         logger.exception("Could not read the coach's rules")
         await update.effective_message.reply_text(RULES_UNAVAILABLE)
@@ -1397,7 +1440,7 @@ async def _learn_from_entry(
     this pass found will be offered again by the next entry.
     """
     try:
-        profile = _memory_store().load().profile
+        profile = (await _memory_sync().pull()).profile
     except Exception:
         logger.exception("Could not read the profile; this entry teaches nothing")
         return
@@ -1427,6 +1470,7 @@ async def _learn_from_entry(
         logger.exception("Could not write the profile; this entry teaches nothing")
         return
 
+    await _mirror_memory()
     await _post_memory_note(
         context,
         chat_id=chat_id,
@@ -1490,8 +1534,13 @@ async def _apply_profile_op(op: dict) -> coach_memory.ApplyResult | None:
     Under the same lock as everything else that writes this file, and reading
     inside it: the owner pressing a button while a pass from the entry he saved
     a moment ago is still running is the ordinary case, not the exotic one.
+
+    The pull comes first and outside the lock, because the id in the button is an
+    id the owner is looking at in the chat, and the page may meanwhile have given
+    that fact different words.
     """
     try:
+        await _memory_sync().pull()
         async with _store_lock():
             stored = _memory_store().load()
             applied = coach_memory.apply_ops(
@@ -1502,10 +1551,12 @@ async def _apply_profile_op(op: dict) -> coach_memory.ApplyResult | None:
                 # see `fact_callback` for why this is the second press.
                 return applied
             _memory_store().save(replace(stored, profile=applied.items))
-            return applied
     except Exception:
         logger.exception("Could not change the profile by hand")
         return None
+
+    await _mirror_memory()
+    return applied
 
 
 def _without_fact(markup: InlineKeyboardMarkup | None, fact_id: str) -> InlineKeyboardMarkup | None:

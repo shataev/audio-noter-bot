@@ -30,12 +30,13 @@ for _name, _value in DUMMY_ENV.items():
 import asyncio  # noqa: E402
 from dataclasses import replace  # noqa: E402
 
+from notion_pages_fake import FakePages  # noqa: E402
+
 from services import memory_sync, notion  # noqa: E402
 from services.coach import memory  # noqa: E402
 from services.coach.store import MemoryStore, StoreData  # noqa: E402
 
 OLD = "2026-01-02T03:04:05+00:00"
-PARENT = "parent-page"
 
 
 def fact(id, text, *, key=None, kind="trait", sources=()):
@@ -48,83 +49,6 @@ def listed(*facts, next_id=None):
     return memory.MemoryList(
         facts=tuple(facts), next_id=next_id if next_id is not None else len(facts) + 1
     )
-
-
-class FakePages:
-    """The two pages, and a record of what was asked of them.
-
-    ``write_bullets`` reconciles positionally and mints an id for anything new,
-    which is what the real one does — the ids it hands back are the whole reason
-    push exists, so a fake that returned nothing would hide the bug it is here to
-    catch.
-    """
-
-    def __init__(self):
-        self.bullets = {"profile-page": [], "rules-page": []}
-        self.reads = 0
-        self.writes = 0
-        self.lookups = 0
-        self.created = []
-        self.exists = {
-            notion.MEMORY_PROFILE_TITLE: "profile-page",
-            notion.MEMORY_RULES_TITLE: "rules-page",
-        }
-        self.fails = None
-        self._next = 0
-
-    def install(self, monkeypatch):
-        monkeypatch.setattr(notion, "memory_parent_page_id", self.parent)
-        monkeypatch.setattr(notion, "find_child_page", self.find)
-        monkeypatch.setattr(notion, "create_child_page", self.create)
-        monkeypatch.setattr(notion, "read_bullets", self.read)
-        monkeypatch.setattr(notion, "write_bullets", self.write)
-        return self
-
-    def put(self, page, *pairs):
-        self.bullets[page] = [notion.Bullet(id=key, text=text) for key, text in pairs]
-
-    def texts(self, page):
-        return [bullet.text for bullet in self.bullets[page]]
-
-    def _raise(self):
-        if self.fails is not None:
-            raise self.fails
-
-    async def parent(self):
-        self._raise()
-        self.lookups += 1
-        return PARENT
-
-    async def find(self, parent, title):
-        self._raise()
-        return self.exists.get(title)
-
-    async def create(self, parent, title):
-        self._raise()
-        page_id = f"new-{title}"
-        self.exists[title] = page_id
-        self.bullets[page_id] = []
-        self.created.append(title)
-        return page_id
-
-    async def read(self, page_id):
-        self._raise()
-        self.reads += 1
-        return list(self.bullets[page_id])
-
-    async def write(self, page_id, texts):
-        self._raise()
-        self.writes += 1
-        existing = self.bullets[page_id]
-        kept = []
-        for index, text in enumerate(texts):
-            if index < len(existing):
-                kept.append(notion.Bullet(id=existing[index].id, text=text))
-            else:
-                self._next += 1
-                kept.append(notion.Bullet(id=f"new-block-{self._next}", text=text))
-        self.bullets[page_id] = kept
-        return [bullet.id for bullet in kept]
 
 
 class CountingStore(MemoryStore):

@@ -21,12 +21,14 @@ from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree
 
 import pytest
+from notion_pages_fake import FakePages
 from telegram import CallbackQuery, Chat, Message, Update, User, Voice
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 import bot
 from services.ai import Completion
+from services.notion import NotionError
 
 # --------------------------------------------------------------------------- #
 # A stub Telegram, standing in for the Bot API.
@@ -2893,3 +2895,182 @@ def test_the_conversations_are_read_from_the_directory_in_force(tmp_path, monkey
 
     assert bot._load_threads().threads == (), "a different directory is a different file"
     assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, 101)) is None
+
+
+# --------------------------------------------------------------------------- #
+# The two memory pages
+#
+# The wiring, not the mirror itself: that has its own tests in
+# tests/test_memory_sync.py. What is checked here is that the handlers ask before
+# they answer, write after they change something, and carry on when Notion will
+# not — which is the only one of the three that costs the owner anything if it
+# goes wrong.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def pages(monkeypatch):
+    return FakePages().install(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_a_rule_written_on_the_page_by_hand_reaches_the_next_prompt(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """The point of the whole branch: he edits the page, the bot obeys it."""
+    pages.put("rules-page", ("r1", "не начинай с приветствия"))
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert "не начинай с приветствия" in chat.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_a_rule_the_answer_wrote_reaches_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert pages.texts("rules-page") == ["короче"]
+    assert bot._memory_store().load().rules.facts[0].key == "new-block-1", (
+        "the block id is recorded, or his first rewording of it arrives as a stranger"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_wrote_no_rule_does_not_write_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """Almost every answer. It reads, and that is all it should cost."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert pages.writes == 0
+
+
+@pytest.mark.asyncio
+async def test_the_coach_still_answers_when_notion_will_not(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """A page that cannot be read is worth a log line, never an answer."""
+    pages.fails = NotionError("Notion GET /blocks/rules-page/children failed")
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch)
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert coach_messages(fake_bot, buttons_id)[-1].text == COACH_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_a_rule_written_while_notion_is_down_is_still_stored(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    """The file is the source of truth for availability. The page catches up later."""
+    pages.fails = NotionError("Notion GET /blocks/rules-page/children failed")
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert [f.text for f in bot._memory_store().load().rules.facts] == ["короче"]
+
+
+@pytest.mark.asyncio
+async def test_rules_prints_what_the_page_says(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+    key = bot._memory_store().load().rules.facts[0].key
+    pages.put("rules-page", (key, "отвечай короче"))
+
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    printed = fake_bot.sent[-1].text
+    assert "[1] отвечай короче" in printed, "his wording, under the id the model uses"
+
+
+@pytest.mark.asyncio
+async def test_rules_falls_back_to_the_file_when_notion_is_unreachable(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, pages
+):
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=COACH_ANSWER + '\n<<<RULES>>>{"ops": [{"action": "create", "text": "короче"}]}',
+    )
+    await _press_coach(fake_bot, context, buttons_id)
+    pages.fails = NotionError("Notion GET /blocks/rules-page/children failed")
+
+    await bot.handle_rules(text_update(fake_bot, "/rules"), context)
+
+    assert "[1] короче" in fake_bot.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_what_a_saved_entry_taught_reaches_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT))
+
+    assert pages.texts("profile-page") == [LEARNED_FACT]
+
+
+@pytest.mark.asyncio
+async def test_a_fact_marked_wrong_leaves_the_page(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT)
+    )
+    note = notes(fake_bot, buttons_id)[-1]
+    fact_id = fact_buttons(note)[0].rsplit(":", 1)[-1]
+
+    await bot.fact_callback(
+        callback_update(fake_bot, f"fact:drop:{fact_id}", note.message_id), context
+    )
+
+    assert pages.texts("profile-page") == []
+
+
+@pytest.mark.asyncio
+async def test_a_fact_reworded_on_the_page_is_the_same_fact_after_a_correction(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network, pages
+):
+    """He rewords it in Notion, then presses «неверно» on the note in the chat.
+
+    The button carries the id the note showed. If the reworded bullet had come
+    back as a new fact, that id would address nothing and the press would say so.
+    """
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT)
+    )
+    note = notes(fake_bot, buttons_id)[-1]
+    fact_id = fact_buttons(note)[0].rsplit(":", 1)[-1]
+    key = bot._memory_store().load().profile.facts[0].key
+    pages.put("profile-page", (key, "Совсем другими словами."))
+
+    await bot.fact_callback(
+        callback_update(fake_bot, f"fact:drop:{fact_id}", note.message_id), context
+    )
+
+    assert bot._memory_store().load().profile.facts == ()
+    assert pages.texts("profile-page") == []
