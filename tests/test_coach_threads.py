@@ -418,3 +418,97 @@ def test_a_key_is_not_remembered_as_forgotten_twice():
 
     assert pruned.forgotten == (threads.key(1, 101),)
     assert threads.was_forgotten(pruned, threads.key(1, 101))
+
+
+# --------------------------------------------------------------------------- #
+# Ending one on purpose
+#
+# A draft can be discarded, and the conversation the coach opened about it goes
+# with it. That is the same thing pruning does when a bound comes due, asked for
+# rather than waited for — which is why it has to leave the same trace behind.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dropped_conversation_is_gone():
+    items, thread = opened()
+
+    left = threads.drop(items, thread.id)
+
+    assert left.threads == ()
+    assert threads.find(left, threads.key(1, 101)) is None
+
+
+def test_every_door_into_a_dropped_conversation_is_remembered_as_forgotten():
+    """The messages may still be on screen — a delete can fail — and a reply to one
+    of them has to be answered honestly rather than start a blank conversation."""
+    items, thread = threads.start(
+        threads.Threads(),
+        mode="roast",
+        turns=turns("запись", "ответ"),
+        keys=[threads.key(1, 101), threads.key(1, 102)],
+        now=NOW,
+    )
+
+    left = threads.drop(items, thread.id)
+
+    assert threads.was_forgotten(left, threads.key(1, 101))
+    assert threads.was_forgotten(left, threads.key(1, 102))
+
+
+def test_dropping_one_conversation_leaves_the_others_alone():
+    items, first = opened(message_id=101)
+    items, second = opened(items, message_id=201)
+
+    left = threads.drop(items, first.id)
+
+    assert [thread.id for thread in left.threads] == [second.id]
+    assert threads.find(left, threads.key(1, 201)) is not None
+    assert not threads.was_forgotten(left, threads.key(1, 201))
+
+
+def test_dropping_a_conversation_that_is_not_there_changes_nothing():
+    """The caller holds an id it recorded earlier; the file may have pruned it since."""
+    items, _ = opened()
+
+    assert threads.drop(items, "не тот") == items
+
+
+def test_the_id_counter_is_not_lowered_by_a_drop():
+    """An id handed out twice would address two conversations at once."""
+    items, thread = opened()
+
+    left = threads.drop(items, thread.id)
+
+    assert left.next_id == items.next_id
+
+
+def test_a_dropped_conversation_stays_dropped_across_a_restart(store):
+    items, thread = opened()
+    store.save(threads.drop(items, thread.id))
+
+    reloaded = threads.ThreadStore(store.path).load(now=NOW)
+
+    assert reloaded.threads == ()
+    assert threads.was_forgotten(reloaded, threads.key(1, 101))
+
+
+def test_a_conversation_is_found_by_the_id_its_opener_kept():
+    items, thread = opened()
+
+    assert threads.find_by_id(items, thread.id) == thread
+    assert threads.find_by_id(items, "не тот") is None
+
+
+def test_an_address_gives_back_the_message_it_points_at():
+    assert threads.message_of(threads.key(1, 101), 1) == 101
+
+
+def test_an_address_in_another_chat_is_not_a_message_in_this_one():
+    """Deleting message 101 of this chat because thread 101 exists in another
+    would delete something the coach never sent."""
+    assert threads.message_of(threads.key(2, 101), 1) is None
+
+
+def test_an_address_that_is_not_one_gives_back_nothing():
+    assert threads.message_of("1:не число", 1) is None
+    assert threads.message_of("мусор", 1) is None

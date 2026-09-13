@@ -97,6 +97,11 @@ DRAFT_KEYS = (
     # one: a call still in the air when the entry is saved must not leave the
     # next draft's buttons refusing to answer.
     "coach_in_flight",
+    # The conversations opened about this draft, by thread id. They are the
+    # draft's: an answer about an entry that has been discarded is about nothing,
+    # so it is discarded with it. Kept as ids rather than message ids because the
+    # thread is what knows every message it was delivered in.
+    "coach_thread_ids",
 )
 
 # Message ids of previews that were saved, so a press arriving from a client whose view
@@ -354,11 +359,19 @@ def _clear_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 
 async def _retire_preview(bot: Bot, chat_id: int, draft: dict, notice: str) -> bool:
-    """Takes the buttons off a preview that is no longer backed by a draft.
+    """Ends a draft on screen: the coach's messages about it, then the buttons.
 
     Editing the text of the buttons message and passing no markup is what removes the
     keyboard, so the dead buttons disappear rather than sitting there doing nothing.
+
+    This is the one place all three endings meet — the ✕ button and /cancel, a
+    newer recording replacing the preview, and the preview timing out — which is
+    why the coach is wound up here rather than in any of them. What each of them
+    deletes above this call differs on purpose; what a draft ending *means* does
+    not.
     """
+    await _end_coach_conversations(bot, chat_id, draft)
+
     buttons_msg_id = draft.get("buttons_msg_id")
     if buttons_msg_id is None:
         return False
@@ -1133,6 +1146,62 @@ def _save_threads(items: coach_threads.Threads) -> None:
     _thread_cache = (path, items)
 
 
+async def _end_coach_conversations(bot: Bot, chat_id: int, draft: dict) -> None:
+    """Takes the coach's answers about a draft away with the draft.
+
+    Called from `_retire_preview`, which is where all three endings meet. An
+    answer left behind after a cancel discusses an entry that no longer exists,
+    and worse, the thread behind it still holds the keys of its messages: a reply
+    would carry on a conversation about something that was never written.
+
+    A conversation several replies deep still goes. It is the same thread, opened
+    about this draft, and a rule that tried to tell "still about the entry" from
+    "a conversation of its own" would have to guess.
+
+    Nothing in here can stop the cancel. A message the author deleted himself, or
+    one older than the Bot API will delete, is a warning in the log — the draft is
+    discarded either way, exactly as it was before any of this existed.
+    """
+    thread_ids = draft.get("coach_thread_ids") or []
+    if not thread_ids:
+        return
+
+    try:
+        items = _load_threads()
+    except Exception:
+        logger.warning("Could not read the coach conversations to end them", exc_info=True)
+        return
+
+    message_ids: list[int] = []
+    for thread_id in thread_ids:
+        thread = coach_threads.find_by_id(items, thread_id)
+        if thread is None:
+            continue
+        message_ids += [
+            message_id
+            for message_id in (
+                coach_threads.message_of(address, chat_id) for address in thread.keys
+            )
+            if message_id is not None
+        ]
+        items = coach_threads.drop(items, thread_id)
+
+    logger.info(
+        "Ending %d coach conversation(s) with the draft: %d message(s)",
+        len(thread_ids),
+        len(message_ids),
+    )
+    await _delete_messages(bot, chat_id, message_ids)
+
+    # Written even if a delete failed. The keys have moved to `forgotten`, so a
+    # reply to a message still on screen is answered with "I no longer have that
+    # conversation" rather than starting a blank one about a discarded entry.
+    try:
+        _save_threads(items)
+    except Exception:
+        logger.warning("Could not drop the coach conversations of a draft", exc_info=True)
+
+
 def _knows_coach_message(chat_id: int, message_id: int) -> bool:
     """Whether that message is one of the coach's — live conversation or pruned one.
 
@@ -1252,8 +1321,13 @@ async def _run_coach(
     mode: coach_prompts.Mode,
     new_turns: list[coach_threads.Turn],
     thread: coach_threads.Thread | None = None,
-) -> None:
+) -> str | None:
     """One turn of the coach, from the waiting message to the recorded conversation.
+
+    Returns the id of the conversation this turn belongs to, so a caller that has a
+    draft can note that the conversation is the draft's and end it with it. ``None``
+    means there is nothing to note: the turn produced no conversation, or the file
+    it would have been written to could not be written.
 
     The same function for the first press and for the fifth reply: the only
     difference is whether there is already a thread to carry the earlier turns and
@@ -1329,14 +1403,18 @@ async def _run_coach(
     try:
         items = _load_threads()
         if thread is None:
-            items, _ = coach_threads.start(items, mode=mode.key, turns=exchange, keys=keys)
+            items, recorded = coach_threads.start(items, mode=mode.key, turns=exchange, keys=keys)
         else:
-            items, _ = coach_threads.extend(items, thread.id, turns=exchange, keys=keys)
+            items, recorded = coach_threads.extend(
+                items, thread.id, turns=exchange, keys=keys
+            )
         _save_threads(items)
     except Exception:
         # The answer is already on screen. Losing the thread costs the next reply
         # its context, and that is worth a log line, not a message.
         logger.exception("Could not record the coach conversation")
+        return None
+    return recorded.id if recorded is not None else None
 
 
 async def coach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1369,7 +1447,7 @@ async def coach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await query.answer()
     try:
-        await _run_coach(
+        opened = await _run_coach(
             context,
             chat_id=update.effective_chat.id,
             reply_to=query.message.message_id,
@@ -1383,6 +1461,14 @@ async def coach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     finally:
         context.user_data["coach_in_flight"] = False
+
+    # The conversation belongs to this draft, and goes when the draft does. Only
+    # while the draft is still here: a call that was in the air when the author
+    # cancelled has nothing left to belong to, and must not be handed to whatever
+    # draft comes next. A reply into this conversation extends the same thread, so
+    # the id noted here covers the whole of it however long it runs.
+    if opened is not None and context.user_data.get("pending") is not None:
+        context.user_data.setdefault("coach_thread_ids", []).append(opened)
     return PREVIEW
 
 

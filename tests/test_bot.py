@@ -3367,3 +3367,257 @@ async def test_the_words_kept_are_the_ones_that_reach_notion(
     )
 
     assert no_network[0][1] == DICTATED
+
+
+# --------------------------------------------------------------------------- #
+# Reported live — "режим разъёб сработал, но после отмены записи его результат
+# из чата не пропал"
+#
+# The coach's answer is about the draft. When the draft ends, the answer is about
+# an entry that does not exist, and the thread behind it still holds the keys of
+# its messages — so a reply carries on a conversation about something that was
+# never written.
+#
+# There are three endings, not one, and they meet in `_retire_preview`. Each of
+# these tests goes through the handler the author actually reaches rather than
+# calling that helper, because the thing being asserted is that none of the three
+# is the one that was missed.
+# --------------------------------------------------------------------------- #
+
+
+async def _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context, text=COACH_ANSWER):
+    """A preview with one conversation open about it. Returns both message ids."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text=text)
+    await _press_coach(fake_bot, context, buttons_id)
+    answer_id = next(m for m in fake_bot.sent if m.text.startswith(text[:20])).message_id
+    return buttons_id, answer_id
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_button_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The reported defect, by the path it was reported on."""
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == (), "and no thread left pointing at it"
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_command_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    _, answer_id = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_a_newer_recording_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The replaced preview is a discarded draft too, whatever it says on screen."""
+    _, answer_id = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Другой", "другое тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == ()
+    assert context.user_data["pending"]["title"] == "Другой", "the new draft is fine"
+    assert context.user_data.get("coach_thread_ids") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_preview_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    _, answer_id = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    await bot.handle_preview_timeout(text_update(fake_bot, "whatever"), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_every_message_of_a_long_answer_goes(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A long answer is several messages, and the thread knows all of them.
+
+    Deleting only the first would leave the rest of it on screen discussing an
+    entry that was never written — the defect, three quarters unfixed.
+    """
+    long_answer = "\n\n".join(["абзац " * 200] * 4)
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text=long_answer)
+    await _press_coach(fake_bot, context, buttons_id)
+    delivered = [m.message_id for m in coach_messages(fake_bot, buttons_id)]
+    assert len(delivered) > 1, "the fixture has to actually produce several messages"
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert set(delivered) <= set(fake_bot.deleted)
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_several_replies_deep_goes_with_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """It is still the conversation about that entry, however far it has run.
+
+    Telling "still about the entry" from "a conversation of its own" would be a
+    guess, and the wrong guess leaves exactly the defect that was reported.
+    """
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+    stub_coach(monkeypatch, text="Потому что ты ждёшь разрешения.")
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+    second_id = next(
+        m for m in fake_bot.sent if m.text == "Потому что ты ждёшь разрешения."
+    ).message_id
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert {answer_id, second_id} <= set(fake_bot.deleted)
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_every_mode_pressed_on_one_draft_goes_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Each press opens its own conversation, and all of them are the draft's."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text="Разъёб.")
+    await _press_coach(fake_bot, context, buttons_id, mode="roast")
+    stub_coach(monkeypatch, text="Разбор.")
+    await _press_coach(fake_bot, context, buttons_id, mode="breakdown")
+    answers = [m.message_id for m in fake_bot.sent if m.text in ("Разъёб.", "Разбор.")]
+    assert len(answers) == 2
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert set(answers) <= set(fake_bot.deleted)
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_a_reply_after_the_cancel_does_not_start_a_blank_conversation(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A delete can fail and the message can still be on screen. Replying to it
+    has to behave like a reply to any conversation that is gone: honest, and no
+    model call made without the context it belongs to."""
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert bot._knows_coach_message(fake_bot.chat_id, answer_id), (
+        "the filter still has to claim it, or a voice reply becomes a diary entry"
+    )
+    chat = stub_coach(monkeypatch)
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+
+    assert fake_bot.sent[-1].text == bot.COACH_FORGOTTEN
+    assert chat.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_delete_that_fails_still_discards_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The author may have deleted it himself, or it may be too old for the Bot
+    API. Either way the draft is discarded, exactly as it was before this."""
+    buttons_id, _ = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    async def refuse(chat_id, message_id, **kwargs):
+        raise BadRequest("message can't be deleted")
+
+    monkeypatch.setattr(fake_bot, "delete_message", refuse)
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert bot._load_threads().threads == (), "and the thread goes even so"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_conversation_file_still_discards_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id, _ = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+    monkeypatch.setattr(bot, "_thread_cache", None)
+    (coach_state / bot.COACH_THREADS_FILE_NAME).write_text("не json", encoding="utf-8")
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_saving_keeps_the_coachs_answer(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The other half of the fix. The entry exists, so the conversation about it
+    still means something — and a reply must go on reaching it."""
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert answer_id not in fake_bot.deleted
+    assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, answer_id))
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_with_no_conversation_does_not_touch_the_file(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Almost every draft is cancelled without the coach ever being pressed."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert not (coach_state / bot.COACH_THREADS_FILE_NAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_the_conversation_of_an_earlier_draft_is_not_the_next_ones_to_end(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Saving leaves the conversation live. Cancelling the next draft must not
+    take it: it belongs to an entry that is in Notion."""
+    first_buttons, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+    monkeypatch.setattr(bot, "save_entry", _saved_quietly)
+    await bot.save_callback(callback_update(fake_bot, "save", first_buttons), context)
+
+    second_buttons = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", second_buttons), context)
+
+    assert answer_id not in fake_bot.deleted
+    assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, answer_id))
+
+
+async def _saved_quietly(title, text, tags, day=None):
+    return True

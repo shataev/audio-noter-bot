@@ -103,9 +103,33 @@ def key(chat_id: int, message_id: int) -> str:
     return f"{chat_id}:{message_id}"
 
 
+def message_of(address: str, chat_id: int) -> int | None:
+    """The message an address points at in that chat, or ``None`` for another chat.
+
+    The inverse of :func:`key`, and here rather than at the caller so the shape of
+    an address stays knowledge this module keeps to itself.
+    """
+    prefix = f"{chat_id}:"
+    if not address.startswith(prefix):
+        return None
+    try:
+        return int(address[len(prefix) :])
+    except ValueError:
+        return None
+
+
 def find(items: Threads, address: str) -> Thread | None:
     """The conversation that message belongs to, or ``None``."""
     return next((thread for thread in items.threads if address in thread.keys), None)
+
+
+def find_by_id(items: Threads, thread_id: str) -> Thread | None:
+    """The conversation with that id, or ``None``.
+
+    Addressing by id rather than by one of its keys is what a caller holding a
+    conversation it opened earlier has: the keys are the doors, the id is the room.
+    """
+    return next((thread for thread in items.threads if thread.id == thread_id), None)
 
 
 def was_forgotten(items: Threads, address: str) -> bool:
@@ -171,6 +195,31 @@ def prune(items: Threads, *, now: datetime | None = None) -> Threads:
 
     return Threads(
         threads=trimmed,
+        forgotten=_forget(items.forgotten, dropped),
+        next_id=items.next_id,
+    )
+
+
+def drop(items: Threads, thread_id: str) -> Threads:
+    """End a conversation for good, remembering that its messages were the coach's.
+
+    What :func:`prune` does when a bound comes due, done on purpose: the thread
+    goes and its keys move to ``forgotten``. Moving them is the whole point — the
+    messages themselves may still be on screen, or may have failed to delete, and
+    a reply to one of them has to be answered honestly rather than taken for the
+    first message of a new conversation with no context behind it.
+
+    Dropping a conversation that is not there changes nothing, so a caller does
+    not have to check first.
+    """
+    kept = tuple(thread for thread in items.threads if thread.id != thread_id)
+    if len(kept) == len(items.threads):
+        logger.info("coach threads: nothing to drop for thread %s", thread_id)
+        return items
+
+    dropped = [thread for thread in items.threads if thread.id == thread_id]
+    return Threads(
+        threads=kept,
         forgotten=_forget(items.forgotten, dropped),
         next_id=items.next_id,
     )
