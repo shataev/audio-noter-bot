@@ -3314,20 +3314,11 @@ async def test_one_character_past_the_tenth_is_refused(tmp_path, monkeypatch, fa
 async def test_the_shortfall_is_logged_as_numbers_and_not_as_the_entry(
     tmp_path, monkeypatch, fake_bot, context, caplog
 ):
-    """The journal on the server is readable by the deploy account.
-
-    `handle_voice` already logs the transcription once, which is its own problem
-    and not this one's — so the test is that the guard added no second copy, not
-    that the word appears nowhere.
-    """
+    """The journal on the server is readable by the deploy account."""
     with caplog.at_level("DEBUG", logger="bot"):
         await _voice_formatted_as(
             monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
         )
-
-    carrying = [r for r in caplog.records if "пробежку" in r.getMessage()]
-    assert len(carrying) == 1, "only the transcription line that was already there"
-    assert carrying[0].getMessage().startswith("Transcription:")
 
     (warned,) = [r for r in caplog.records if r.levelname == "WARNING"]
     said = warned.getMessage()
@@ -3336,6 +3327,111 @@ async def test_the_shortfall_is_logged_as_numbers_and_not_as_the_entry(
     assert f"{kept.ratio:.2f}" in said
     assert "пробежку" not in said
     assert COMPRESSED not in said
+
+
+@pytest.mark.asyncio
+async def test_a_reply_the_formatter_kept_whole_is_logged_too(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """A line that only appears when something is wrong cannot tell a quiet day
+    from a logger that has stopped working. The question the log answers is "did
+    the formatter get the whole thing", and "yes" is an answer to it."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+        )
+
+    said = [r.getMessage() for r in caplog.records if "spoken characters" in r.getMessage()]
+    assert len(said) == 1
+    assert "1.00" in said[0]
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+# --------------------------------------------------------------------------- #
+# The transcription log
+#
+# `handle_voice` used to write the whole entry into the journal on every voice
+# message. The journal on the server is readable by the deploy account, and
+# CLAUDE.md forbids exactly this everywhere under services/coach/ — bot.py
+# predates that rule rather than disagreeing with it.
+#
+# Same shape as `test_no_fact_text_ever_reaches_the_log` in the coach tests: a
+# distinctive sentence, every handler listening, and the assertion that it is
+# nowhere in what was written.
+# --------------------------------------------------------------------------- #
+
+SECRET_ENTRY = (
+    "сегодня я говорил с врачом про две тысячи одиннадцатый год и про то что до сих пор снится"
+)
+
+
+@pytest.mark.asyncio
+async def test_no_entry_text_ever_reaches_the_log(tmp_path, monkeypatch, fake_bot, context, caplog):
+    """A diary is not something to put in a journal the deploy account can read."""
+    with caplog.at_level("DEBUG"):
+        await _voice_formatted_as(
+            monkeypatch,
+            tmp_path,
+            fake_bot,
+            context,
+            dictated=SECRET_ENTRY,
+            formatted=SECRET_ENTRY + ".",
+        )
+
+    assert SECRET_ENTRY not in caplog.text
+    assert "врачом" not in caplog.text
+    assert "снится" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_entry_does_not_reach_the_log_when_it_is_kept_raw_either(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """The path that puts the transcription into the draft is the one that most
+    obviously has it to hand."""
+    with caplog.at_level("DEBUG"):
+        await _voice_formatted_as(
+            monkeypatch,
+            tmp_path,
+            fake_bot,
+            context,
+            dictated=SECRET_ENTRY,
+            formatted="Поговорил с врачом.",
+        )
+
+    assert context.user_data["pending"]["text"] == SECRET_ENTRY, "the guard fired, as intended"
+    assert SECRET_ENTRY not in caplog.text
+    assert "снится" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_transcription_that_produced_nothing_is_still_diagnosable(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """Deleting the line would have been the easy fix and the wrong one: a silent
+    path is how the next defect hides."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated="", formatted=""
+        )
+
+    (said,) = [r.getMessage() for r in caplog.records if "Transcribed" in r.getMessage()]
+    assert "0 characters" in said
+
+
+@pytest.mark.asyncio
+async def test_the_length_of_the_transcription_is_still_logged(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """What the line is for — "did the formatter get the whole thing" — needs the
+    number, and the guard's line beside it is the other half of that answer."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+        )
+
+    (said,) = [r.getMessage() for r in caplog.records if "Transcribed" in r.getMessage()]
+    assert f"{len(DICTATED)} characters" in said
 
 
 @pytest.mark.asyncio

@@ -575,7 +575,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if transcription is None:
         return on_failure
 
-    logger.info("Transcription: %s", transcription)
+    # The length, not the words. This line used to carry the whole entry into the
+    # journal on every voice message, and the journal on the server is readable by
+    # the deploy account — the same rule the coach package has been held to since
+    # it was written, which this predates rather than disagrees with.
+    #
+    # Nothing diagnostic is lost. What the line is for is answering "did the
+    # formatter get the whole thing", and the one below answers that properly:
+    # this says how much was said, that says how much came back. A voice message
+    # that transcribed to nothing still says so here, which is the failure that
+    # most needs a line of its own.
+    logger.info("Transcribed a voice message: %d characters", len(transcription))
 
     try:
         await message.reply_text("Formatting...")
@@ -593,10 +603,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # to show for it — there is no copy of the transcription anywhere else.
     kept = measure_kept(transcription, text)
     unformatted = kept.too_little
+    # Lengths and the ratio, never the text — the same rule as the line above, and
+    # the other half of the same story: how much was said, then how much came back.
+    # Logged either way, because "the formatter returned all of it" is the answer
+    # to the question just as often as the other one, and a line that only appears
+    # when something is wrong cannot tell a quiet day from a broken logger.
     if unformatted:
-        # Lengths and the ratio, never the text. What a diagnosis needs is how
-        # much came back, and the journal on the server is readable by the deploy
-        # account, so a diary entry has no business in it.
         logger.warning(
             "The formatter returned %d of %d spoken characters (%.2f), below %.2f: "
             "keeping the raw transcription",
@@ -606,6 +618,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             MIN_KEPT,
         )
         text = transcription
+    else:
+        logger.info(
+            "The formatter returned %d of %d spoken characters (%.2f)",
+            kept.kept,
+            kept.spoken,
+            kept.ratio,
+        )
 
     try:
         title_msg = await reply_html(message, _title_body(title))
