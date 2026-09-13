@@ -338,7 +338,7 @@ class MemoryStore:
         """
         text = _dumps(data)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        _write_text_atomically(self._path, text)
+        write_text_atomically(self._path, text)
         logger.info(
             "coach store: wrote %d profile fact(s) and %d rule(s) to %s",
             len(data.profile.facts),
@@ -359,7 +359,7 @@ class MemoryStore:
             return None
 
         target = self._path.with_name(f"{self._path.stem}.snapshot-{_safe_label(label)}.json")
-        _write_text_atomically(target, text)
+        write_text_atomically(target, text)
         self._prune_snapshots()
         logger.info("coach store: snapshot written to %s", target)
         return target
@@ -377,8 +377,12 @@ class MemoryStore:
                 logger.warning("coach store: could not remove the old snapshot %s", stale)
 
 
-def _write_text_atomically(path: Path, text: str) -> None:
+def write_text_atomically(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` without ``path`` ever holding a partial document.
+
+    Public, and imported by ``threads.py``: the conversation file wants exactly
+    this guarantee, and a second copy of a routine whose whole value is being
+    subtle in the right way is a second copy to get subtly wrong.
 
     The temporary file is a sibling so that ``os.replace`` stays within one
     filesystem, and is created with mode 0600: these are diary facts, and the
