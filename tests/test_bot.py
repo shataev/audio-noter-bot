@@ -15,6 +15,8 @@ os.environ.setdefault("ALLOWED_USER_ID", "1")
 os.environ.setdefault("TIMEZONE", "Europe/Moscow")
 
 import asyncio
+import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree
 
@@ -130,11 +132,22 @@ class FakeBot:
 
 
 class FakeMessage:
-    def __init__(self, fake_bot, message_id=1, text=None, voice=None, reply_to_message=None):
+    def __init__(
+        self,
+        fake_bot,
+        message_id=1,
+        text=None,
+        voice=None,
+        reply_to_message=None,
+        reply_markup=None,
+    ):
         self._bot = fake_bot
         self.message_id = message_id
         self.text = text
         self.voice = voice
+        # The keyboard the message carries, which a callback handler reads to
+        # rebuild it without the row it has just acted on.
+        self.reply_markup = reply_markup
         self.chat = FakeChat(fake_bot.chat_id)
         # A reply to one of the coach's messages is the only way into a
         # conversation, so the double has to be able to be one.
@@ -183,6 +196,33 @@ class FakeUpdate:
         self.effective_chat = FakeChat(fake_bot.chat_id)
 
 
+class FakeApplication:
+    """Stands in for `Application.create_task`: records the coroutine, runs nothing.
+
+    Running nothing is the point. The profile pass is started by Save and must
+    not be waited on by it, so a test that wants the pass to happen awaits it
+    explicitly — and every test that does not gets to prove, by the entry already
+    being in Notion with the coroutine untouched, that Save did not wait.
+    """
+
+    def __init__(self):
+        self.tasks = []
+
+    def create_task(self, coroutine, update=None, *, name=None):
+        self.tasks.append(coroutine)
+        return coroutine
+
+    async def run_tasks(self):
+        """Run what Save handed over, in the order it was handed over."""
+        while self.tasks:
+            await self.tasks.pop(0)
+
+    def close(self):
+        for coroutine in self.tasks:
+            coroutine.close()
+        self.tasks.clear()
+
+
 class FakeContext:
     def __init__(self, fake_bot):
         self.bot = fake_bot
@@ -192,6 +232,9 @@ class FakeContext:
         # CallbackContext; a double without them hides a missing attribute.
         self.bot_data = {}
         self.args = []
+        # `application` is how a handler starts background work, and the profile
+        # pass is the one thing in this bot that is started and not awaited.
+        self.application = FakeApplication()
 
 
 class FakeFile:
@@ -214,7 +257,11 @@ def fake_bot():
 
 @pytest.fixture
 def context(fake_bot):
-    return FakeContext(fake_bot)
+    made = FakeContext(fake_bot)
+    yield made
+    # Close anything Save started and no test asked for, so an unawaited
+    # coroutine is not reported against whichever test runs next.
+    made.application.close()
 
 
 def voice_update(fake_bot, message_id=1):
@@ -2123,3 +2170,527 @@ async def test_an_in_flight_flag_left_by_a_dead_process_does_not_wedge_the_coach
     assert not context.user_data.get("coach_in_flight")
     assert len(chat.calls) == 1, "the buttons must work again, not be permanently deaf"
     assert COACH_ANSWER in [m.text for m in coach_messages(fake_bot, buttons_id)]
+
+
+# --------------------------------------------------------------------------- #
+# The profile: what a saved entry teaches, and the two buttons that fix it.
+#
+# The model is replaced at the one place it reaches the network, so everything
+# between Save and the note on screen is the real code: the pass, the lock, the
+# store, the note and the callbacks.
+#
+# Two invariants outrank the feature and are asserted wherever they are in reach.
+# Save must never wait on the pass and must never fail because of it — the entry
+# is already in Notion by the time any of this runs. And a fact the owner has
+# corrected must never be overwritten by a pass that was in the air when he
+# corrected it: the facts a pass found come back with the next entry, a
+# correction does not.
+# --------------------------------------------------------------------------- #
+
+LEARNED_FACT = "Откладывает трудные разговоры, пока они не решаются сами."
+SECOND_FACT = "Считает деньги только когда их не хватает."
+
+
+class FakeProfileChat:
+    """Stands in for the chat client at the one point it would reach the network."""
+
+    def __init__(self, *ops, fail=False, text=None, gate=None):
+        self.body = text if text is not None else json.dumps({"ops": list(ops)})
+        self.fail = fail
+        self.gate = gate
+        self.calls = []
+
+    async def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.gate is not None:
+            self.gate.started.set()
+            await self.gate.release.wait()
+        if self.fail:
+            raise RuntimeError("the provider said no")
+        return Completion(text=self.body, finish_reason="stop")
+
+
+def stub_profile(monkeypatch, *ops, **kwargs):
+    chat = FakeProfileChat(*ops, **kwargs)
+    monkeypatch.setattr(bot.coach_profile, "_client", chat)
+    return chat
+
+
+def creates(text, kind="pattern"):
+    return {"action": "create", "text": text, "kind": kind}
+
+
+def stored_profile():
+    return bot._memory_store().load().profile
+
+
+def profile_texts():
+    return [fact.text for fact in stored_profile().facts]
+
+
+async def _save_and_learn(monkeypatch, tmp_path, fake_bot, context, *ops, **kwargs):
+    """A full save, then the background pass it started — in that order, by hand."""
+    chat = stub_profile(monkeypatch, *ops, **kwargs)
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+    await context.application.run_tasks()
+    return buttons_id, chat
+
+
+def notes(fake_bot, since):
+    return [
+        m for m in fake_bot.sent if m.message_id > since and bot.coach_profile.NOTE_HEADER in m.text
+    ]
+
+
+def fact_buttons(message):
+    return [button.callback_data for row in message.reply_markup.inline_keyboard for button in row]
+
+
+# --------------------------------------------------------------------------- #
+# Save comes first, and cannot be hurt by what follows it
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_save_does_not_wait_on_the_profile_pass(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """A model call takes seconds; the entry is already written before it starts."""
+    chat = stub_profile(monkeypatch, creates(LEARNED_FACT))
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    state = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert len(no_network) == 1, "the entry is in Notion"
+    assert fake_bot.find(buttons_id).text == "✓ Saved to Notion"
+    assert chat.calls == [], "Save returned before the extraction had even begun"
+    assert len(context.application.tasks) == 1, "and left it running in the background"
+
+
+@pytest.mark.asyncio
+async def test_save_survives_an_extraction_that_raises(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    buttons_id, _ = await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, fail=True)
+
+    assert len(no_network) == 1
+    assert fake_bot.find(buttons_id).text == "✓ Saved to Notion"
+    assert notes(fake_bot, buttons_id) == []
+    assert not (coach_state / bot.COACH_MEMORY_FILE_NAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_cannot_be_read_costs_the_entry_and_nothing_else(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    (coach_state / bot.COACH_MEMORY_FILE_NAME).write_text("{not json", encoding="utf-8")
+
+    buttons_id, chat = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT)
+    )
+
+    assert len(no_network) == 1
+    assert chat.calls == [], "a profile that could not be read is not one to extract against"
+    assert notes(fake_bot, buttons_id) == []
+    assert (coach_state / bot.COACH_MEMORY_FILE_NAME).read_text(encoding="utf-8") == "{not json"
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_cannot_even_be_started_does_not_break_save(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The last line of the save path must not be the one that breaks it."""
+
+    def refuse(coroutine, update=None, *, name=None):
+        raise RuntimeError("no running event loop")
+
+    stub_profile(monkeypatch, creates(LEARNED_FACT))
+    monkeypatch.setattr(context.application, "create_task", refuse)
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    state = await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert len(no_network) == 1
+    assert fake_bot.find(buttons_id).text == "✓ Saved to Notion"
+
+
+@pytest.mark.asyncio
+async def test_no_pass_is_started_when_the_coach_is_switched_off(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    monkeypatch.setattr(bot.settings, "ai_provider", bot.ANTHROPIC)
+    monkeypatch.setattr(bot.settings, "anthropic_api_key", "")
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert context.application.tasks == []
+    assert len(no_network) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The note
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_an_entry_that_taught_something_says_so_under_the_preview(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    buttons_id, chat = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT)
+    )
+
+    assert profile_texts() == [LEARNED_FACT]
+    note = notes(fake_bot, buttons_id)[-1]
+    assert note.reply_to == buttons_id
+    assert LEARNED_FACT in note.text
+    assert note.parse_mode is None, "a model's sentence must not be handed to a parser"
+    assert chat.calls[0]["model"] == bot.settings.profile_model
+
+
+@pytest.mark.asyncio
+async def test_an_entry_that_taught_nothing_says_nothing(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The common case, and the one a chatty implementation gets wrong."""
+    buttons_id, chat = await _save_and_learn(monkeypatch, tmp_path, fake_bot, context)
+
+    assert len(chat.calls) == 1, "the pass really did run"
+    assert [m for m in fake_bot.sent if m.message_id > buttons_id] == []
+    assert not (coach_state / bot.COACH_MEMORY_FILE_NAME).exists(), "nothing to write either"
+
+
+@pytest.mark.asyncio
+async def test_the_note_counts_what_the_pass_actually_did(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """One reworded fact is a + and a −; one new fact is a +; and that is all."""
+    bot._memory_store().save(
+        replace(
+            bot._memory_store().load(),
+            profile=bot.coach_memory.MemoryList(
+                facts=(
+                    bot.coach_memory.Fact(
+                        id="1",
+                        text="Старая формулировка.",
+                        kind="pattern",
+                        created_at="2026-09-01T10:00:00+00:00",
+                        updated_at="2026-09-01T10:00:00+00:00",
+                    ),
+                ),
+                next_id=2,
+            ),
+        )
+    )
+
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch,
+        tmp_path,
+        fake_bot,
+        context,
+        {"action": "modify", "id": "1", "text": LEARNED_FACT},
+        creates(SECOND_FACT),
+    )
+
+    lines = notes(fake_bot, buttons_id)[-1].text.splitlines()
+    assert lines[0] == bot.coach_profile.NOTE_HEADER
+    assert lines[1] == "About you:"
+    assert sum(line.startswith("+") for line in lines) == 2
+    assert lines.count("− Старая формулировка.") == 1
+    assert f"+ [1] {LEARNED_FACT}" in lines
+
+
+@pytest.mark.asyncio
+async def test_the_entry_it_was_learned_from_is_recorded_on_the_fact(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT))
+
+    assert stored_profile().facts[0].sources == (f"{bot.diary_today().isoformat()} · Заголовок",)
+
+
+@pytest.mark.asyncio
+async def test_the_note_carries_a_button_for_every_fact_that_changed(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT), creates(SECOND_FACT)
+    )
+
+    note = notes(fake_bot, buttons_id)[-1]
+    assert fact_buttons(note) == [
+        "fact:drop:1",
+        "fact:fix:1",
+        "fact:drop:2",
+        "fact:fix:2",
+    ]
+    assert "1" in note.reply_markup.inline_keyboard[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_a_note_does_not_grow_a_keyboard_without_end(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """Telegram stops drawing a keyboard long before it stops accepting one."""
+    many = [creates(f"Факт номер {n}.") for n in range(bot.MAX_CORRECTION_ROWS + 5)]
+
+    buttons_id, _ = await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, *many)
+
+    note = notes(fake_bot, buttons_id)[-1]
+    assert len(stored_profile().facts) == len(many), "every fact is still written"
+    assert len(note.reply_markup.inline_keyboard) == bot.MAX_CORRECTION_ROWS
+
+
+# --------------------------------------------------------------------------- #
+# Two writers, one file
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_pass_is_dropped_when_the_profile_moved_under_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """A correction made while the call was in the air is not coming back.
+
+    The facts this pass found will be offered again by the next entry, so the
+    cheap mistake is to drop them and the expensive one is to overwrite a
+    sentence the owner has just fixed by hand.
+    """
+    gate = Gate()
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_profile(monkeypatch, creates(LEARNED_FACT), gate=gate)
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    pass_task = asyncio.create_task(context.application.run_tasks())
+    await gate.started.wait()
+
+    # The owner corrects something from a note further up the chat, by hand,
+    # while the pass is still waiting on the model.
+    written = await bot._apply_profile_op(creates("Факт, который он вписал сам."))
+    assert written.created, "the hand-made change really did land"
+
+    gate.release.set()
+    await pass_task
+
+    assert profile_texts() == ["Факт, который он вписал сам."]
+    assert notes(fake_bot, buttons_id) == [], "a pass that was dropped has nothing to announce"
+
+
+@pytest.mark.asyncio
+async def test_a_rules_write_does_not_take_the_profile_back_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The coach loads the store before its call and writes after it.
+
+    A profile pass that finishes in between is entirely inside that window, so
+    writing back the document the coach loaded — rather than re-reading it under
+    the lock — silently drops every fact the pass had just written.
+    """
+    gate = Gate()
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(
+        monkeypatch,
+        text=f"Ладно.\n{bot.coach_prompts.RULES_MARKER}"
+        '{"ops": [{"action": "create", "text": "не начинать с приветствия"}]}',
+        gate=gate,
+    )
+
+    press = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
+    await gate.started.wait()
+
+    learned = await bot._apply_profile_op(creates(LEARNED_FACT))
+    assert learned.created, "the profile pass really did write"
+
+    gate.release.set()
+    await press
+
+    stored = bot._memory_store().load()
+    assert [fact.text for fact in stored.profile.facts] == [LEARNED_FACT]
+    assert [fact.text for fact in stored.rules.facts] == ["не начинать с приветствия"]
+
+
+@pytest.mark.asyncio
+async def test_a_write_waits_for_whoever_is_holding_the_store(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Asserted as "it waits", because today it cannot be asserted as "it is safe".
+
+    Every critical section over this file is currently await-free, so on one
+    event loop two of them could not interleave even with the lock taken out —
+    a test that wrote through both and checked the result would pass either way
+    and prove nothing. What is real and is checked here is that a writer which
+    cannot have the lock does not proceed without it, which is what will still
+    hold the day one of these sections grows an await in the middle.
+    """
+    async with bot._store_lock():
+        write = asyncio.create_task(bot._apply_profile_op(creates(LEARNED_FACT)))
+        await asyncio.sleep(0)
+
+        assert not write.done(), "a second writer must not get past a held lock"
+        assert profile_texts() == []
+
+    assert (await write).created
+    assert profile_texts() == [LEARNED_FACT]
+
+
+@pytest.mark.asyncio
+async def test_the_store_lock_is_one_lock(tmp_path, monkeypatch, coach_state):
+    """Two locks over one file are no lock at all."""
+    assert bot._store_lock() is bot._store_lock()
+
+
+# --------------------------------------------------------------------------- #
+# The correction buttons
+# --------------------------------------------------------------------------- #
+
+
+async def _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context):
+    buttons_id, _ = await _save_and_learn(
+        monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT), creates(SECOND_FACT)
+    )
+    return notes(fake_bot, buttons_id)[-1]
+
+
+def _press_fact(fake_bot, note, data):
+    message = FakeMessage(fake_bot, message_id=note.message_id, reply_markup=note.reply_markup)
+    return FakeUpdate(
+        fake_bot, message=message, callback_query=FakeCallbackQuery(fake_bot, data, message)
+    )
+
+
+@pytest.mark.asyncio
+async def test_neverno_removes_exactly_one_fact(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    note = await _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context)
+
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:drop:1"), context)
+
+    assert profile_texts() == [SECOND_FACT]
+    assert fake_bot.answered[-1] == bot.FACT_DROPPED
+    assert fact_buttons(fake_bot.find(note.message_id)) == ["fact:drop:2", "fact:fix:2"]
+
+
+@pytest.mark.asyncio
+async def test_neverno_pressed_twice_is_harmless(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The second press comes from a client whose view has not caught up."""
+    note = await _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context)
+    press = _press_fact(fake_bot, note, "fact:drop:1")
+
+    await bot.fact_callback(press, context)
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:drop:1"), context)
+
+    assert profile_texts() == [SECOND_FACT], "the second press removed nothing else"
+    assert fake_bot.answered[-1] == bot.FACT_GONE
+
+
+@pytest.mark.asyncio
+async def test_popravit_asks_for_the_new_wording_and_applies_it_by_id(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    note = await _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context)
+
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:fix:2"), context)
+    prompt = fake_bot.sent[-1]
+    assert "2" in prompt.text and prompt.reply_to == note.message_id
+
+    reply = _reply_update(fake_bot, to=prompt.message_id, text="Тратит деньги молча.")
+    assert bot.FactEditReplyFilter().filter(reply.effective_message), "the reply has to be routed"
+    await bot.fact_edit_reply(reply, context)
+
+    facts = {fact.id: fact.text for fact in stored_profile().facts}
+    assert facts == {"1": LEARNED_FACT, "2": "Тратит деньги молча."}
+    assert fake_bot.sent[-1].text == bot.FACT_FIXED
+
+
+@pytest.mark.asyncio
+async def test_a_correction_for_a_fact_that_is_already_gone_says_so(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    note = await _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context)
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:fix:1"), context)
+    prompt = fake_bot.sent[-1]
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:drop:1"), context)
+
+    await bot.fact_edit_reply(
+        _reply_update(fake_bot, to=prompt.message_id, text="слишком поздно"), context
+    )
+
+    assert profile_texts() == [SECOND_FACT]
+    assert fake_bot.sent[-1].text == bot.FACT_GONE
+
+
+@pytest.mark.asyncio
+async def test_an_empty_correction_leaves_the_fact_as_it_was(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    note = await _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context)
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:fix:1"), context)
+    prompt = fake_bot.sent[-1]
+
+    await bot.fact_edit_reply(_reply_update(fake_bot, to=prompt.message_id, text="   "), context)
+
+    assert profile_texts() == [LEARNED_FACT, SECOND_FACT]
+    assert fake_bot.sent[-1].text == bot.FACT_EMPTY
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_is_answered_once_and_then_forgotten(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """A second reply to the same prompt must not reach the profile again."""
+    note = await _note_with_two_facts(tmp_path, monkeypatch, fake_bot, context)
+    await bot.fact_callback(_press_fact(fake_bot, note, "fact:fix:1"), context)
+    prompt = fake_bot.sent[-1]
+    await bot.fact_edit_reply(
+        _reply_update(fake_bot, to=prompt.message_id, text="Первая правка."), context
+    )
+
+    late = _reply_update(fake_bot, to=prompt.message_id, text="Вторая правка.")
+
+    assert bot.FactEditReplyFilter().filter(late.effective_message) is False
+    await bot.fact_edit_reply(late, context)
+    assert profile_texts() == ["Первая правка.", SECOND_FACT]
+
+
+def test_a_reply_to_anything_else_is_not_a_correction(fake_bot):
+    """Everything this filter does not match has to reach the handler it always did."""
+    bot._fact_edit_prompts.clear()
+
+    reply = _reply_update(fake_bot, to=4242, text="новый заголовок")
+
+    assert bot.FactEditReplyFilter().filter(reply.effective_message) is False
+
+
+def test_the_correction_reply_handler_is_tried_before_the_conversation(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    handlers = bot.build_application().handlers[0]
+
+    conv_index = next(i for i, h in enumerate(handlers) if isinstance(h, bot.ConversationHandler))
+    reply_index = next(i for i, h in enumerate(handlers) if h.callback is bot.fact_edit_reply)
+
+    assert reply_index < conv_index
+
+
+def test_the_fact_buttons_are_routed_outside_the_conversation(tmp_path, monkeypatch):
+    """A note stays pressable long after the draft it came from has ended."""
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    app = bot.build_application()
+
+    handler = next(
+        h
+        for h in app.handlers[0]
+        if isinstance(h, bot.CallbackQueryHandler) and h.callback is bot.fact_callback
+    )
+
+    assert handler.pattern.match("fact:drop:12")
+    assert handler.pattern.match("fact:fix:12")
+    assert not handler.pattern.match("fact:burn:12")
+    conv = _conversation_handler(app)
+    assert bot.fact_callback not in [h.callback for h in conv.states[bot.PREVIEW]]

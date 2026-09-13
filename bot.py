@@ -1,13 +1,16 @@
+import asyncio
 import html
 import logging
 import os
 import tempfile
+import weakref
 import zoneinfo
 from dataclasses import replace
 from datetime import date, time, timedelta
 
 from telegram import (
     Bot,
+    ForceReply,
     Message,
     ReplyParameters,
     Update,
@@ -30,6 +33,8 @@ from telegram.ext import (
 
 from config import ANTHROPIC, settings
 from services.coach import conversation as coach
+from services.coach import memory as coach_memory
+from services.coach import profile as coach_profile
 from services.coach import prompts as coach_prompts
 from services.coach import threads as coach_threads
 from services.coach.store import MemoryStore
@@ -206,6 +211,28 @@ RULES_EMPTY = (
     "<i>«не начинай с приветствия»</i> — and it writes the rule down itself."
 )
 RULES_UNAVAILABLE = "I couldn't read the rules. It is in the log."
+
+# The note the bot posts when a saved entry taught it something, and the two
+# buttons under it. Both are Russian, like the coach's own messages: what they
+# act on is a sentence the model wrote in Russian about the owner.
+#
+# The id is on every button because it is on every line of the note, so three
+# facts changing at once still leaves each button pointing at a line the owner
+# can read. A press costs one tap; correcting a wrong fact anywhere else costs a
+# trip to another app, which is the same as never.
+FACT_WRONG_LABEL = "✗ неверно {id}"
+FACT_FIX_LABEL = "✎ поправить {id}"
+FACT_DROPPED = "Забыл."
+FACT_GONE = "Этого факта уже нет."
+FACT_FIX_PROMPT = "Пришли новый текст факта {id}:"
+FACT_FIXED = "Поправил."
+FACT_EMPTY = "Пустой текст — оставил как было."
+FACT_UNAVAILABLE = "Не смог обновить память. Это в логе."
+
+# How many facts one note offers buttons for. A pass that changes more than this
+# is not a pass worth hand-correcting one line at a time, and Telegram stops
+# drawing a keyboard long before it stops accepting one.
+MAX_CORRECTION_ROWS = 10
 
 # Telegram rejects a message body longer than this.
 TELEGRAM_TEXT_LIMIT = 4096
@@ -561,9 +588,23 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return PREVIEW
 
     status = "Added to today's page" if updated else "Saved to Notion"
-    _remember_saved(context, context.user_data.get("buttons_msg_id"))
+    buttons_msg_id = context.user_data.get("buttons_msg_id")
+    day = _draft_day(context)
+    _remember_saved(context, buttons_msg_id)
     _clear_draft(context)
     await query.edit_message_text(f"✓ {status}", reply_markup=None)
+
+    # Last, and in the background. The entry is in Notion and the preview says
+    # so: everything the owner asked for has happened by this line, and what
+    # follows it can only add.
+    _learn_later(
+        context,
+        chat_id=update.effective_chat.id,
+        reply_to=buttons_msg_id,
+        title=pending["title"],
+        text=pending["text"],
+        day=day,
+    )
     return ConversationHandler.END
 
 
@@ -920,6 +961,31 @@ def _memory_store() -> MemoryStore:
     return MemoryStore(coach_memory_path())
 
 
+# One lock over every write to the memory file. Two things write to it — a coach
+# answer that carried a rules block, and the profile pass that runs in the
+# background after a save — and they can be in the air at the same time: the pass
+# starts when Save is pressed and the owner is free to open a conversation while
+# it runs. The file is written atomically, so neither can see half of the other's
+# document; what the lock stops is the read-modify-write around it, where the
+# second writer saves a document built on a copy from before the first one wrote
+# and silently drops it.
+#
+# Made per loop rather than once at import, because an asyncio.Lock binds itself
+# to the loop it first has to wait on and raises "bound to a different event
+# loop" in any other. The bot has exactly one loop and never notices; a test
+# suite has one per test and would fail on the second contended case. Weak keys
+# so that a loop that is finished takes its lock with it.
+_store_locks: "weakref.WeakKeyDictionary[object, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _store_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _store_locks.get(loop)
+    if lock is None:
+        lock = _store_locks[loop] = asyncio.Lock()
+    return lock
+
+
 # The conversations, read from their file once and kept in step on every write.
 # Keyed by the path they were read from, so that pointing STATE_DIRECTORY
 # somewhere else — which is what a test does — reads that directory rather than
@@ -1019,12 +1085,19 @@ def _chunks(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     return chunks
 
 
-async def _send_plain(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> Message:
+async def _send_plain(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    reply_to: int | None = None,
+    reply_markup: object | None = None,
+) -> Message:
     """Sends a coach message: plain text, never a parse mode.
 
     The coach is told to write no markdown, but what reaches here is a model's
     output about the owner's own day and it is not worth one unbalanced asterisk
-    to render it nicely. Plain text cannot fail to parse.
+    to render it nicely. Plain text cannot fail to parse — which matters twice
+    over for the memory note, whose every line is a sentence the model wrote.
 
     `allow_sending_without_reply` so that a reply target which has since been
     deleted costs the reply threading and not the answer.
@@ -1034,7 +1107,12 @@ async def _send_plain(bot: Bot, chat_id: int, text: str, reply_to: int | None = 
         if reply_to is not None
         else None
     )
-    return await bot.send_message(chat_id=chat_id, text=text, reply_parameters=reply_parameters)
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_parameters=reply_parameters,
+        reply_markup=reply_markup,
+    )
 
 
 async def _edit_plain(bot: Bot, chat_id: int, message_id: int, text: str) -> None:
@@ -1085,8 +1163,13 @@ async def _run_coach(
     # also lose it. `changed` is None for a reply with no rules block at all,
     # which is almost every reply, and then nothing is written.
     if answer.changed is not None:
+        # Re-read inside the lock rather than writing back the document loaded
+        # before the call: the profile pass from an entry saved a minute ago may
+        # have written facts into it while this answer was being generated, and
+        # `stored` no longer has them. Only the rules are this turn's to replace.
         try:
-            _memory_store().save(replace(stored, rules=answer.rules))
+            async with _store_lock():
+                _memory_store().save(replace(_memory_store().load(), rules=answer.rules))
         except Exception:
             logger.exception("Could not write the coach's rules")
 
@@ -1241,6 +1324,280 @@ async def handle_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = [render(RULES_TITLE, count=str(len(rules)))]
     lines += [render("{line}", line=coach_prompts.rule_line(fact)) for fact in rules]
     await reply_html(update.effective_message, "\n".join(lines))
+
+
+# --------------------------------------------------------------------------- #
+# The profile: what a saved entry taught the bot, and the two buttons that fix it.
+#
+# This runs after Save, never before it and never in its way. The entry is
+# already in Notion by the time any of this starts, so the worst a failure here
+# can cost is one entry's contribution to the profile — and the next entry offers
+# the same facts again. That is the whole reason it is allowed to run unattended.
+# --------------------------------------------------------------------------- #
+
+# Which fact a "✎ поправить" prompt is waiting for an answer about, keyed by the
+# chat and the prompt's own message id. In memory rather than in user_data
+# because the filter that routes the reply runs before any handler and cannot see
+# user_data; a restart in the seconds between the prompt and the answer costs the
+# owner one more tap on the button, which is the cheapest failure in this file.
+_fact_edit_prompts: dict[tuple[int, int], str] = {}
+FACT_EDITS_REMEMBERED = 20
+
+
+def _learn_later(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int | None,
+    title: str,
+    text: str,
+    day: date,
+) -> None:
+    """Start the profile pass for an entry that has just been saved.
+
+    Deliberately not awaited. A model call takes seconds and the entry is already
+    in Notion: making Save wait for it would turn a working save into a bot that
+    looks stuck, and a failing extraction into a save that looks broken.
+    `Application.create_task` rather than a bare task so that a failure reaches
+    the error handler and a pass in flight is awaited at shutdown instead of
+    being dropped.
+    """
+    if not coach_enabled():
+        return
+    work = _learn_from_entry(
+        context, chat_id=chat_id, reply_to=reply_to, title=title, text=text, day=day
+    )
+    try:
+        context.application.create_task(work)
+    except Exception:
+        # The last line of the save path, and it must not be the one that breaks
+        # it: the entry is already in Notion and the preview already says so, so
+        # a pass that could not even be started is worth a log line and nothing
+        # more. Closed explicitly, or it is reported against whatever runs next.
+        work.close()
+        logger.exception("Could not start the profile pass")
+
+
+async def _learn_from_entry(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int | None,
+    title: str,
+    text: str,
+    day: date,
+) -> None:
+    """Fold one saved entry into the profile, and say what that changed.
+
+    The read before the call is not locked — a load is one atomic read of a file
+    that is only ever replaced whole — but the commit is, and it checks that the
+    profile is still the one the model was looking at. If it has moved, this pass
+    is dropped rather than written: the owner correcting a fact by hand while the
+    call was in the air is a correction that will not come back, and the facts
+    this pass found will be offered again by the next entry.
+    """
+    try:
+        profile = _memory_store().load().profile
+    except Exception:
+        logger.exception("Could not read the profile; this entry teaches nothing")
+        return
+
+    learned = await coach_profile.learn(
+        profile=profile,
+        title=title,
+        text=text,
+        model=settings.profile_model,
+        # Where the bot learned it. One page per day, so the day and the entry's
+        # own title are what identifies the entry it came from.
+        source=f"{day.isoformat()} · {title}",
+    )
+    if learned.changed is None:
+        # The common case, and it is silent by design: an entry that taught
+        # nothing must not cost the owner a message.
+        return
+
+    try:
+        async with _store_lock():
+            stored = _memory_store().load()
+            if stored.profile != profile:
+                logger.info("The profile moved while an entry was being read; dropping the pass")
+                return
+            _memory_store().save(replace(stored, profile=learned.profile))
+    except Exception:
+        logger.exception("Could not write the profile; this entry teaches nothing")
+        return
+
+    await _post_memory_note(
+        context,
+        chat_id=chat_id,
+        reply_to=reply_to,
+        before=profile.facts,
+        changed=learned.changed,
+    )
+
+
+def _corrections_keyboard(changed: coach_memory.ApplyResult) -> InlineKeyboardMarkup | None:
+    """One row per fact the note offers to correct, in the order the note lists them.
+
+    Only facts that are still there: a fact the pass deleted has nothing left to
+    be wrong about.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                FACT_WRONG_LABEL.format(id=fact.id), callback_data=f"fact:drop:{fact.id}"
+            ),
+            InlineKeyboardButton(
+                FACT_FIX_LABEL.format(id=fact.id), callback_data=f"fact:fix:{fact.id}"
+            ),
+        ]
+        for fact in (*changed.created, *changed.modified)[:MAX_CORRECTION_ROWS]
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _post_memory_note(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int | None,
+    before: tuple[coach_memory.Fact, ...],
+    changed: coach_memory.ApplyResult,
+) -> None:
+    """Say what was learned, under the entry it was learned from."""
+    body = coach_profile.note(about=coach_profile.change_lines(before, changed))
+    if body is None:  # pragma: no cover - `changed` is never empty by the time we are here
+        return
+
+    keyboard = _corrections_keyboard(changed)
+    try:
+        parts = _chunks(body)
+        for part in parts[:-1]:
+            await _send_plain(context.bot, chat_id, part, reply_to=reply_to)
+        # The buttons ride the last message, so they are under the whole list
+        # rather than in the middle of it.
+        await _send_plain(context.bot, chat_id, parts[-1], reply_to=reply_to, reply_markup=keyboard)
+    except Exception:
+        # The profile is already written, which is the part worth keeping. A note
+        # that did not arrive costs the owner the chance to correct it now, not
+        # the fact itself.
+        logger.warning("Could not post the memory note", exc_info=True)
+
+
+async def _apply_profile_op(op: dict) -> coach_memory.ApplyResult | None:
+    """Apply one hand-made operation to the profile. None if the file was unreachable.
+
+    Under the same lock as everything else that writes this file, and reading
+    inside it: the owner pressing a button while a pass from the entry he saved
+    a moment ago is still running is the ordinary case, not the exotic one.
+    """
+    try:
+        async with _store_lock():
+            stored = _memory_store().load()
+            applied = coach_memory.apply_ops(
+                stored.profile, [op], kinds=coach_memory.PROFILE_KINDS
+            )
+            if not (applied.created or applied.modified or applied.deleted):
+                # An id that is already gone. Nothing to write, and not an error:
+                # see `fact_callback` for why this is the second press.
+                return applied
+            _memory_store().save(replace(stored, profile=applied.items))
+            return applied
+    except Exception:
+        logger.exception("Could not change the profile by hand")
+        return None
+
+
+def _without_fact(markup: InlineKeyboardMarkup | None, fact_id: str) -> InlineKeyboardMarkup | None:
+    """The same keyboard with one fact's row taken out."""
+    if markup is None:
+        return None
+    rows = [
+        row
+        for row in markup.inline_keyboard
+        if not any((button.callback_data or "").rsplit(":", 1)[-1] == fact_id for button in row)
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def fact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The two buttons under a memory note.
+
+    Both are written to be harmless when pressed twice, or pressed on a fact that
+    is already gone — from a second device, or from a note further up the chat.
+    The id is addressed rather than a position, so the worst outcome of a stale
+    press is that it matches nothing, which `apply_ops` reports as a skip and
+    this answers with one line.
+    """
+    query = update.callback_query
+    _, action, fact_id = query.data.split(":", 2)
+
+    if action == "fix":
+        prompt = await _send_plain(
+            context.bot,
+            update.effective_chat.id,
+            FACT_FIX_PROMPT.format(id=fact_id),
+            reply_to=query.message.message_id,
+            reply_markup=ForceReply(selective=True),
+        )
+        _fact_edit_prompts[(update.effective_chat.id, prompt.message_id)] = fact_id
+        for stale in list(_fact_edit_prompts)[:-FACT_EDITS_REMEMBERED]:
+            del _fact_edit_prompts[stale]
+        await query.answer()
+        return
+
+    applied = await _apply_profile_op(
+        {"action": "delete", "id": fact_id, "reason": "marked wrong in the chat"}
+    )
+    if applied is None:
+        await query.answer(FACT_UNAVAILABLE)
+        return
+
+    await query.answer(FACT_DROPPED if applied.deleted else FACT_GONE)
+    # The row goes either way: the fact is not there any more, whichever press
+    # removed it, and a button that can only say so again is noise.
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=_without_fact(query.message.reply_markup, fact_id)
+        )
+    except Exception:
+        logger.warning("Could not take a corrected fact off the note", exc_info=True)
+
+
+class FactEditReplyFilter(filters.MessageFilter):
+    """Matches the answer to a "✎ поправить" prompt, and nothing else.
+
+    A filter rather than a check inside a handler, for the same reason the coach
+    has one: a handler cannot decline an update once it has been given one, and
+    everything this does not match has to go on reaching the handler it always
+    did — including a new title typed into an open draft.
+    """
+
+    def filter(self, message: Message) -> bool:
+        reply = message.reply_to_message
+        if reply is None or message.chat is None:
+            return False
+        return (message.chat.id, reply.message_id) in _fact_edit_prompts
+
+
+async def fact_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The new wording for a fact, applied as a modify against its id."""
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    fact_id = _fact_edit_prompts.pop((chat_id, message.reply_to_message.message_id), None)
+    if fact_id is None:  # pragma: no cover - the filter has just said otherwise
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply_text(FACT_EMPTY)
+        return
+
+    applied = await _apply_profile_op({"action": "modify", "id": fact_id, "text": text})
+    if applied is None:
+        await message.reply_text(FACT_UNAVAILABLE)
+        return
+    await message.reply_text(FACT_FIXED if applied.modified else FACT_GONE)
 
 
 async def handle_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1405,6 +1762,16 @@ def build_application() -> Application:
         )
     )
 
+    # Ahead of the conversation for the same reason, and as narrow: it matches
+    # only a reply to a prompt this process is still waiting on an answer to, so
+    # a new title typed into an open draft goes on reaching the conversation.
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & user_filter & FactEditReplyFilter(),
+            fact_edit_reply,
+        )
+    )
+
     app.add_handler(conv_handler)
     for handler in [*command_handlers, cancel_handler]:
         app.add_handler(handler)
@@ -1418,6 +1785,11 @@ def build_application() -> Application:
         pattern=r"^(save|toggle_highlight|edit_title|edit_text|edit_tags|cancel"
                 r"|date_open|date_back|date:\d{4}-\d{2}-\d{2}|coach:[a-z]+)$",
     ))
+
+    # Outside the conversation on purpose: a memory note is posted after the
+    # entry is saved, which is after the conversation has ended, and the note
+    # stays pressable in the chat long after the next draft has come and gone.
+    app.add_handler(CallbackQueryHandler(fact_callback, pattern=r"^fact:(drop|fix):\S{1,32}$"))
 
     app.add_error_handler(handle_error)
 
