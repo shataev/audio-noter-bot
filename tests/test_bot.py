@@ -1394,9 +1394,36 @@ class FakeCoachChat:
 
 
 class Gate:
+    """Holds a stubbed model call open so a test can look at the bot mid-flight.
+
+    ``wait_until_started`` has a deadline rather than being a bare
+    ``Event.wait()``, because the call it waits for is not guaranteed to happen:
+    anything that makes the handler give up before it reaches the model — a
+    memory read that raises, a draft that has gone — leaves a bare wait pending
+    for as long as the test runner allows.
+
+    A test that hangs is worse than a test that fails. It burns the whole CI job
+    timeout and reports "cancelled", which names nothing: the next person to
+    break this guarantee gets a red X with no failure in it. The deadline turns
+    that into one assertion that says what did not happen.
+    """
+
+    # Generous: these calls are stubs and return immediately once released, so
+    # anything approaching this is a call that is never coming.
+    START_TIMEOUT = 5.0
+
     def __init__(self):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+
+    async def wait_until_started(self):
+        try:
+            await asyncio.wait_for(self.started.wait(), self.START_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                f"the stubbed model call was not reached within {self.START_TIMEOUT}s: "
+                f"the handler gave up before it got there"
+            ) from None
 
 
 @pytest.fixture
@@ -1550,7 +1577,7 @@ async def test_something_says_it_is_thinking_before_the_answer_arrives(
     stub_coach(monkeypatch, gate=gate)
 
     press = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
-    await gate.started.wait()
+    await gate.wait_until_started()
     waiting = coach_messages(fake_bot, buttons_id)
 
     assert len(waiting) == 1
@@ -1572,7 +1599,7 @@ async def test_a_second_press_while_one_is_in_flight_is_a_no_op(
     chat = stub_coach(monkeypatch, gate=gate)
 
     first = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
-    await gate.started.wait()
+    await gate.wait_until_started()
     second = await _press_coach(fake_bot, context, buttons_id)
     gate.release.set()
     await first
@@ -1893,7 +1920,7 @@ async def test_a_second_reply_while_one_is_in_flight_is_a_no_op(
     first = asyncio.create_task(
         bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
     )
-    await gate.started.wait()
+    await gate.wait_until_started()
     await bot.coach_reply(
         _reply_update(fake_bot, to=answer_id, text="ну?", message_id=301), context
     )
@@ -2501,7 +2528,7 @@ async def test_a_pass_is_dropped_when_the_profile_moved_under_it(
     await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
 
     pass_task = asyncio.create_task(context.application.run_tasks())
-    await gate.started.wait()
+    await gate.wait_until_started()
 
     # The owner corrects something from a note further up the chat, by hand,
     # while the pass is still waiting on the model.
@@ -2535,7 +2562,7 @@ async def test_a_rules_write_does_not_take_the_profile_back_with_it(
     )
 
     press = asyncio.create_task(_press_coach(fake_bot, context, buttons_id))
-    await gate.started.wait()
+    await gate.wait_until_started()
 
     learned = await bot._apply_profile_op(creates(LEARNED_FACT))
     assert learned.created, "the profile pass really did write"
@@ -3038,6 +3065,24 @@ async def test_what_a_saved_entry_taught_reaches_the_page(
     await _save_and_learn(monkeypatch, tmp_path, fake_bot, context, creates(LEARNED_FACT))
 
     assert pages.texts("profile-page") == [LEARNED_FACT]
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_never_arrives_fails_the_test_instead_of_hanging(monkeypatch):
+    """The deadline on Gate, which is the only thing standing between a broken
+    guarantee and a CI job that reports "cancelled" with nothing in it.
+
+    Putting a raise into the memory sync's fallback found this: five tests here
+    wait for a stubbed model call that the handler had already given up before
+    reaching, and a bare Event.wait() waits for it forever.
+    """
+    monkeypatch.setattr(Gate, "START_TIMEOUT", 0.01)
+    gate = Gate()
+
+    with pytest.raises(AssertionError) as raised:
+        await gate.wait_until_started()
+
+    assert "gave up before it got there" in str(raised.value)
 
 
 @pytest.mark.asyncio
