@@ -26,11 +26,14 @@ endpoint, so `services/whisper.py` keeps its own OpenAI client and the provider
 setting cannot reach it.
 """
 
+import logging
 from dataclasses import dataclass
 
 import openai
 
 from config import ANTHROPIC, OPENAI, settings
+
+logger = logging.getLogger(__name__)
 
 # How hard a model may think, or None for a role that does not reason at all.
 # Anthropic also accepts "xhigh" and "max"; they are left out until something
@@ -42,7 +45,16 @@ EFFORTS = ("low", "medium", "high")
 # than hope: gpt-4o-mini formats a diary entry perfectly well and would fail the
 # request if it were sent one. Families rather than individual ids, because the
 # families are stable and the ids are not.
-_OPENAI_REASONING_FAMILIES = ("o1", "o3", "o4", "gpt-5")
+#
+# The two ways of being wrong here are not symmetrical, which is why this is a
+# list that gets added to rather than a guess. A family wrongly present fails
+# loudly: the first request to such a model is a 400 and nobody can miss it. A
+# family missing fails silently: the request succeeds, the effort is dropped on
+# the floor, and a role that pinned one — the profile extractor pins `low` to
+# keep reasoning from eating the completion budget — quietly gets the model's
+# default instead. So add a family once it reasons; do not try to be clever
+# about the ones that might.
+_OPENAI_REASONING_FAMILIES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
 
 # Belt-and-braces only. The format parameters below are the mechanism; this is a
 # sentence appended to the prompt for the one case that has no parameter —
@@ -170,8 +182,20 @@ class OpenAIChatClient(ChatClient):
         # accepted by some and rejected by others — so this omits the parameter
         # rather than guess at a 400. The roles that ask for no effort are
         # configured onto models that do not reason in the first place.
-        if effort is not None and _openai_takes_effort(model):
-            kwargs["reasoning_effort"] = effort
+        if effort is not None:
+            if _openai_takes_effort(model):
+                kwargs["reasoning_effort"] = effort
+            else:
+                # The silent half of the asymmetry above, said out loud. A role
+                # that asked to think and is not going to is worth a line in the
+                # journal: without it the only symptom is output that slowly
+                # gets worse. Nothing is logged on the ordinary path, where no
+                # effort was asked for in the first place.
+                logger.info(
+                    "ai: %s is in no known reasoning family, dropping effort %r",
+                    model,
+                    effort,
+                )
 
         if json_schema is not None:
             # Structured outputs: strict, so the schema is a guarantee rather
