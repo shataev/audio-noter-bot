@@ -129,7 +129,13 @@ def _env(**overrides):
         **REAL_ENV,
         "PYTHONPATH": PROJECT_ROOT,
     }
-    for name in ("AI_PROVIDER", "ANTHROPIC_API_KEY", "FORMATTER_MODEL", "SUMMARY_MODEL"):
+    for name in (
+        "AI_PROVIDER",
+        "ANTHROPIC_API_KEY",
+        "FORMATTER_MODEL",
+        "SUMMARY_MODEL",
+        "FORMATTER_FULL_TEXT_LIMIT",
+    ):
         env.pop(name, None)
     for name, value in overrides.items():
         if value is None:
@@ -209,14 +215,37 @@ def test_the_chat_models_default_to_claude_under_the_anthropic_provider(tmp_path
     assert result.stdout.strip() == "('claude-opus-5', 'claude-opus-5', 'claude-opus-5')"
 
 
-def test_the_chat_models_default_to_the_cheap_openai_ones(tmp_path):
-    """Formatting and summarising are mechanical; only the coach reasons."""
+def test_the_openai_defaults_pay_for_the_formatter_and_not_the_summary(tmp_path):
+    """The formatter's job is mechanical in shape but the constraint is the job.
+
+    gpt-4o-mini does not hold "do not rewrite this" on a dictated entry — it
+    compresses, and the author loses words. Summarising has no such constraint
+    and stays on the cheap model. The deployed environment sets neither variable,
+    so these defaults are what actually run.
+    """
     result = _import_and_print(
         "(config.settings.formatter_model, config.settings.summary_model)", _env(), tmp_path
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "('gpt-4o-mini', 'gpt-4o-mini')"
+    assert result.stdout.strip() == "('gpt-6-astra', 'gpt-4o-mini')"
+
+
+def test_the_full_text_limit_has_a_default_and_can_be_overridden(tmp_path):
+    """Which path the formatter takes is configuration, not a constant."""
+    default = _import_and_print("config.settings.formatter_full_text_limit", _env(), tmp_path)
+
+    assert default.returncode == 0, default.stderr
+    assert default.stdout.strip() == "6000"
+
+    set_by_hand = _import_and_print(
+        "config.settings.formatter_full_text_limit",
+        _env(FORMATTER_FULL_TEXT_LIMIT="1500"),
+        tmp_path,
+    )
+
+    assert set_by_hand.returncode == 0, set_by_hand.stderr
+    assert set_by_hand.stdout.strip() == "1500"
 
 
 def test_an_explicit_model_wins_over_the_provider_default(tmp_path):

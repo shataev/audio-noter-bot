@@ -358,10 +358,30 @@ for the provider in use:
 | Variable             | OpenAI default   | Anthropic default | Used for                          |
 |----------------------|------------------|-------------------|-----------------------------------|
 | `TRANSCRIPTION_MODEL`| `gpt-transcribe` | `gpt-transcribe`  | Voice message → text, always OpenAI |
-| `FORMATTER_MODEL`    | `gpt-4o-mini`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
+| `FORMATTER_MODEL`    | `gpt-6-astra`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
 | `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
 | `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | The coach, at high effort         |
 | `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Learning about you from a saved entry, at low effort |
+
+The formatter is the one mechanical-looking role that does not run on the cheap
+model. Its instruction is "punctuate this and change nothing else", and holding
+that on ten minutes of dictation is the whole job: a model that does not hold it
+summarises, and the words are gone — there is no copy of the transcription
+anywhere you can reach.
+
+Two things guard that, and they are belt and braces rather than alternatives:
+
+| Variable                    | Default | Used for                                        |
+|-----------------------------|---------|-------------------------------------------------|
+| `FORMATTER_FULL_TEXT_LIMIT` | `6000`  | Longest entry, in characters, that the model is asked to hand back |
+
+Past that length the model is asked for a title and tags only, is told not to
+return the text, and your transcription is used exactly as it came out of the
+transcriber — unpunctuated, but whole. A model that was never asked to echo six
+thousand characters back cannot shorten them. Below the length, the reply is
+compared against the transcription on letters and digits alone, and one that
+lost more than a tenth of them is refused the same way: the entry keeps your own
+words and the preview says so in one line.
 
 ### Connecting Notion integration to your database
 

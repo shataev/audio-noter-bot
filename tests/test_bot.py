@@ -281,6 +281,18 @@ def callback_update(fake_bot, data, message_id):
     )
 
 
+def as_dictated(text):
+    """The same words as they arrive from the transcriber: no punctuation, no capitals.
+
+    The stubbed pair have to be a plausible before-and-after, because the code
+    between them now compares the two: a formatted text materially shorter than
+    the transcription is refused and the transcription kept instead. A stub whose
+    "transcription" had nothing to do with its "formatted text" would put every
+    test in this file on the wrong side of that guard.
+    """
+    return "".join(c for c in text if c.isalnum() or c.isspace()).lower()
+
+
 async def stub_voice_pipeline(
     monkeypatch, tmp_path, fake_bot, title, text, tags, download_fails=False
 ):
@@ -292,7 +304,7 @@ async def stub_voice_pipeline(
 
     async def fake_transcribe(path, keywords=None):
         transcribed_with.append(list(keywords or []))
-        return "raw transcription"
+        return as_dictated(text)
 
     async def fake_format(transcription):
         return title, text, tags
@@ -3151,3 +3163,587 @@ async def test_a_fact_reworded_on_the_page_is_the_same_fact_after_a_correction(
         (reworded.id, "Совсем другими словами.")
     ]
     assert pages.texts("profile-page") == ["Совсем другими словами."]
+
+
+# --------------------------------------------------------------------------- #
+# Reported live — "транскрибция снова урезала и отформатировала мое сообщение"
+#
+# The formatter is forbidden to remove anything and does not hold to it on a long
+# entry. What is tested here is not the model: it is that the loss cannot be
+# silent. A shortened reply is refused, the draft keeps the transcription, and the
+# preview says which of the two is on screen.
+#
+# The second half of every one of these is the case that must stay quiet. A guard
+# that fires on an ordinary well-punctuated reply would replace a clean entry with
+# an unpunctuated one every time, which is a worse bot than the one with the bug.
+# --------------------------------------------------------------------------- #
+
+DICTATED = (
+    "ну вот сегодня я это самое сходил на пробежку было тяжело первые два "
+    "километра потом как-то разбежался и стало нормально в конце даже ускорился"
+)
+PUNCTUATED = (
+    "Ну вот, сегодня я, это самое, сходил на пробежку.\n\n"
+    "Было тяжело первые два километра, потом как-то разбежался и стало нормально. "
+    "В конце даже ускорился!"
+)
+COMPRESSED = "Сходил на пробежку. Первые два километра дались тяжело, потом стало легче."
+
+
+async def _voice_formatted_as(monkeypatch, tmp_path, fake_bot, context, *, dictated, formatted):
+    """One voice message, with both halves of the pipeline pinned by the test."""
+    monkeypatch.setattr(bot.tempfile, "tempdir", str(tmp_path))
+    fake_bot.files["voice-1"] = FakeFile()
+
+    async def fake_transcribe(path, keywords=None):
+        return dictated
+
+    async def fake_format(transcription):
+        return "Заголовок", formatted, ["sport"]
+
+    monkeypatch.setattr(bot, "transcribe", fake_transcribe)
+    monkeypatch.setattr(bot, "format_entry", fake_format)
+    return await bot.handle_voice(voice_update(fake_bot), context)
+
+
+def _notices(fake_bot):
+    return [m for m in fake_bot.sent if m.text == bot.UNFORMATTED_NOTICE]
+
+
+@pytest.mark.asyncio
+async def test_a_shortened_entry_leaves_the_draft_holding_the_transcription(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The reported defect. The words are the entry; the punctuation is not."""
+    state = await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    assert state == bot.PREVIEW
+    assert context.user_data["pending"]["text"] == DICTATED
+    assert COMPRESSED not in preview_bodies(fake_bot)
+    assert fake_bot.find(context.user_data["text_msg_id"]).text == DICTATED
+
+
+@pytest.mark.asyncio
+async def test_it_says_so_once_and_the_buttons_stay_last(tmp_path, monkeypatch, fake_bot, context):
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    (notice,) = _notices(fake_bot)
+    assert notice.message_id == context.user_data["unformatted_msg_id"]
+    assert context.user_data["tags_msg_id"] < notice.message_id
+    assert notice.message_id < context.user_data["buttons_msg_id"]
+    assert fake_bot.sent[-1].message_id == context.user_data["buttons_msg_id"]
+
+
+@pytest.mark.asyncio
+async def test_the_title_and_tags_are_still_the_formatters(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """Only the text is refused. The title is invented by definition, and the
+    tags are the words the author himself named — neither is what came back short."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    assert context.user_data["pending"]["title"] == "Заголовок"
+    assert context.user_data["pending"]["tags"] == ["sport"]
+
+
+@pytest.mark.asyncio
+async def test_punctuation_and_paragraphs_are_used_as_they_are_and_say_nothing(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """The ordinary case, which is the one the guard must never touch."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+    )
+
+    assert context.user_data["pending"]["text"] == PUNCTUATED
+    assert _notices(fake_bot) == []
+    assert context.user_data["unformatted_msg_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_same_words_with_commas_added_are_not_shorter(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """A naive length comparison would call this reply longer, and a naive
+    word-count one would call a merged word a loss. Letters and digits only."""
+    dictated = "короче я пошел"
+    await _voice_formatted_as(
+        monkeypatch,
+        tmp_path,
+        fake_bot,
+        context,
+        dictated=dictated,
+        formatted="Короче, я пошёл...",
+    )
+
+    assert context.user_data["pending"]["text"] == "Короче, я пошёл..."
+    assert _notices(fake_bot) == []
+
+
+@pytest.mark.asyncio
+async def test_exactly_a_tenth_lost_is_still_used(tmp_path, monkeypatch, fake_bot, context):
+    """The boundary from the safe side, end to end."""
+    dictated = "а" * 1000
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=dictated, formatted="а" * 900
+    )
+
+    assert context.user_data["pending"]["text"] == "а" * 900
+    assert _notices(fake_bot) == []
+
+
+@pytest.mark.asyncio
+async def test_one_character_past_the_tenth_is_refused(tmp_path, monkeypatch, fake_bot, context):
+    """And from the other side, so the threshold is pinned rather than approximated."""
+    dictated = "а" * 1000
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=dictated, formatted="а" * 899
+    )
+
+    assert context.user_data["pending"]["text"] == dictated
+    assert len(_notices(fake_bot)) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_shortfall_is_logged_as_numbers_and_not_as_the_entry(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """The journal on the server is readable by the deploy account."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+        )
+
+    (warned,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    said = warned.getMessage()
+    kept = bot.measure_kept(DICTATED, COMPRESSED)
+    assert f"{kept.kept} of {kept.spoken}" in said, "lengths, which is what a diagnosis needs"
+    assert f"{kept.ratio:.2f}" in said
+    assert "пробежку" not in said
+    assert COMPRESSED not in said
+
+
+@pytest.mark.asyncio
+async def test_a_reply_the_formatter_kept_whole_is_logged_too(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """A line that only appears when something is wrong cannot tell a quiet day
+    from a logger that has stopped working. The question the log answers is "did
+    the formatter get the whole thing", and "yes" is an answer to it."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+        )
+
+    said = [r.getMessage() for r in caplog.records if "spoken characters" in r.getMessage()]
+    assert len(said) == 1
+    assert "1.00" in said[0]
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+# --------------------------------------------------------------------------- #
+# The transcription log
+#
+# `handle_voice` used to write the whole entry into the journal on every voice
+# message. The journal on the server is readable by the deploy account, and
+# CLAUDE.md forbids exactly this everywhere under services/coach/ — bot.py
+# predates that rule rather than disagreeing with it.
+#
+# Same shape as `test_no_fact_text_ever_reaches_the_log` in the coach tests: a
+# distinctive sentence, every handler listening, and the assertion that it is
+# nowhere in what was written.
+# --------------------------------------------------------------------------- #
+
+SECRET_ENTRY = (
+    "сегодня я говорил с врачом про две тысячи одиннадцатый год и про то что до сих пор снится"
+)
+
+
+@pytest.mark.asyncio
+async def test_no_entry_text_ever_reaches_the_log(tmp_path, monkeypatch, fake_bot, context, caplog):
+    """A diary is not something to put in a journal the deploy account can read."""
+    with caplog.at_level("DEBUG"):
+        await _voice_formatted_as(
+            monkeypatch,
+            tmp_path,
+            fake_bot,
+            context,
+            dictated=SECRET_ENTRY,
+            formatted=SECRET_ENTRY + ".",
+        )
+
+    assert SECRET_ENTRY not in caplog.text
+    assert "врачом" not in caplog.text
+    assert "снится" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_entry_does_not_reach_the_log_when_it_is_kept_raw_either(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """The path that puts the transcription into the draft is the one that most
+    obviously has it to hand."""
+    with caplog.at_level("DEBUG"):
+        await _voice_formatted_as(
+            monkeypatch,
+            tmp_path,
+            fake_bot,
+            context,
+            dictated=SECRET_ENTRY,
+            formatted="Поговорил с врачом.",
+        )
+
+    assert context.user_data["pending"]["text"] == SECRET_ENTRY, "the guard fired, as intended"
+    assert SECRET_ENTRY not in caplog.text
+    assert "снится" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_transcription_that_produced_nothing_is_still_diagnosable(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """Deleting the line would have been the easy fix and the wrong one: a silent
+    path is how the next defect hides."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated="", formatted=""
+        )
+
+    (said,) = [r.getMessage() for r in caplog.records if "Transcribed" in r.getMessage()]
+    assert "0 characters" in said
+
+
+@pytest.mark.asyncio
+async def test_the_length_of_the_transcription_is_still_logged(
+    tmp_path, monkeypatch, fake_bot, context, caplog
+):
+    """What the line is for — "did the formatter get the whole thing" — needs the
+    number, and the guard's line beside it is the other half of that answer."""
+    with caplog.at_level("DEBUG", logger="bot"):
+        await _voice_formatted_as(
+            monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=PUNCTUATED
+        )
+
+    (said,) = [r.getMessage() for r in caplog.records if "Transcribed" in r.getMessage()]
+    assert f"{len(DICTATED)} characters" in said
+
+
+@pytest.mark.asyncio
+async def test_cancelling_takes_the_notice_with_the_preview(
+    tmp_path, monkeypatch, fake_bot, context
+):
+    """It is part of the preview, so it goes when the preview goes."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+    notice_id = context.user_data["unformatted_msg_id"]
+
+    await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert notice_id in fake_bot.deleted
+
+
+@pytest.mark.asyncio
+async def test_the_words_kept_are_the_ones_that_reach_notion(
+    tmp_path, monkeypatch, fake_bot, context, no_network
+):
+    """The whole point of the guard: Save writes what the author actually said."""
+    await _voice_formatted_as(
+        monkeypatch, tmp_path, fake_bot, context, dictated=DICTATED, formatted=COMPRESSED
+    )
+
+    await bot.save_callback(
+        callback_update(fake_bot, "save", context.user_data["buttons_msg_id"]), context
+    )
+
+    assert no_network[0][1] == DICTATED
+
+
+# --------------------------------------------------------------------------- #
+# Reported live — "режим разъёб сработал, но после отмены записи его результат
+# из чата не пропал"
+#
+# The coach's answer is about the draft. When the draft ends, the answer is about
+# an entry that does not exist, and the thread behind it still holds the keys of
+# its messages — so a reply carries on a conversation about something that was
+# never written.
+#
+# There are three endings, not one, and they meet in `_retire_preview`. Each of
+# these tests goes through the handler the author actually reaches rather than
+# calling that helper, because the thing being asserted is that none of the three
+# is the one that was missed.
+# --------------------------------------------------------------------------- #
+
+
+async def _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context, text=COACH_ANSWER):
+    """A preview with one conversation open about it. Returns both message ids."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text=text)
+    await _press_coach(fake_bot, context, buttons_id)
+    answer_id = next(m for m in fake_bot.sent if m.text.startswith(text[:20])).message_id
+    return buttons_id, answer_id
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_button_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The reported defect, by the path it was reported on."""
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == (), "and no thread left pointing at it"
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_command_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    _, answer_id = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    await bot.handle_cancel(text_update(fake_bot, "/cancel"), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_a_newer_recording_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The replaced preview is a discarded draft too, whatever it says on screen."""
+    _, answer_id = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    await stub_voice_pipeline(monkeypatch, tmp_path, fake_bot, "Другой", "другое тело", [])
+    await bot.handle_voice(voice_update(fake_bot, message_id=2), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == ()
+    assert context.user_data["pending"]["title"] == "Другой", "the new draft is fine"
+    assert context.user_data.get("coach_thread_ids") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_preview_takes_the_coachs_answer_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    _, answer_id = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    await bot.handle_preview_timeout(text_update(fake_bot, "whatever"), context)
+
+    assert answer_id in fake_bot.deleted
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_every_message_of_a_long_answer_goes(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A long answer is several messages, and the thread knows all of them.
+
+    Deleting only the first would leave the rest of it on screen discussing an
+    entry that was never written — the defect, three quarters unfixed.
+    """
+    long_answer = "\n\n".join(["абзац " * 200] * 4)
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text=long_answer)
+    await _press_coach(fake_bot, context, buttons_id)
+    delivered = [m.message_id for m in coach_messages(fake_bot, buttons_id)]
+    assert len(delivered) > 1, "the fixture has to actually produce several messages"
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert set(delivered) <= set(fake_bot.deleted)
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_several_replies_deep_goes_with_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """It is still the conversation about that entry, however far it has run.
+
+    Telling "still about the entry" from "a conversation of its own" would be a
+    guess, and the wrong guess leaves exactly the defect that was reported.
+    """
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+    stub_coach(monkeypatch, text="Потому что ты ждёшь разрешения.")
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+    second_id = next(
+        m for m in fake_bot.sent if m.text == "Потому что ты ждёшь разрешения."
+    ).message_id
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert {answer_id, second_id} <= set(fake_bot.deleted)
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_every_mode_pressed_on_one_draft_goes_with_it(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Each press opens its own conversation, and all of them are the draft's."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    stub_coach(monkeypatch, text="Разъёб.")
+    await _press_coach(fake_bot, context, buttons_id, mode="roast")
+    stub_coach(monkeypatch, text="Разбор.")
+    await _press_coach(fake_bot, context, buttons_id, mode="breakdown")
+    answers = [m.message_id for m in fake_bot.sent if m.text in ("Разъёб.", "Разбор.")]
+    assert len(answers) == 2
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert set(answers) <= set(fake_bot.deleted)
+    assert bot._load_threads().threads == ()
+
+
+@pytest.mark.asyncio
+async def test_a_reply_after_the_cancel_does_not_start_a_blank_conversation(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """A delete can fail and the message can still be on screen. Replying to it
+    has to behave like a reply to any conversation that is gone: honest, and no
+    model call made without the context it belongs to."""
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert bot._knows_coach_message(fake_bot.chat_id, answer_id), (
+        "the filter still has to claim it, or a voice reply becomes a diary entry"
+    )
+    chat = stub_coach(monkeypatch)
+    await bot.coach_reply(_reply_update(fake_bot, to=answer_id, text="почему?"), context)
+
+    assert fake_bot.sent[-1].text == bot.COACH_FORGOTTEN
+    assert chat.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_delete_that_fails_still_discards_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The author may have deleted it himself, or it may be too old for the Bot
+    API. Either way the draft is discarded, exactly as it was before this."""
+    buttons_id, _ = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+
+    async def refuse(chat_id, message_id, **kwargs):
+        raise BadRequest("message can't be deleted")
+
+    monkeypatch.setattr(fake_bot, "delete_message", refuse)
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert bot._load_threads().threads == (), "and the thread goes even so"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_conversation_file_still_discards_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    buttons_id, _ = await _draft_with_a_coach_answer(tmp_path, monkeypatch, fake_bot, context)
+    monkeypatch.setattr(bot, "_thread_cache", None)
+    (coach_state / bot.COACH_THREADS_FILE_NAME).write_text("не json", encoding="utf-8")
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_file_that_cannot_be_written_still_discards_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The other half of the same guarantee, and the half a failed delete does not cover.
+
+    Reading the file can fail and is tested above; writing it back can fail too —
+    a full disk, a permission the deploy changed, a state directory that moved.
+    By the time the write happens the draft has already been cleared from
+    `user_data`, so letting it out leaves the owner watching Cancel error on a
+    draft that was in fact discarded, with the preview still wearing its buttons.
+    """
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+
+    def unwritable(items):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(bot, "_save_threads", unwritable)
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert answer_id in fake_bot.deleted, "the messages go whether or not the file does"
+
+
+@pytest.mark.asyncio
+async def test_saving_keeps_the_coachs_answer(
+    tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
+):
+    """The other half of the fix. The entry exists, so the conversation about it
+    still means something — and a reply must go on reaching it."""
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+
+    await bot.save_callback(callback_update(fake_bot, "save", buttons_id), context)
+
+    assert answer_id not in fake_bot.deleted
+    assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, answer_id))
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_with_no_conversation_does_not_touch_the_file(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Almost every draft is cancelled without the coach ever being pressed."""
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert not (coach_state / bot.COACH_THREADS_FILE_NAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_the_conversation_of_an_earlier_draft_is_not_the_next_ones_to_end(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """Saving leaves the conversation live. Cancelling the next draft must not
+    take it: it belongs to an entry that is in Notion."""
+    first_buttons, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+    monkeypatch.setattr(bot, "save_entry", _saved_quietly)
+    await bot.save_callback(callback_update(fake_bot, "save", first_buttons), context)
+
+    second_buttons = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    await bot.cancel_callback(callback_update(fake_bot, "cancel", second_buttons), context)
+
+    assert answer_id not in fake_bot.deleted
+    assert bot.coach_threads.find(bot._load_threads(), bot.coach_threads.key(1, answer_id))
+
+
+async def _saved_quietly(title, text, tags, day=None):
+    return True
