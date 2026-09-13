@@ -8,20 +8,9 @@ module is imported.
 ``setdefault`` is used throughout: test modules that set the same variables
 themselves — so they can be run standalone — are unaffected, and a real value
 already in the environment always wins.
-
-The second half of the file keeps the suite offline. Nothing here talks to a real
-API, and it should not be able to start doing so by accident — which became
-possible when a coach answer started asking Notion for the memory pages before it
-answers. A test that has not mocked the transport then reaches it; what happens is
-not a failure, because the sync falls back to the file on purpose, it is a pile of
-connection attempts and retry sleeps, and on a machine with a route out it is a
-request to Notion carrying whatever token the environment happens to hold.
 """
 
 import os
-
-import httpx
-import pytest
 
 DUMMY_ENV = {
     "TELEGRAM_TOKEN": "test-token",
@@ -35,6 +24,25 @@ DUMMY_ENV = {
 for _name, _value in DUMMY_ENV.items():
     os.environ.setdefault(_name, _value)
 
+
+# --------------------------------------------------------------------------- #
+# Nothing in this suite talks to a real API, and it should not be able to start
+# doing so by accident.
+#
+# That became possible when a coach answer started asking Notion for the memory
+# pages before it answers: a test that has not mocked the transport reaches it.
+# What happens then is not a failure — the sync falls back to the file on purpose
+# — it is a pile of connection attempts and retry sleeps, and on a machine with a
+# route out it is a request to Notion carrying whatever token the environment
+# happens to hold.
+#
+# Appended rather than woven into the file above, and the two imports carry a
+# noqa for the same reason: `feat-coach-batch` is working in this file too, and a
+# conflict in added lines is cheap where a reordered file is not.
+# --------------------------------------------------------------------------- #
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
 
 # Loopback is still allowed: one test in tests/test_notion_http.py deliberately
 # points the client at a local socket that never answers, to prove the read
