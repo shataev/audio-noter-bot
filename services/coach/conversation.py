@@ -18,9 +18,9 @@ that this one can afford it.
 """
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from collections.abc import Sequence
 
 from services.ai import Message, create_chat_client
 

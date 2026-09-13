@@ -241,21 +241,41 @@ def test_an_empty_file_is_an_empty_store(store):
     assert store.load() == threads.Threads()
 
 
-def test_a_conversation_nothing_can_reply_into_is_not_kept(store):
-    """No keys means no door: it would be scanned on every message and never match."""
+def _stored(store, thread):
     store.path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "next_id": 2,
-                "threads": [{"id": "1", "mode": "roast", "keys": [], "turns": []}],
-                "forgotten": [],
-            }
-        ),
+        json.dumps({"version": 1, "next_id": 2, "threads": [thread], "forgotten": []}),
         encoding="utf-8",
     )
+    return store.load(now=NOW)
 
-    assert store.load(now=NOW).threads == ()
+
+def test_a_conversation_nothing_can_reply_into_is_not_kept(store):
+    """No keys means no door: it would be scanned on every message and never match.
+
+    The turns are deliberately present. Dropping a thread that has neither turns
+    nor keys proves only that one of the two rules fires, and the one this test is
+    named for is the other.
+    """
+    loaded = _stored(
+        store,
+        {
+            "id": "1",
+            "mode": "roast",
+            "keys": [],
+            "turns": [{"role": "user", "text": "запись"}],
+        },
+    )
+
+    assert loaded.threads == ()
+
+
+def test_a_conversation_with_nothing_in_it_is_not_kept(store):
+    """And the other way round: a door into a conversation that has nothing to say."""
+    loaded = _stored(
+        store, {"id": "1", "mode": "roast", "keys": [threads.key(1, 101)], "turns": []}
+    )
+
+    assert loaded.threads == ()
 
 
 # --------------------------------------------------------------------------- #
@@ -383,3 +403,18 @@ def test_an_unreadable_timestamp_keeps_the_conversation_rather_than_ageing_it_ou
     )
 
     assert len(threads.prune(broken, now=NOW).threads) == 1
+
+
+def test_a_key_is_not_remembered_as_forgotten_twice():
+    """Otherwise a repeated key could push the rest of the window out with its own copies."""
+    items, thread = opened(now=NOW - timedelta(days=threads.MAX_AGE_DAYS + 1))
+    already = threads.Threads(
+        threads=items.threads,
+        forgotten=(threads.key(1, 101),),
+        next_id=items.next_id,
+    )
+
+    pruned = threads.prune(already, now=NOW)
+
+    assert pruned.forgotten == (threads.key(1, 101),)
+    assert threads.was_forgotten(pruned, threads.key(1, 101))
