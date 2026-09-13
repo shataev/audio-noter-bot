@@ -448,6 +448,64 @@ def test_adopt_keeps_the_id_when_the_text_matches_and_there_is_no_key():
     assert fact.key == "block-new", "the key is recorded so the next edit matches on it"
 
 
+def test_adopt_matches_on_the_key_before_the_text_when_the_two_disagree():
+    """The one case that separates the two orders, and the reason ``key`` exists.
+
+    The owner has moved a sentence from one bullet to another — recycled the
+    wording of the second bullet into the first, and given the second something
+    new. Every other case in this file agrees whichever order the two matches are
+    tried in; this one does not.
+
+    Matching on the key, the edit lands on the bullet he was editing. Matching on
+    the text first, the first line lands on fact 2 instead, fact 1 is left
+    unclaimed and tombstoned, and the sentence he moved arrives carrying the other
+    fact's kind, its creation date and the entries that taught it. Two facts trade
+    histories and nothing anywhere says so.
+    """
+    result = adopt(
+        stored(),
+        [
+            EditedItem("block-a", "He is saving for a flat"),
+            EditedItem("block-b", "He wants to learn to sail"),
+        ],
+        now=TUESDAY,
+    )
+
+    first, second = result.items.facts
+    assert (first.id, first.key, first.text) == ("1", "block-a", "He is saving for a flat")
+    assert (second.id, second.key, second.text) == ("2", "block-b", "He wants to learn to sail")
+    assert (first.kind, first.sources) == ("trait", ("entry-1",))
+    assert (second.kind, second.sources) == ("work", ("entry-2",))
+    assert result.deleted == (), "nothing was removed, so nothing may be buried"
+    assert result.created == (), "both lines matched, so no id may be minted"
+    assert result.items.next_id == 3
+
+
+def test_adopt_falls_back_to_the_text_when_the_key_names_nothing():
+    """A key that has been reissued — a bullet deleted and rewritten in Notion.
+
+    It matches no stored fact, so the text decides, and the new key is recorded
+    in place of the one that is gone: next time round there is a key to match on
+    again.
+    """
+    result = adopt(
+        stored(),
+        [
+            EditedItem("block-reissued", "He avoids conflict"),
+            EditedItem("block-b", "He is saving for a flat"),
+        ],
+        now=TUESDAY,
+    )
+
+    first, _ = result.items.facts
+    assert first.id == "1"
+    assert first.key == "block-reissued"
+    assert first.sources == ("entry-1",)
+    assert first.created_at == "2026-08-03T09:00:00+00:00"
+    assert result.created == ()
+    assert result.deleted == ()
+
+
 def test_adopt_mints_an_id_for_a_line_that_matches_nothing():
     result = adopt(
         stored(),
