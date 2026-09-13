@@ -3669,6 +3669,36 @@ async def test_an_unreadable_conversation_file_still_discards_the_draft(
 
 
 @pytest.mark.asyncio
+async def test_a_conversation_file_that_cannot_be_written_still_discards_the_draft(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The other half of the same guarantee, and the half a failed delete does not cover.
+
+    Reading the file can fail and is tested above; writing it back can fail too —
+    a full disk, a permission the deploy changed, a state directory that moved.
+    By the time the write happens the draft has already been cleared from
+    `user_data`, so letting it out leaves the owner watching Cancel error on a
+    draft that was in fact discarded, with the preview still wearing its buttons.
+    """
+    buttons_id, answer_id = await _draft_with_a_coach_answer(
+        tmp_path, monkeypatch, fake_bot, context
+    )
+
+    def unwritable(items):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(bot, "_save_threads", unwritable)
+
+    state = await bot.cancel_callback(callback_update(fake_bot, "cancel", buttons_id), context)
+
+    assert state == bot.ConversationHandler.END
+    assert "pending" not in context.user_data
+    assert fake_bot.find(buttons_id).text == bot.DRAFT_CANCELLED
+    assert fake_bot.find(buttons_id).reply_markup is None
+    assert answer_id in fake_bot.deleted, "the messages go whether or not the file does"
+
+
+@pytest.mark.asyncio
 async def test_saving_keeps_the_coachs_answer(
     tmp_path, monkeypatch, fake_bot, context, coach_state, no_network
 ):
