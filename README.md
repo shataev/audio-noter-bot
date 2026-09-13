@@ -23,6 +23,7 @@ A Telegram bot that turns voice messages into structured diary entries in Notion
 | `/cancel` | Throw away the draft being previewed |
 | `/keywords` | Manage the words the transcriber should lean towards |
 | `/rules`  | Show the standing instructions the coach has written down |
+| `/memory` | Rebuild the profile from everything already in the diary |
 
 ## Editing before saving
 
@@ -178,6 +179,57 @@ timeout, a provider outage — the profile is left exactly as it was and the nex
 entry offers the same facts again. The one thing that is never risked is a fact
 you corrected by hand: if the profile changed while an extraction was in flight,
 that extraction is dropped rather than written.
+
+### Rebuilding it from a diary that came first
+
+The profile only grows from entries saved after this feature shipped, so it knows
+nothing about whatever was already written. `/memory` walks all of it and folds it
+in — the same per-entry extraction, oldest first, each call seeing what the calls
+before it learned.
+
+It asks for two things before it does anything. First, what this pass should be
+looking for — what matters, what to keep, what to drop. Answer by text or by
+voice; `-` means no focus. What you say there is read **only** as focus: it is
+never saved as a diary entry and never stored as a fact. Then it echoes the focus
+and the number of facts it currently holds, and waits for you to confirm. Nothing
+runs before that: the pass costs real money per entry and rewrites the thing the
+whole coach reads.
+
+On confirm it copies the memory file to a labelled snapshot before the first call,
+and the last message tells you which one — a pass that went badly is one file move
+away from being undone.
+
+It is built to be dull. One entry at a time with a pause between them, never
+concurrent. A second `/memory` while one is running is refused rather than queued.
+An entry that cannot be read or extracted is counted and skipped, and the facts
+already accumulated are untouched. Failures back to back stop the pass instead of
+burning one doomed call per remaining entry. And the profile is written after
+every entry, so a restart in the middle costs the entry in flight and nothing
+else.
+
+### Once a week it writes first
+
+Everything above is the coach reacting to something you did. Once a week it opens
+the conversation itself: it reads the week's entries and the profile, and sends
+one thing — a pattern it noticed, or a single question worth sitting with. Not a
+recap; the weekly report already does that.
+
+It is a normal coach message, so you can just reply to it and carry on.
+
+A week with nothing written in it gets silence rather than a generated observation
+about nothing, and no week is ever spoken about twice — the week it last spoke
+about is on disk, so a deploy in between changes nothing. When something goes
+wrong it says nothing at all and puts the reason in the log.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `COACH_WEEKLY_ENABLED` | `1` | `0` switches the whole thing off |
+| `COACH_WEEKLY_DAY` | `sunday` | The day it goes out, by name |
+| `COACH_WEEKLY_HOUR` | `12` | The hour, in `TIMEZONE` |
+| `COACH_WEEKLY_MINUTE` | `0` | The minute |
+
+The default is midday Sunday, well clear of the 21:00 recaps, so that the week's
+report and the week's question are not read as one message.
 
 ### Making it yours
 
@@ -747,7 +799,10 @@ noter/
 │       ├── prompts.py      # The three personas, and the self-editing rules
 │       ├── threads.py      # Conversations, in a file that outlives a deploy
 │       ├── conversation.py # One coach turn: ask, answer, update the rules
-│       └── profile.py     # What a saved entry taught it about its author
+│       ├── profile.py      # What a saved entry taught it about its author
+│       ├── diary.py        # An entry, as plain data on the coach's side
+│       ├── rebuild.py      # /memory: the whole diary, one entry at a time
+│       └── weekly.py       # The one message a week it sends unprompted
 ├── Makefile                # Dev and deploy commands
 ├── requirements.txt
 └── .env.example

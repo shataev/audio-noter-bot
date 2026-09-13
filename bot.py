@@ -33,14 +33,22 @@ from telegram.ext import (
 
 from config import ANTHROPIC, settings
 from services.coach import conversation as coach
+from services.coach import diary as coach_diary
 from services.coach import memory as coach_memory
 from services.coach import profile as coach_profile
 from services.coach import prompts as coach_prompts
+from services.coach import rebuild as coach_rebuild
 from services.coach import threads as coach_threads
+from services.coach import weekly as coach_weekly
 from services.coach.store import MemoryStore
 from services.formatter import format_entry
-from services.notion import day_label, diary_today, save_entry
-from services.summary import generate_daily_summary, generate_weekly_report
+from services.notion import day_label, diary_today, get_week_pages, save_entry
+from services.summary import (
+    all_pages,
+    generate_daily_summary,
+    generate_weekly_report,
+    read_page_entries,
+)
 from services.whisper import merge_keywords, transcribe
 
 logging.basicConfig(
@@ -68,6 +76,7 @@ SUNDAY = 0
 
 DAILY_SUMMARY_JOB = "daily_summary"
 WEEKLY_REPORT_JOB = "weekly_report"
+COACH_WEEKLY_JOB = "coach_weekly_session"
 
 # Everything in user_data that belongs to one draft. Cleared together, so a draft can
 # never survive half-way and leave message ids pointing at a preview that is gone.
@@ -108,6 +117,10 @@ CONVERSATION_NAME = "preview_flow"
 # .gitignore already covers, because neither is anybody's business but the owner's.
 COACH_MEMORY_FILE_NAME = "coach_memory.state.json"
 COACH_THREADS_FILE_NAME = "coach_threads.state.json"
+# One line: the week the coach last opened a conversation about. On disk rather
+# than in memory because the bot restarts on every deploy, and "never twice for
+# the same week" has to survive that.
+COACH_WEEKLY_FILE_NAME = "coach_weekly.state.json"
 
 WELCOME_TEXT = """👋 Welcome to Noter!
 
@@ -148,6 +161,10 @@ The buttons under <b>✓ Save</b> send the entry to a model that thinks about it
 🔥 <b>Разъёб</b> — blunt; 🧭 <b>Разбор</b> — structural; 🫂 <b>Поддержка</b> — kind.
 Reply to its message to keep talking, by text or by voice. A voice reply inside a conversation is never turned into a diary entry.
 Tell it to change how it answers — "don't start with a greeting" — and it writes the rule down itself. <b>/rules</b> shows what it has written.
+Once a week it writes first: one thing it noticed, or one question. Reply to it like any other message of its own.
+
+<b>What it remembers</b>
+<b>/memory</b> rebuilds what it knows about you from everything already in the diary. It asks what to look for, then asks again before it starts — it costs money and it takes a while.
 
 <b>Daily summary</b>
 Every day at 21:00 I send a summary of all entries recorded that day. If there are none, I'll send a friendly nudge instead."""
@@ -233,6 +250,41 @@ FACT_UNAVAILABLE = "Не смог обновить память. Это в ло�
 # is not a pass worth hand-correcting one line at a time, and Telegram stops
 # drawing a keyboard long before it stops accepting one.
 MAX_CORRECTION_ROWS = 10
+
+# /memory: the retrospective rebuild, in the language the memory notes are in.
+MEMORY_OFF = "Коуч выключен: у провайдера нет ключа."
+MEMORY_FOCUS_PROMPT = (
+    "🧠 Пересборка памяти по всему дневнику.\n\n"
+    "На что смотреть в этом проходе? Что важно, что оставить, что выкинуть.\n"
+    "Можно текстом или голосом. «-» — без фокуса."
+)
+MEMORY_NO_FOCUS = "без фокуса"
+MEMORY_CONFIRM = (
+    "Фокус: {focus}\n"
+    "Сейчас в памяти фактов: {count}\n\n"
+    "Пройду по всему дневнику, запись за записью. Это долго и стоит денег. Погнали?"
+)
+MEMORY_RUN_LABEL = "🧠 Пересобрать"
+MEMORY_CANCEL_LABEL = "Отмена"
+MEMORY_CANCELLED = "Отменил. Память не тронута."
+MEMORY_IN_FLIGHT = "Пересборка уже идёт."
+MEMORY_GONE = "Это подтверждение уже неактуально — набери /memory заново."
+MEMORY_UNAVAILABLE = "Не смог прочитать память. Это в логе."
+MEMORY_FAILED = "Пересборка сорвалась. Это в логе; память в том виде, до которого дошла."
+MEMORY_STARTED = "🧠 Пересобираю память..."
+MEMORY_PROGRESS = (
+    "🧠 Пересобираю память... день {page}/{pages}, записей {done}, "
+    "+{created} / ~{modified} / −{deleted}"
+)
+MEMORY_NO_ENTRIES = "В дневнике нечего читать — память не тронута."
+MEMORY_DONE_HEADER = "🧠 Пересборка закончена."
+MEMORY_ABORTED = "🧠 Остановился: {count} ошибок подряд."
+MEMORY_DONE_COUNTS = (
+    "Записей прочитано: {done}, из них с фактами: {learned}, пропущено: {skipped}.\n"
+    "Фактов было {before}, стало {after}: +{created} / ~{modified} / −{deleted}."
+)
+MEMORY_UNDO = "Откатить: вернуть на место {path}"
+MEMORY_NO_SNAPSHOT = "Откатывать не к чему: до этого прохода памяти не было."
 
 # Telegram rejects a message body longer than this.
 TELEGRAM_TEXT_LIMIT = 4096
@@ -1654,6 +1706,418 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Error generating daily summary")
 
 
+# --------------------------------------------------------------------------- #
+# /memory — rebuilding the profile from the diary that came before it.
+#
+# The profile only knows what it was told by entries saved after it shipped.
+# This walks everything already written and folds it in, in two steps the owner
+# controls: what the pass should be looking for, and an explicit go-ahead. It
+# costs real money per entry and rewrites the file the whole coach reads, so it
+# never starts from one tap.
+#
+# The pass itself is in services/coach/rebuild.py and knows nothing about
+# Telegram or Notion. Everything here is the adapter: the two prompts, the walk
+# over the diary, the progress bar, and the single-flight guard.
+# --------------------------------------------------------------------------- #
+
+# The prompt this bot is waiting on an answer to, keyed by the chat and the
+# prompt's own message id — the same shape, and for the same reason, as
+# `_fact_edit_prompts`: the filter that routes the answer runs before any handler
+# and cannot see user_data. The value is the focus once it has been given.
+_memory_focus_prompts: dict[tuple[int, int], None] = {}
+_memory_confirmations: dict[tuple[int, int], str | None] = {}
+MEMORY_PROMPTS_REMEMBERED = 5
+
+# One pass at a time, for the whole process rather than per chat: it is one
+# owner, one profile and one file. A second /memory while one is running is
+# refused rather than queued — a queued rebuild is a rebuild that starts an hour
+# later, against a profile the first one has already rewritten, which is not what
+# anybody pressing the button a second time is asking for.
+_rebuild_in_flight = False
+
+
+def coach_weekly_path() -> str:
+    return os.path.join(os.environ.get("STATE_DIRECTORY", "."), COACH_WEEKLY_FILE_NAME)
+
+
+def _remember_prompt(prompts: dict, address: tuple[int, int], value: str | None) -> None:
+    """Keep the newest few prompts and forget the rest.
+
+    An unanswered prompt is abandoned, not cancelled, and without a bound the
+    dictionary is a slow leak over the life of a process that is restarted only
+    by a deploy.
+    """
+    prompts[address] = value
+    for stale in list(prompts)[:-MEMORY_PROMPTS_REMEMBERED]:
+        prompts.pop(stale, None)
+
+
+def _focus_label(focus: str | None) -> str:
+    return focus if focus else MEMORY_NO_FOCUS
+
+
+async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step one of the rebuild: ask what this pass should be looking for."""
+    message = update.effective_message
+    if not coach_enabled():
+        await message.reply_text(MEMORY_OFF)
+        return
+    if _rebuild_in_flight:
+        await message.reply_text(MEMORY_IN_FLIGHT)
+        return
+
+    prompt = await _send_plain(
+        context.bot,
+        update.effective_chat.id,
+        MEMORY_FOCUS_PROMPT,
+        reply_to=message.message_id,
+        reply_markup=ForceReply(selective=True),
+    )
+    _remember_prompt(_memory_focus_prompts, (update.effective_chat.id, prompt.message_id), None)
+
+
+class MemoryFocusFilter(filters.MessageFilter):
+    """Matches the answer to the focus prompt, and nothing else.
+
+    Ahead of the conversation, so that answering it by voice reaches this and not
+    the entry point that would turn it into a draft. That is the whole reason the
+    focus is asked for with a ForceReply: the answer is a reply to one known
+    message, rather than "the next thing said in this chat", which would be a far
+    wider net over a chat whose ordinary traffic is diary entries.
+    """
+
+    def filter(self, message: Message) -> bool:
+        reply = message.reply_to_message
+        if reply is None or message.chat is None:
+            return False
+        return (message.chat.id, reply.message_id) in _memory_focus_prompts
+
+
+async def memory_focus_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step two: echo the focus and the fact count, and wait to be told to go.
+
+    What the owner says here is read as focus and as nothing else. It is never
+    saved as a diary entry — there is no path from this handler to a draft — and
+    it is never stored as a fact: it reaches the model as part of the extraction
+    prompt for each entry and is gone when the pass ends.
+    """
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    address = (chat_id, message.reply_to_message.message_id)
+    if address not in _memory_focus_prompts:  # pragma: no cover - the filter says otherwise
+        return
+    _memory_focus_prompts.pop(address, None)
+
+    said = message.text
+    if said is None:
+        said = await _voice_to_text(context, message)
+        if said is None:
+            # Already reported by the transcription step, and deliberately the
+            # end of it: no draft, and no half-built rebuild left waiting.
+            return
+
+    focus = said.strip()
+    if focus in ("", "-", "—", "–"):
+        focus = None
+
+    try:
+        count = len(_memory_store().load().profile.facts)
+    except Exception:
+        logger.exception("Could not read the profile before a rebuild")
+        await message.reply_text(MEMORY_UNAVAILABLE)
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(MEMORY_RUN_LABEL, callback_data="memory:run"),
+                InlineKeyboardButton(MEMORY_CANCEL_LABEL, callback_data="memory:cancel"),
+            ]
+        ]
+    )
+    confirmation = await _send_plain(
+        context.bot,
+        chat_id,
+        MEMORY_CONFIRM.format(focus=_focus_label(focus), count=count),
+        reply_to=message.message_id,
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "A profile rebuild is waiting to be confirmed: %d fact(s), focus of %d character(s)",
+        count,
+        len(focus or ""),
+    )
+    _remember_prompt(_memory_confirmations, (chat_id, confirmation.message_id), focus)
+
+
+async def memory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step three: the go-ahead, or the cancel. Nothing has run before this point."""
+    global _rebuild_in_flight
+
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    address = (chat_id, query.message.message_id)
+
+    if query.data.endswith(":cancel"):
+        _memory_confirmations.pop(address, None)
+        await query.answer()
+        await _edit_plain(context.bot, chat_id, query.message.message_id, MEMORY_CANCELLED)
+        return
+
+    if address not in _memory_confirmations:
+        # A confirmation from before a restart, or one that has already been
+        # pressed. Either way there is no focus behind it and starting a pass
+        # that ignores what was asked for is worse than asking again.
+        await query.answer(MEMORY_GONE)
+        return
+
+    # Read and set with no await in between: two presses of the same button, or
+    # a press on each of two confirmations, must not both get past here.
+    if _rebuild_in_flight:
+        await query.answer(MEMORY_IN_FLIGHT)
+        return
+    _rebuild_in_flight = True
+    focus = _memory_confirmations.pop(address)
+
+    await query.answer()
+    work = _run_rebuild(context, chat_id=chat_id, focus=focus)
+    try:
+        # Not awaited. Updates are processed one at a time, so a pass awaited here
+        # would leave the bot deaf for as long as it runs — which is the length of
+        # the diary, times a model call each.
+        context.application.create_task(work)
+    except Exception:
+        _rebuild_in_flight = False
+        work.close()
+        logger.exception("Could not start the profile rebuild")
+        await _edit_plain(context.bot, chat_id, query.message.message_id, MEMORY_UNAVAILABLE)
+
+
+async def _diary_entries(walked: dict):
+    """Every entry in the diary, oldest first, as plain data for the coach package.
+
+    A page that cannot be read becomes one `Unreadable` rather than an exception:
+    a single unreachable day must not end a walk over a year of diary, and the
+    pass counts it and steps over it. A failure to list the pages at all is
+    different and is left to propagate — there is nothing to walk.
+    """
+    pages = await all_pages()
+    walked["pages"] = len(pages)
+    for index, page in enumerate(pages, start=1):
+        walked["page"] = index
+        where = page.get("id", "an unnamed page")
+        try:
+            entries = await read_page_entries(page)
+        except Exception:
+            logger.warning("Could not read the diary page %s", where, exc_info=True)
+            yield coach_diary.Unreadable(where=where)
+            continue
+        for entry in entries:
+            yield coach_diary.Entry(source=entry.source, title=entry.title, text=entry.text)
+
+
+def _rebuild_report(
+    result: coach_rebuild.Rebuild, *, before: int, after: int, snapshot, breaker: int
+) -> str:
+    """The last message of a pass: what changed, what was skipped, how to undo it."""
+    lines = [
+        MEMORY_ABORTED.format(count=breaker) if result.aborted else MEMORY_DONE_HEADER,
+        MEMORY_DONE_COUNTS.format(
+            done=result.done,
+            learned=result.learned,
+            skipped=result.skipped,
+            before=before,
+            after=after,
+            created=result.created,
+            modified=result.modified,
+            deleted=result.deleted,
+        ),
+    ]
+    lines.append(MEMORY_UNDO.format(path=snapshot) if snapshot else MEMORY_NO_SNAPSHOT)
+    return "\n".join(lines)
+
+
+async def _run_rebuild(
+    context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, focus: str | None
+) -> None:
+    """The pass itself: snapshot, walk, and one final message. Never raises."""
+    global _rebuild_in_flight
+
+    store = _memory_store()
+    try:
+        stored = store.load()
+        # Before the first call, not after the last: the snapshot is the only
+        # thing that makes a pass over the whole diary a reversible decision, and
+        # a snapshot taken at the end would be a copy of the damage.
+        snapshot = store.snapshot("before-rebuild")
+    except Exception:
+        _rebuild_in_flight = False
+        logger.exception("Could not snapshot the profile; the rebuild has not started")
+        await _send_plain(context.bot, chat_id, MEMORY_UNAVAILABLE)
+        return
+
+    before = len(stored.profile.facts)
+    notice = await _send_plain(context.bot, chat_id, MEMORY_STARTED)
+    walked: dict[str, int] = {"page": 0, "pages": 0}
+
+    async def persist(profile: coach_memory.MemoryList) -> None:
+        # Under the same lock as every other write to this file, and re-reading
+        # inside it, because the rules a conversation writes live in the same
+        # document and must not be rolled back to what they were when the pass
+        # started. Only the profile is this pass's to replace.
+        async with _store_lock():
+            store.save(replace(store.load(), profile=profile))
+
+    async def progress(state: coach_rebuild.Progress) -> None:
+        await _edit_plain(
+            context.bot,
+            chat_id,
+            notice.message_id,
+            MEMORY_PROGRESS.format(
+                page=walked["page"],
+                pages=walked["pages"],
+                done=state.done,
+                created=state.created,
+                modified=state.modified,
+                deleted=state.deleted,
+            ),
+        )
+
+    try:
+        result = await coach_rebuild.run(
+            entries=_diary_entries(walked),
+            profile=stored.profile,
+            model=settings.profile_model,
+            focus=focus,
+            persist=persist,
+            progress=progress,
+        )
+    except Exception:
+        logger.exception("The profile rebuild failed")
+        await _send_plain(context.bot, chat_id, MEMORY_FAILED)
+        return
+    finally:
+        _rebuild_in_flight = False
+
+    if result.done == 0 and result.skipped == 0:
+        await _send_plain(context.bot, chat_id, MEMORY_NO_ENTRIES)
+        return
+
+    await _send_plain(
+        context.bot,
+        chat_id,
+        _rebuild_report(
+            result,
+            before=before,
+            after=len(result.profile.facts),
+            snapshot=snapshot,
+            breaker=coach_rebuild.CONSECUTIVE_FAILURES,
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The weekly session: the one time the coach speaks first.
+# --------------------------------------------------------------------------- #
+
+# Which persona carries the conversation if the owner replies. The weekly message
+# is written by its own prompt, but a reply to it lands in an ordinary coach
+# thread and something has to answer it — the reflective one rather than the
+# first in the list, which is the roast.
+COACH_WEEKLY_MODE = "breakdown"
+
+
+async def _week_entries() -> list:
+    """This week's diary, entry by entry, as plain data for the coach package.
+
+    The same pages the Sunday report reads. A page that cannot be read is dropped
+    with a log line rather than failing the week: an observation drawn from six
+    days out of seven is worth more than silence.
+    """
+    entries = []
+    for page in await get_week_pages():
+        try:
+            entries.extend(await read_page_entries(page))
+        except Exception:
+            logger.warning("Could not read a diary page for the weekly session", exc_info=True)
+    return [
+        coach_diary.Entry(source=entry.source, title=entry.title, text=entry.text)
+        for entry in entries
+        if entry.text.strip()
+    ]
+
+
+async def send_coach_weekly(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Once a week: read the week and the profile, and send one thing.
+
+    Silent in the chat whatever goes wrong, and loud in the log. This is the one
+    message the owner did not ask for, and a version of it that sometimes arrives
+    as an apology for itself is worse than one that is occasionally missing.
+    """
+    if not (coach_enabled() and settings.coach_weekly_enabled):
+        return
+
+    path = coach_weekly_path()
+    week = coach_weekly.week_key(diary_today())
+    try:
+        if coach_weekly.last_spoken(path) == week:
+            # A deploy restarts the bot, and a restart re-schedules the job. The
+            # week that has already been spoken about is on disk for exactly this.
+            logger.info("coach weekly: %s has already been spoken about", week)
+            return
+
+        entries = await _week_entries()
+        if not entries:
+            logger.info("coach weekly: nothing written in %s, staying quiet", week)
+            return
+
+        text = await coach_weekly.session(
+            profile=_memory_store().load().profile,
+            entries=entries,
+            model=settings.coach_model,
+        )
+        if not text:
+            # Already logged, with the reason. Nothing reaches the chat.
+            return
+
+        chat_id = settings.allowed_user_id
+        parts = _chunks(text)
+        first = await _send_plain(context.bot, chat_id, parts[0])
+        sent = [first.message_id]
+        for part in parts[1:]:
+            follow = await _send_plain(context.bot, chat_id, part, reply_to=first.message_id)
+            sent.append(follow.message_id)
+    except Exception:
+        logger.exception("coach weekly: the session failed")
+        return
+
+    # Written down only now, because "sent" is what must not happen twice. A
+    # failure before this point is a week the coach may still speak about.
+    try:
+        coach_weekly.remember(path, week)
+    except Exception:
+        logger.exception("coach weekly: could not record that %s was spoken about", week)
+
+    # Every message of it becomes a door into the conversation, exactly as a coach
+    # answer does, so that the owner can simply reply to what arrived.
+    try:
+        mode = coach_prompts.mode_for(COACH_WEEKLY_MODE) or coach_prompts.MODES[0]
+        items, _ = coach_threads.start(
+            _load_threads(),
+            mode=mode.key,
+            turns=[
+                coach_threads.Turn(role="user", text=coach_weekly.digest(entries)),
+                coach_threads.Turn(role="assistant", text=text),
+            ],
+            keys=[coach_threads.key(chat_id, message_id) for message_id in sent],
+        )
+        _save_threads(items)
+    except Exception:
+        # The message is already in the chat. Losing the thread costs a reply its
+        # context, which is a log line rather than a second message.
+        logger.exception("coach weekly: could not record the conversation")
+
+
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Last line of defence: log the traceback, tell the user something happened.
 
@@ -1712,6 +2176,7 @@ def build_application() -> Application:
         CommandHandler("weekly", handle_weekly),
         CommandHandler("keywords", handle_keywords),
         CommandHandler("rules", handle_rules),
+        CommandHandler("memory", handle_memory),
     ]
     cancel_handler = CommandHandler("cancel", handle_cancel)
 
@@ -1772,6 +2237,18 @@ def build_application() -> Application:
         )
     )
 
+    # Ahead of the conversation, and it takes voice as well as text: the focus a
+    # rebuild is given may be dictated, and a dictated answer that reached the
+    # conversation's entry point would become a diary entry instead. Narrow for
+    # the same reason as the two above — it matches a reply to one prompt this
+    # process is still waiting on.
+    app.add_handler(
+        MessageHandler(
+            (filters.VOICE | (filters.TEXT & ~filters.COMMAND)) & user_filter & MemoryFocusFilter(),
+            memory_focus_reply,
+        )
+    )
+
     app.add_handler(conv_handler)
     for handler in [*command_handlers, cancel_handler]:
         app.add_handler(handler)
@@ -1791,6 +2268,10 @@ def build_application() -> Application:
     # stays pressable in the chat long after the next draft has come and gone.
     app.add_handler(CallbackQueryHandler(fact_callback, pattern=r"^fact:(drop|fix):\S{1,32}$"))
 
+    # Outside the conversation for the same reason: the confirmation is answered
+    # minutes after the command, and a draft may well have come and gone since.
+    app.add_handler(CallbackQueryHandler(memory_callback, pattern=r"^memory:(run|cancel)$"))
+
     app.add_error_handler(handle_error)
 
     tz = zoneinfo.ZoneInfo(settings.timezone)
@@ -1805,6 +2286,16 @@ def build_application() -> Application:
         days=(SUNDAY,),
         name=WEEKLY_REPORT_JOB,
     )
+    if settings.coach_weekly_enabled:
+        # Not registered at all when it is switched off, rather than registered
+        # and returning early: a job that exists is a job somebody has to reason
+        # about when the next scheduled thing misfires.
+        app.job_queue.run_daily(
+            send_coach_weekly,
+            time=time(settings.coach_weekly_hour, settings.coach_weekly_minute, tzinfo=tz),
+            days=(settings.coach_weekly_day,),
+            name=COACH_WEEKLY_JOB,
+        )
 
     return app
 

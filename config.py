@@ -85,6 +85,48 @@ def _provider_key(variable: str) -> str:
         raise RuntimeError(f"{variable} is required when AI_PROVIDER={_provider}") from None
 
 
+# The days of the week, numbered from Sunday. That is not the ISO numbering and
+# it is not an accident: python-telegram-bot's ``JobQueue.run_daily`` numbers its
+# ``days`` 0-6 as Sunday-Saturday, and the one time this repository assumed
+# otherwise the weekly report arrived on Saturday for a month. Naming the day in
+# the environment rather than numbering it there means nobody has to know that.
+WEEKDAYS = (
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+)
+
+
+def _weekday(variable: str, default: str) -> int:
+    """A weekday name from the environment, as an index into ``WEEKDAYS``."""
+    name = (os.getenv(variable) or default).strip().lower()
+    try:
+        return WEEKDAYS.index(name)
+    except ValueError:
+        raise ValueError(
+            f"{variable} must be one of {', '.join(WEEKDAYS)}, got {name!r}"
+        ) from None
+
+
+def _flag(variable: str, default: bool) -> bool:
+    """An on/off setting, read the way a person would write one."""
+    raw = os.getenv(variable)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bounded_int(variable: str, default: int, low: int, high: int) -> int:
+    value = int(os.getenv(variable) or default)
+    if not low <= value <= high:
+        raise ValueError(f"{variable} must be {low}-{high}, got {value}")
+    return value
+
+
 class _Settings:
     telegram_token: str = os.environ["TELEGRAM_TOKEN"]
     openai_api_key: str = os.environ["OPENAI_API_KEY"]
@@ -132,6 +174,17 @@ class _Settings:
     transcription_keywords: str = os.getenv("TRANSCRIPTION_KEYWORDS", "")
     # The transcription endpoint rejects uploads above 25 MB.
     max_audio_mb: float = float(os.getenv("MAX_AUDIO_MB", "25"))
+
+    # The coach's weekly session: once a week it reads the week and the profile
+    # and writes first, unprompted. Off is a supported configuration — it is one
+    # model call and one message a week that nobody asked for in the moment, and
+    # the owner must be able to stop it from the environment rather than from a
+    # deploy. The default day and hour keep it well clear of the 21:00 recaps, so
+    # that the week's report and the week's question are not read as one message.
+    coach_weekly_enabled: bool = _flag("COACH_WEEKLY_ENABLED", True)
+    coach_weekly_day: int = _weekday("COACH_WEEKLY_DAY", "sunday")
+    coach_weekly_hour: int = _bounded_int("COACH_WEEKLY_HOUR", 12, 0, 23)
+    coach_weekly_minute: int = _bounded_int("COACH_WEEKLY_MINUTE", 0, 0, 59)
 
     # Notion HTTP behaviour.
     notion_timeout: float = float(os.getenv("NOTION_TIMEOUT_SECONDS", "30"))
