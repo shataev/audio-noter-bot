@@ -2068,3 +2068,58 @@ async def test_help_still_parses_now_that_the_coach_is_in_it(fake_bot, context):
 
     assert "Разъёб" in fake_bot.sent[-1].text
     assert "/rules" in fake_bot.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_the_filter_claims_a_reply_to_a_conversation_that_was_pruned(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """The honest answer lives or dies here, not in the handler that speaks it.
+
+    `coach_reply` says COACH_FORGOTTEN, and there is a test for that — but it can
+    only say it if the update reaches it, and in production what routes the update
+    is this filter. Let the `was_forgotten` half stop matching and COACH_FORGOTTEN
+    becomes unreachable: the reply falls through to the voice entry point instead,
+    and a voice reply to a fortnight-old coach message becomes a diary entry. The
+    500 forgotten keys exist for exactly this, so it is asserted where it is
+    decided.
+    """
+    answer_id = await _start_conversation(tmp_path, monkeypatch, fake_bot, context)
+    aged = bot.coach_threads.prune(
+        bot._load_threads(), now=datetime.now(timezone.utc) + timedelta(days=99)
+    )
+    bot._save_threads(aged)
+
+    address = bot.coach_threads.key(fake_bot.chat_id, answer_id)
+    update = _reply_update(fake_bot, to=answer_id, voice=FakeVoice("voice-2"))
+
+    assert bot.coach_threads.find(aged, address) is None, "the conversation really is gone"
+    assert bot.coach_threads.was_forgotten(aged, address)
+    assert bot.CoachReplyFilter().filter(update.effective_message), (
+        "a reply to a pruned conversation still has to be routed to the coach, "
+        "or the honest answer is never reached and the audio becomes an entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_in_flight_flag_left_by_a_dead_process_does_not_wedge_the_coach(
+    tmp_path, monkeypatch, fake_bot, context, coach_state
+):
+    """`coach_in_flight` is in DRAFT_KEYS, and that one line is load-bearing.
+
+    The flag is otherwise cleared only in the handler's own `finally`, which does
+    not run when the process dies mid-call — and the process dies mid-call on
+    every deploy. The stale True then rides the persisted user_data into the next
+    process, where nothing else would ever clear it: the mode buttons answer
+    "still thinking" for good. Being in DRAFT_KEYS is what rescues it, so starting
+    a draft has to be shown to clear it.
+    """
+    context.user_data["coach_in_flight"] = True
+
+    buttons_id = await _open_preview(monkeypatch, tmp_path, fake_bot, context)
+    chat = stub_coach(monkeypatch)
+    await _press_coach(fake_bot, context, buttons_id)
+
+    assert not context.user_data.get("coach_in_flight")
+    assert len(chat.calls) == 1, "the buttons must work again, not be permanently deaf"
+    assert COACH_ANSWER in [m.text for m in coach_messages(fake_bot, buttons_id)]
