@@ -22,6 +22,7 @@ A Telegram bot that turns voice messages into structured diary entries in Notion
 | `/help`   | Detailed usage instructions        |
 | `/cancel` | Throw away the draft being previewed |
 | `/keywords` | Manage the words the transcriber should lean towards |
+| `/rules`  | Show the standing instructions the coach has written down |
 
 ## Editing before saving
 
@@ -97,6 +98,66 @@ The `Daily` tag is always added automatically. Additional tags can be:
 - **Edited manually** — click **✎ Tags** and send tags separated by commas: `sport, health, work`
 
 When appending to an existing page, tags from all entries are merged without duplicates.
+
+## A second opinion on an entry
+
+Under **✓ Save** the preview offers three buttons. Each one sends the entry to a
+reasoning-grade model and posts its answer as a **new message**:
+
+| Button | What it does |
+|---|---|
+| 🔥 **Разъёб** | Blunt. Names the thing the entry is circling and not saying. |
+| 🧭 **Разбор** | Calm and structural: what happened, what drove it, what repeats. |
+| 🫂 **Поддержка** | For the day when being taken apart is not what is needed. |
+
+**The draft is never modified.** This is an opinion, not an edit — a feature that
+can rewrite a diary entry is a feature that will eventually rewrite one by
+accident. A failed call costs one line in the chat and leaves the preview exactly
+as it was, so the entry can still be saved.
+
+The buttons only appear when the chat provider in use has a key; see
+[Choosing the chat provider](#choosing-the-chat-provider).
+
+### Keeping the conversation going
+
+Reply to the coach's message to continue. Replying by voice works too — the audio
+is transcribed and added to the conversation, and it is **never** turned into a
+diary entry.
+
+Conversations are stored in a file, so a deploy in the middle of one does not
+lose it. They are bounded — roughly fifty conversations, forty messages each,
+nothing older than a fortnight — and a reply to one that has aged out is answered
+honestly rather than silently starting a new conversation with no context.
+
+### Rules it writes down itself
+
+Tell the coach how you want it to answer — _«не начинай с приветствия»_, _«забудь
+правило 2»_ — and it records the rule itself, from inside its own reply. The
+rules are appended to the end of every later prompt with a header saying they
+outrank the persona, so on a conflict the rule wins. That is how the bot's
+behaviour is changed by talking to it instead of by editing a file.
+
+`/rules` prints the current list, numbered with the same ids the model uses.
+
+### Making it yours
+
+The personas committed to this repository are neutral defaults, written to be
+usable by someone who has just cloned it. The ones actually in use come from the
+environment, so they stay off GitHub:
+
+| Variable | Replaces |
+|---|---|
+| `COACH_PROMPT_ROAST` | the 🔥 Разъёб persona |
+| `COACH_PROMPT_BREAKDOWN` | the 🧭 Разбор persona |
+| `COACH_PROMPT_SUPPORT` | the 🫂 Поддержка persona |
+
+Each replaces its persona paragraph entirely. The shared rules about the shape of
+an answer — a few sentences, one paragraph, no markdown, no question at the end —
+and the protocol for editing the rules list are added whatever you write, so a
+custom persona only has to describe who is answering.
+
+Leave one unset to keep the committed default. `COACH_MODEL` picks the model;
+it wants a reasoning-grade one, and it is called at high effort.
 
 ## Daily summary
 
@@ -174,7 +235,7 @@ for the provider in use:
 | `TRANSCRIPTION_MODEL`| `gpt-transcribe` | `gpt-transcribe`  | Voice message → text, always OpenAI |
 | `FORMATTER_MODEL`    | `gpt-4o-mini`    | `claude-opus-5`   | Punctuation, paragraphs, title, tags |
 | `SUMMARY_MODEL`      | `gpt-4o-mini`    | `claude-opus-5`   | Daily summary and weekly report   |
-| `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | Not read yet — reserved for the coach |
+| `COACH_MODEL`        | `gpt-5`          | `claude-opus-5`   | The coach, at high effort         |
 | `PROFILE_MODEL`      | `SUMMARY_MODEL`  | `SUMMARY_MODEL`   | Not read yet — reserved for the coach |
 
 ### Connecting Notion integration to your database
@@ -638,7 +699,14 @@ noter/
 │   ├── whisper.py          # Audio transcription via the OpenAI audio API
 │   ├── formatter.py        # Entry formatting via GPT-4o-mini
 │   ├── notion.py           # Notion API: create/update diary pages
-│   └── summary.py          # Daily summary and weekly report generation
+│   ├── summary.py          # Daily summary and weekly report generation
+│   ├── ai.py               # One chat interface, OpenAI or Anthropic behind it
+│   └── coach/
+│       ├── memory.py       # Id-addressed lists of facts the model edits
+│       ├── store.py        # The memory file: atomic writes, tolerant loads
+│       ├── prompts.py      # The three personas, and the self-editing rules
+│       ├── threads.py      # Conversations, in a file that outlives a deploy
+│       └── conversation.py # One coach turn: ask, answer, update the rules
 ├── Makefile                # Dev and deploy commands
 ├── requirements.txt
 └── .env.example
